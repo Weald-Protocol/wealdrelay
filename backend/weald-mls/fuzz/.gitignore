@@ -1,0 +1,7 @@
+target
+artifacts
+coverage
+# `corpus` is deliberately NOT ignored. `specs/backend/relay/mls-binding.md` requires the
+# fuzz corpus to be carried forward, and a corpus that lived only in a CI worker's scratch
+# directory would start from nothing on every run, which is the same as never having
+# fuzzed. The seeds under `corpus/process/` are checked in.

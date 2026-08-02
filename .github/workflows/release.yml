@@ -1,0 +1,270 @@
+# Release: everything the public repository can prove on its own.
+#
+# The relay's full gate (coverage floors, property suites, miri, fuzz, the
+# negative proofs, and the app-side integration steps) runs in Weald's private
+# build repository, because most of it exercises surfaces that are not here.
+# What IS here is the part a third party needs in order to disbelieve us: the
+# test suite against a real Postgres, two independent runners producing
+# byte-identical images, a clean clone of the tag producing the same digest a
+# third time, and a cosign signature over the result.
+#
+# Nothing below takes a secret. `GITHUB_TOKEN` pushes to this repository's own
+# package namespace and cosign signs keylessly against the Actions OIDC issuer,
+# which is what makes the signature checkable by someone with no relationship to
+# us.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "wealdrelay-v*"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      # The suites refuse to skip without a database. accept.rs panics with
+      # "Postgres is not reachable ... it does not skip" rather than passing
+      # quietly, which is the right choice and is why this service is here.
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wealdrelay
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      WEALD_RELAY_DATABASE_URL: postgres://postgres:postgres@localhost:5432/wealdrelay
+      WEALD_RELAY_HOSTNAME: relay.test
+      WEALD_RELAY_STORAGE_URL: file:///tmp/wealdrelay-blobs
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml is the pin and has to be the pin here too.
+      # `dtolnay/rust-toolchain@stable` exports RUSTUP_TOOLCHAIN=stable, which
+      # overrides the file, so the channel is read from the file rather than
+      # written twice and allowed to drift.
+      - id: pin
+        run: sed -n 's/^channel = "\(.*\)"/channel=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # Two independent runners must produce byte-identical artifacts. They differ
+  # in architecture as well as identity, which is a stronger claim than two of
+  # the same: a build that depended on its host would have two chances to say so.
+  #
+  # `fetch-depth: 0` is load-bearing. relay-reproduce.sh takes
+  # SOURCE_DATE_EPOCH from the tagged commit's own timestamp, and a shallow
+  # clone has no commit to take it from.
+  reproducible:
+    name: reproducible build, runner ${{ matrix.runner }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - runner: a
+            os: ubuntu-24.04
+          - runner: b
+            os: ubuntu-24.04-arm
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and record the digest
+        env:
+          WEALD_REPRO_LABEL: ${{ matrix.runner }}
+          # Stated rather than derived. The OCI version label is a digest input,
+          # so all three builds have to agree on it, and `git describe` agreeing
+          # by luck is not the same as every job being handed the same string.
+          WEALD_REPRO_VERSION: ${{ github.ref_name }}
+        run: scripts/relay-reproduce.sh --out repro-${{ matrix.runner }} --label ${{ matrix.runner }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.runner }}-${{ github.ref_name }}
+          # The image tar is hundreds of megabytes and is not the evidence. The
+          # manifest is.
+          path: |
+            repro-${{ matrix.runner }}/manifest.json
+            repro-${{ matrix.runner }}/build.log
+
+  compare:
+    name: the digests must match
+    needs: reproducible
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.compare.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: repro-*-${{ github.ref_name }}
+          path: repro
+      - name: Compare
+        id: compare
+        run: |
+          set -eux
+          python3 scripts/repro-compare.py repro --out agreed-digest.txt
+          echo "digest=$(cat agreed-digest.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agreed-digest-${{ github.ref_name }}
+          path: agreed-digest.txt
+
+  # The compose bundle a self-hoster downloads, with the checksum
+  # deploy/install.sh refuses to install without.
+  bundle:
+    name: the compose bundle
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pack
+        run: |
+          set -eux
+          staging=weald-relay
+          mkdir -p "$staging"
+          cp backend/wealdrelay/deploy/compose/docker-compose.yml \
+             backend/wealdrelay/deploy/compose/Caddyfile \
+             backend/wealdrelay/deploy/compose/.env.example \
+             backend/wealdrelay/deploy/compose/README.md \
+             "$staging/"
+          # Deterministic: sorted, no owner, and mtimes from the tagged commit,
+          # so the bundle's checksum is a property of the tag and not of the
+          # runner's clock.
+          epoch="$(git log -1 --pretty=%ct)"
+          find "$staging" -exec touch -d "@$epoch" {} +
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@$epoch" -czf weald-relay-compose.tar.gz "$staging"
+          sha256sum weald-relay-compose.tar.gz | tee weald-relay-compose.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compose-bundle-${{ github.ref_name }}
+          path: |
+            weald-relay-compose.tar.gz
+            weald-relay-compose.tar.gz.sha256
+
+  # Deliberately downstream of `compare`: an image is published only after two
+  # runners have agreed on the build. Publishing first and verifying afterwards
+  # would put an unverified digest in front of a self-hoster, which is the
+  # ordering the reproducibility proof exists to prevent.
+  image:
+    name: publish the image
+    needs: [compare, bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve SOURCE_DATE_EPOCH from the tagged commit
+        id: epoch
+        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push, amd64 and arm64
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/wealdrelay/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # No moving tag. A `:latest` that changed under a self-hoster without
+          # a deploy they asked for is exactly the failure digest pinning
+          # exists to prevent, so it is never published.
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/weald-relay:${{ github.ref_name }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,rewrite-timestamp=true
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign, keylessly
+        run: |
+          set -eux
+          cosign sign --yes \
+            "ghcr.io/${{ github.repository_owner }}/weald-relay@${{ steps.push.outputs.digest }}"
+
+  verify-published:
+    name: a clean clone at the tag matches the published digest
+    needs: [compare, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Clone afresh, at the tag, with nothing else on the machine
+        run: git clone --branch "${{ github.ref_name }}" --no-single-branch
+             "https://github.com/${{ github.repository }}.git" clean
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Rebuild
+        working-directory: clean
+        env:
+          WEALD_REPRO_LABEL: clean-clone
+          WEALD_REPRO_VERSION: ${{ github.ref_name }}
+        run: scripts/relay-reproduce.sh --out ../repro-clean --label clean-clone
+      - name: It must equal the digest the other two agreed on
+        run: |
+          set -eux
+          rebuilt="$(python3 -c 'import json;print(json.load(open("repro-clean/manifest.json"))["platform_digests"])')"
+          agreed='${{ needs.compare.outputs.digest }}'
+          {
+            echo "### reproducibility, third build"
+            echo
+            echo "| build | digest |"
+            echo "| --- | --- |"
+            echo "| agreed by runners a and b | ${agreed} |"
+            echo "| clean clone at the tag | ${rebuilt} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$rebuilt" = "$agreed"
+      - uses: sigstore/cosign-installer@v3
+      - name: The published image carries our signature and its provenance
+        run: |
+          set -eux
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "ghcr.io/${{ github.repository_owner }}/weald-relay@${{ needs.image.outputs.digest }}" \
+            | tee cosign-verify.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verify-published-${{ github.ref_name }}
+          path: |
+            repro-clean/manifest.json
+            cosign-verify.txt

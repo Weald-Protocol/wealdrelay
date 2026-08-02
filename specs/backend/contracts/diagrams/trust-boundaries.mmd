@@ -1,0 +1,44 @@
+---
+title: Trust boundaries. What crosses each edge, in what form
+---
+flowchart LR
+  classDef plain fill:#c62828,stroke:#7f1d1d,color:#fff
+  classDef cipher fill:#2e7d32,stroke:#1b4d20,color:#fff
+  classDef meta fill:#ef6c00,stroke:#8a3d00,color:#fff
+  classDef zone fill:#f5f5f5,stroke:#9e9e9e,color:#111
+
+  subgraph TB1["Boundary 1. Customer device. TRUSTED"]
+    direction TB
+    dev["Device key, MLS epoch secrets,<br/>recovery phrase, plaintext index"]:::plain
+  end
+
+  subgraph TB2["Boundary 2. Relay data plane. UNTRUSTED FOR CONTENT"]
+    direction TB
+    rel["Envelope headers, opaque ct,<br/>access set pubkeys, seq, ts"]:::cipher
+  end
+
+  subgraph TB3["Boundary 3. Control plane. UNTRUSTED FOR CONTENT"]
+    direction TB
+    cp["Account, subscription, instance,<br/>provider handles, aggregate bytes"]:::meta
+  end
+
+  subgraph TB4["Boundary 4. Third parties"]
+    direction TB
+    st["Stripe: email, payment method, plan"]:::meta
+    ck["Clerk: email, name, org, role"]:::meta
+    rn["Render: container + database bytes at rest"]:::cipher
+    r2["R2: ciphertext blob objects"]:::cipher
+  end
+
+  dev -->|"E1: MLS ciphertext + cleartext header<br/>group id, epoch, hash, size, ts"| rel
+  rel -->|"E2: aggregate bytes, peak conns, readiness<br/>NO per-group labels on hosted"| cp
+  cp -->|"E3: create/resize/restart/destroy<br/>provider handles only"| rn
+  rel -->|"E4: ciphertext blob PUT/GET"| r2
+  cp -->|"E5: customer email, plan, amount"| st
+  cp -->|"E6: session verification, org claims"| ck
+  dev -.->|"E7: sealed bootstrap link half,<br/>one time, request memory only"| cp
+
+  L1["E1 leaks: who talks to which opaque group, when, and how much.<br/>Mitigation is bounded, not absolute. See threat-model/relay-boundary.md"]
+  L2["E7 is the trust-root race. Single highest-risk edge in the system.<br/>See decisions/ADR-0004 and threat-model/bootstrap-handoff.md"]
+  rel -.- L1
+  cp -.- L2

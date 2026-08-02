@@ -1,0 +1,301 @@
+; Weald relay wire format, deterministic CBOR (RFC 8949 section 4.2.1).
+; Normative prose: specs/backend/relay/wire.md
+;
+; Two layers are described here and they are NOT the same trust domain.
+;   Envelope  is what the relay stores and validates. All of it is cleartext
+;             except `ct`.
+;   Payload   is what is inside `ct` after MLS decryption. The relay cannot
+;             read, produce or verify any of it.
+;
+; If a field is not in Envelope or a named cleartext control frame, the relay
+; does not know it exists.
+;
+; Encoding rules, enforced by the conformance suite in ./vectors:
+;   - Definite-length maps and arrays only.
+;   - Integer keys, sorted ascending. No text keys on the wire.
+;   - Shortest-form integer encoding.
+;   - No indefinite-length strings, no tags, no floats anywhere.
+;   - An unknown map key in Envelope is a reject, not an ignore. An unknown
+;     `kind` in Payload is stored and ignored, so an old client never loses
+;     data written by a new one.
+
+start = Envelope / Frame
+
+; ---------------------------------------------------------------------------
+; Layer 1/2. The envelope. The only unit the relay stores.
+; ---------------------------------------------------------------------------
+
+Envelope = {
+  1 => protocol-version   ; v
+  2 => enc-mode           ; enc
+  3 => group-id           ; group
+  4 => epoch              ; epoch
+  5 => seq                ; assigned by the relay on accept. ADVISORY.
+  6 => relay-ts           ; relay receipt time, ms. ADVISORY ONLY.
+  7 => content-hash       ; hash
+  8 => ciphertext         ; ct
+}
+
+protocol-version = 1              ; currently the only accepted value
+enc-mode         = enc-none / enc-mls
+enc-none         = 0              ; Phase 2 only. Rejected when MIN_ENC=mls.
+enc-mls          = 1
+
+group-id     = bstr .size 32      ; opaque to the relay
+epoch        = uint .size 8       ; MLS epoch, needed only for key routing
+seq          = uint .size 8       ; per-group, monotonic, sync cursor ONLY.
+                                  ; Gaps are legal. Nothing above layer 2
+                                  ; reads seq for correctness.
+relay-ts     = uint .size 8
+content-hash = bstr .size 32      ; BLAKE3 over (v, enc, group, epoch, ct)
+ciphertext   = bstr .size (1..MAX_CT)
+
+; MAX_CT is the relay's configured envelope ceiling. Exceeding it is
+; reject/envelope_too_large. See registries/error-codes.md.
+
+; The relay validates exactly and only:
+;   version, enc against WEALD_RELAY_MIN_ENC, group exists, hash correct,
+;   ct under the size limit, authenticated session device inside the access set.
+; The encrypted payload author is intentionally not consulted: agent authors
+; proxy through their issuing device and are opaque to the relay.
+; There is deliberately NO relay-maintained prev chain. Ordering and tamper
+; evidence live inside the ciphertext where the relay cannot reach them.
+; See decisions/ADR-0002.
+
+; ---------------------------------------------------------------------------
+; Layer 3. The plaintext payload. Inside ct, after MLS decryption.
+; ---------------------------------------------------------------------------
+
+Payload = {
+  1  => Hdr            ; copy of (v, enc, group, epoch) from Envelope
+  2  => event-kind     ; kind
+  3  => principal-key  ; author
+  ? 4 => Certificate   ; cert, present when author is an agent
+  5  => counter        ; ctr, per (author, group), monotonic, starts at 0
+  6  => prev-self      ; hash of this author's previous envelope in this group
+  7  => sent-at        ; author clock, ms
+  8  => body           ; kind-specific, see below
+  9  => signature      ; Ed25519 by author over fields 1..8
+}
+
+Hdr = {
+  1 => protocol-version
+  2 => enc-mode
+  3 => group-id
+  4 => epoch
+}
+
+principal-key = bstr .size 32
+counter       = uint .size 8
+prev-self     = bstr .size 32   ; all-zero for ctr == 0
+sent-at       = uint .size 8
+body          = bstr
+signature     = bstr .size 64
+
+; Sign-then-encrypt. A group member cannot re-attribute a decrypted message.
+; ctr increments by EXACTLY one and prev_self names this author's own previous
+; envelope hash. Both are inside the signature and inside the encryption. That
+; density is what makes relay withholding detectable.
+
+Certificate = {
+  1 => principal-key      ; subject (the agent)
+  2 => principal-key      ; issuer (the issuing device)
+  3 => uint               ; not-before, ms
+  4 => uint               ; not-after, ms
+  5 => [+ capability]     ; delegated capabilities
+  6 => bstr .size 64      ; issuer signature
+}
+
+capability = tstr         ; verification rules in specs/backend/relay/identity.md
+
+; ---------------------------------------------------------------------------
+; Event kinds. Kind numbers are PERMANENT.
+; ---------------------------------------------------------------------------
+
+event-kind =
+    k-doc-change          ; 0x0001
+  / k-doc-snapshot        ; 0x0002
+  / k-chat-message        ; 0x0010
+  / k-roster-update       ; 0x0020
+  / k-roster-revoke       ; 0x0021
+  / k-media-ref           ; 0x0030
+  / k-git-patch           ; 0x0040
+  / k-git-status          ; 0x0041
+  / k-tombstone           ; 0x0050
+  / k-groupinfo-publish   ; 0x0060
+  / k-recovery-wrap       ; 0x0061
+  / k-history-publish     ; 0x0062
+  / k-recovery-directory  ; 0x0063
+  / k-head-attest         ; 0x0070
+  / k-checkpoint          ; 0x0071
+  / k-chain-reset         ; 0x0072
+  / k-snapshot            ; 0x0073
+  / k-media-retain        ; 0x0080
+  / k-ephemeral           ; 0x00F0
+  / unknown-kind
+
+k-doc-change         = 1
+k-doc-snapshot       = 2
+k-chat-message       = 16
+k-roster-update      = 32
+k-roster-revoke      = 33
+k-media-ref          = 48
+k-git-patch          = 64
+k-git-status         = 65
+k-tombstone          = 80
+k-groupinfo-publish  = 96
+k-recovery-wrap      = 97
+k-history-publish    = 98
+k-recovery-directory = 99
+k-head-attest        = 112
+k-checkpoint         = 113
+k-chain-reset        = 114
+k-snapshot           = 115
+k-media-retain       = 128
+k-ephemeral          = 240
+
+unknown-kind = uint   ; stored and ignored. Forward compatibility is a
+                      ; contract, not a courtesy.
+
+; 0x00F0 is the ONLY kind the relay may drop, and the only kind never written
+; to Postgres. It is therefore also the only kind sheddable under backpressure.
+
+; ---------------------------------------------------------------------------
+; Bodies whose shape is load-bearing for a security property.
+; The rest are opaque to this schema by design.
+; ---------------------------------------------------------------------------
+
+HeadAttestBody = {                       ; kind 0x0070
+  1 => [+ GroupHeads]
+}
+
+GroupHeads = {
+  1 => group-id
+  2 => [+ AuthorHead]                    ; every author this client has seen,
+                                         ; INCLUDING itself, and including every
+                                         ; agent whose key this device holds
+}
+
+AuthorHead = {
+  1 => principal-key
+  2 => counter                           ; highest ctr seen
+  3 => content-hash                      ; matching envelope hash
+  ? 4 => proxied-for                     ; set when this device attests on
+                                         ; behalf of an agent it issued
+}
+
+proxied-for = principal-key
+
+; Expected attesters for a group are its current DEVICE leaves, read from the
+; client's own ratchet tree. The relay is never consulted and cannot shrink the
+; set. Agent leaves are never expected attesters and never unattested: the app
+; that proxies an agent attests on its behalf, because that app is the component
+; that actually saw those envelopes leave.
+
+ChainResetBody = {                       ; kind 0x0072
+  1 => counter                           ; last link this author can prove
+  2 => content-hash                      ; its hash
+  3 => counter                           ; the counter it resumes at
+  4 => uint                              ; declared-at, ms
+}
+
+; A self-fork observed WITHOUT a matching chain.reset remains evidence and is
+; surfaced loudly. The distinction between a crash and an attack is made by the
+; author, in signed form, before the fact.
+
+RecoveryWrapBody = {                     ; kind 0x0061
+  1 => bstr                              ; sealed current epoch secret
+  2 => bstr                              ; sealed current GroupInfo
+  3 => blinded-tag                       ; per-epoch, NOT the recovery key
+}
+
+blinded-tag = bstr .size 32
+; Stored by the relay under a per-epoch blinded tag so that the existence of a
+; recovery principal is not itself a queryable fact.
+
+; Access-set rotations are NOT Payload events: Payload is encrypted. ACCESS is
+; a separately named cleartext control frame so the relay can validate its
+; version chain and revoke an authenticated device without reading workspace
+; content. See specs/backend/relay/wire.md.
+AccessPublishFrame = {
+  0 => 9,                                ; ACCESS frame type
+  1 => AccessSet
+}
+
+AccessSet = {
+  1 => group-id,                          ; workspace root group
+  2 => uint,                              ; exactly prior version + 1
+  3 => content-hash,                      ; prior set hash; all-zero at genesis
+  4 => uint,                              ; issued-at ms
+  5 => [+ salted-principal-hash],         ; connection-authorized principals
+  6 => [+ principal-key],                 ; device authorizers
+  7 => [+ principal-key],                 ; recovery principals
+  ? 8 => RecoveryQuorum,                  ; confirm-only external keys
+  9 => [* salted-principal-hash],         ; recovery rotation pending removals
+  10 => principal-key,                    ; signer
+  11 => bstr .size 64                     ; signature over keys 1..10
+}
+
+salted-principal-hash = bstr .size 32
+
+RecoveryQuorum = {
+  1 => uint,                              ; threshold, 1 <= m <= keys.len()
+  2 => [+ principal-key],                 ; unique sorted keys
+  ? 3 => [+ QuorumSignature]              ; confirmation only
+}
+
+QuorumSignature = {
+  1 => principal-key,
+  2 => bstr .size 64
+}
+
+MediaRetainBody = {                      ; kind 0x0080
+  1 => [* content-hash]                  ; ciphertext hashes still referenced
+  2 => uint                              ; asserted-at, ms
+}
+
+; ---------------------------------------------------------------------------
+; Transport frames. WebSocket over TLS, port 443, v1. Transport-agnostic so
+; QUIC can be added later without touching anything above layer 1.
+; ---------------------------------------------------------------------------
+
+Frame = ConnectFrame / AuthFrame / AccessPublishFrame / SubFrame / ReconFrame
+      / PushFrame / SendFrame / BlobFrame / ErrorFrame
+
+ConnectFrame = { 0 => 1, 1 => protocol-version, 2 => [* group-id] }
+AuthFrame    = { 0 => 2, 1 => bstr, ? 2 => bstr .size 64, ? 3 => AuthState }
+SubFrame     = { 0 => 3, 1 => [+ group-id], ? 2 => seq, ? 3 => bool }
+ReconFrame   = { 0 => 4, 1 => group-id, 2 => [* Fingerprint] }
+PushFrame    = { 0 => 5, 1 => Envelope }
+SendFrame    = { 0 => 6, 1 => Envelope }
+BlobFrame    = { 0 => 7, 1 => BlobTicket }
+ErrorFrame   = { 0 => 8, 1 => ErrorBody }
+
+AuthState = {
+  1 => uint                 ; relay time, ms. Observed, never trusted.
+  2 => uint                 ; this device's own unused key package count.
+                            ; Its own number, so this discloses nothing.
+  3 => write-mode           ; full or read_only
+  4 => enc-mode             ; the relay's configured MIN_ENC floor
+  ? 5 => tstr               ; non-content reason code when read_only
+}
+
+write-mode = "full" / "read_only"
+
+Fingerprint = { 1 => seq, 2 => seq, 3 => bstr .size 32 }   ; negentropy range
+
+BlobTicket = {
+  1 => content-hash         ; ciphertext hash. The relay never sees a key.
+  2 => uint                 ; size
+  3 => tstr                 ; presigned url
+  4 => uint                 ; expires-at, ms
+}
+
+ErrorBody = {
+  1 => error-class
+  2 => tstr                 ; stable code. registries/error-codes.md
+  ? 3 => bstr .size 32      ; current state hash, so the client can rebase
+  ? 4 => uint               ; retry-after, ms. Required for retry and quota.
+}
+
+error-class = "retry" / "reject" / "denied" / "quota" / "version"

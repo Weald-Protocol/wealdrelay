@@ -1,0 +1,84 @@
+[package]
+name = "weald-mls"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenMLS behind the narrow C ABI the Weald client links against."
+
+[lib]
+name = "weald_mls"
+path = "src/lib.rs"
+# rlib for the Rust test tiers, staticlib for the XCFramework step 7 vends.
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "crash-victim"
+path = "harness/crash-victim.rs"
+# Out of `src/` on purpose, and the reason is written up in
+# `specs/backend/build/testing.md`. This binary is a test fixture: it exists only so
+# `tests/crash.rs` has a process it can have killed by a real SIGABRT, and its own module
+# doc says nothing links it. A process killed by SIGABRT never writes its coverage profile,
+# so the two lines that do the killing cannot be measured by any means: the profile writer
+# is a local symbol that `dlsym` cannot find, and llvm's continuous mode writes zero
+# counters under this toolchain. Both were tried. A 100 percent floor over a file
+# containing those lines is unprovable rather than merely unmet, so the fixture sits beside
+# `tests/`, which is outside the measured source set for exactly the same reason. What it
+# does is still proven, by `tests/crash.rs` and `tests/crash_edges.rs`, which assert its
+# exit code and its stderr for every failure arm it has.
+#
+# `cargo test` otherwise compiles this bin a second time as its own unit-test harness.
+# It has no `#[test]` in it, so that second copy runs nothing, but it still carries a
+# coverage mapping for every `#[no_mangle]` symbol the library exports. Two mappings for
+# one symbol with different structural hashes is what llvm-cov calls "mismatched data",
+# and the copy it then reports is the one that never ran: lines this suite provably
+# executes get counted as missed. Building it once removes the ambiguity rather than
+# hiding the gap.
+test = false
+bench = false
+
+[features]
+# The panic injector in `ffi.rs`, and nothing else. Off by default and never enabled for
+# the XCFramework: a panic that a customer's process could raise on purpose would be a
+# denial of service with a friendly name. Enabled for this crate's own test targets by
+# the dev-dependency on itself below, which is the stable way to reach a feature from an
+# integration test without turning it on for the library everybody links.
+test-hooks = []
+
+[dependencies]
+# `pure` rather than the default, and it is not a performance preference. The default
+# backend compiles BLAKE3's C and its NEON assembly, and the app target already vendors
+# the same C at Sources/CBLAKE3 because specs/backend/relay/wire.md makes a BLAKE3 digest
+# the envelope's content address. Linking both produced a duplicate symbol for
+# `_blake3_compress_in_place_portable` and the app would not link. The pure-Rust backend
+# emits no C symbols, so there is exactly one copy of BLAKE3's C in the process and it is
+# the one the envelope code already used. The tag this crate hashes is 64 bytes once per
+# commit per recovery key, so the throughput difference is not measurable here.
+blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
+openmls = "0.8.1"
+openmls_basic_credential = "0.5"
+openmls_rust_crypto = "0.5.1"
+openmls_sqlite_storage = "0.2.0"
+openmls_traits = "0.5.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+
+[dev-dependencies]
+weald-mls = { path = ".", features = ["test-hooks"] }
+# The RFC 9420 interop vectors are hex in JSON. `hex` decodes them and nothing else.
+hex = { version = "0.4", features = ["serde"] }
+proptest = "1"
+tempfile = "3.27.0"
+# The same three crates the library already depends on, at the same versions, so
+# `tests/cross_version.rs` can mint a key package that advertises a capability set other
+# than this build's default. There is no other way to describe an older peer from outside
+# the crate, and inventing a second MLS to describe one with would be exactly the test
+# double `mls-binding.md` forbids.
+openmls = "0.8.1"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5.0"
+
+[lints]
+workspace = true

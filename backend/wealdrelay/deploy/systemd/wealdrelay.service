@@ -1,0 +1,65 @@
+# specs/backend/relay/deployment.md path 3: the bare binary, for a team with
+# existing Postgres and existing configuration management.
+#
+# Backups come before the start command in the docs for this path, because this
+# is the path where an operator is most likely to skip them. See
+# deploy/systemd/README.md.
+#
+#   install -m 0755 wealdrelay /usr/local/bin/wealdrelay
+#   useradd --system --home /var/lib/wealdrelay --shell /usr/sbin/nologin wealdrelay
+#   install -d -o wealdrelay -g wealdrelay -m 0750 /var/lib/wealdrelay/blobs
+#   install -m 0640 -o root -g wealdrelay wealdrelay.env /etc/wealdrelay.env
+#   systemctl enable --now wealdrelay
+
+[Unit]
+Description=Weald blind relay
+Documentation=https://github.com/hunterh37/Weald/blob/main/specs/backend/relay/server.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wealdrelay
+Group=wealdrelay
+EnvironmentFile=/etc/wealdrelay.env
+WorkingDirectory=/var/lib/wealdrelay
+ExecStart=/usr/local/bin/wealdrelay
+
+# EX_CONFIG. A misconfiguration is not something a restart loop will fix, so
+# systemd is told to stop rather than hammer the database with a bad URL.
+RestartPreventExitStatus=78
+Restart=on-failure
+RestartSec=5s
+
+# The relay holds no key and needs no privilege. Everything below is the
+# smallest set that still lets it write blobs and talk to Postgres.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadWritePaths=/var/lib/wealdrelay
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Journald. The relay writes structured JSON, one object per line.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

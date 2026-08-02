@@ -1,0 +1,22 @@
+Weald Relay
+Copyright 2026 Dicyanin Labs
+
+This product includes software developed at Dicyanin Labs.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License in the LICENSE file alongside this notice, or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This repository contains two crates, both under the same license:
+
+  backend/wealdrelay   the blind store-and-forward relay
+  backend/weald-mls    the C ABI binding over OpenMLS
+
+Each carries its own LICENSE and NOTICE. weald-mls links OpenMLS and its
+dependencies, which carry their own licenses; their terms are unchanged by this
+notice.
+
+The Weald macOS client is a separate, proprietary work. It is not in this
+repository and is not covered by this license.

@@ -1,0 +1,32 @@
+# The fuzz harness for `weald_mls_process`.
+#
+# `specs/backend/relay/mls-binding.md`: "Fuzzing of `weald_mls_process` with malformed and
+# hostile messages, since it is the one function that consumes bytes from an untrusted
+# network."
+#
+# Its own workspace, not a member of the repository's. cargo-fuzz builds with a sanitizer
+# and a nightly toolchain, and folding that into the workspace would put those flags on
+# every crate the relay ships.
+[package]
+name = "weald-mls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.weald-mls]
+path = ".."
+
+[[bin]]
+name = "process"
+path = "fuzz_targets/process.rs"
+test = false
+doc = false
+bench = false

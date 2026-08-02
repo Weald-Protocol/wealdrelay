@@ -1,0 +1,55 @@
+# Fly.io. specs/backend/relay/deployment.md path 1.
+#
+# Fly Postgres and Tigris (Fly's S3-compatible object storage) are attached by
+# `fly launch`, which writes DATABASE_URL and the AWS_* variables into secrets.
+# The two lines below map Fly's names onto the relay's, which is the only
+# provider-specific work on this path.
+#
+#   fly launch --copy-config --no-deploy
+#   fly postgres create && fly postgres attach <name>
+#   fly storage create
+#   fly secrets set WEALD_RELAY_DATABASE_URL="$(fly ssh console -C 'printenv DATABASE_URL')"
+#   fly deploy
+#
+# Then read the one-time enrollment URL out of `fly logs`.
+
+app = "weald-relay"
+primary_region = "iad"
+
+[build]
+  # Replace with the digest you verified before deploying. The release workflow
+  # publishes no moving tag, so `:latest` would never resolve:
+  #
+  #   image = "ghcr.io/hunterh37/weald-relay@sha256:..."
+  image = "ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0"
+
+[env]
+  WEALD_RELAY_LISTEN = "0.0.0.0:8443"
+  # Loopback. Fly gives every app a private 6PN address, but readiness and
+  # metrics have no reason to be on it (specs/backend/relay/server.md).
+  WEALD_RELAY_OBSERVABILITY_LISTEN = "127.0.0.1:9090"
+  # Fly terminates TLS at the edge proxy.
+  WEALD_RELAY_TLS = "off"
+  # Never weakened by a template.
+  WEALD_RELAY_ACCESS_SET = "enforce"
+  WEALD_RELAY_STORAGE_URL = "s3://weald-blobs"
+
+[http_service]
+  internal_port = 8443
+  force_https = true
+  auto_stop_machines = false
+  # Never zero. A relay that scaled to zero would drop every connected client
+  # and lose presence, and the wake latency lands on somebody typing.
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+[[vm]]
+  # specs/backend/relay/server.md sizing: 3 to 10 people.
+  size = "shared-cpu-1x"
+  memory = "512mb"

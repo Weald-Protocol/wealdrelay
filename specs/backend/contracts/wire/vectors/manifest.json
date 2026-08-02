@@ -1,0 +1,575 @@
+{
+  "$comment": "Conformance corpus for specs/backend/contracts/wire/wire.cddl. Every rejection class named in registries/error-codes.md must have at least one negative vector here, and spec-check.sh fails if one does not. Vectors are declarative: a generator materializes the CBOR from `fields`, so the corpus stays readable and diffable rather than being a directory of opaque blobs.",
+  "version": 1,
+  "max_ct_bytes": 1048576,
+  "vectors": [
+    {
+      "id": "env-valid-mls-first-link",
+      "expect": "accept",
+      "note": "Canonical accepted envelope. ctr 0, prev_self all-zero.",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "group": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-valid-max-ct",
+      "expect": "accept",
+      "note": "ct exactly at the configured ceiling. Boundary must be inclusive.",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "fill:1048576",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-valid-duplicate-hash-resend",
+      "expect": "accept",
+      "note": "Byte-identical resend of env-valid-mls-first-link. MUST return the ORIGINAL seq and MUST NOT take the per-group counter lock. Proves a crash-resend is free and never renumbers an author chain link.",
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-valid-ephemeral-not-persisted",
+      "expect": "accept",
+      "note": "kind 0x00F0 inside ct. Fans out, is never written to Postgres, and is the only kind droppable under backpressure. The integration proof asserts a zero-row delta.",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:ef00",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-reject-version-unsupported",
+      "expect": "version/protocol_unsupported",
+      "fields": {
+        "v": 2,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-denied-plaintext-under-mls-floor",
+      "expect": "denied/plaintext_refused",
+      "note": "THE hosted-tier property test. With WEALD_RELAY_MIN_ENC=mls this must be refused. Run against a relay configured exactly as hosted is configured, where the setting is not writable.",
+      "relay_config": {
+        "WEALD_RELAY_MIN_ENC": "mls"
+      },
+      "fields": {
+        "v": 1,
+        "enc": 0,
+        "epoch": 7,
+        "ct": "hex:706c61696e",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-accept-plaintext-under-none-floor",
+      "expect": "accept",
+      "note": "Same bytes as above under MIN_ENC=none. Self-host Phases 2 and 3 only. /readyz must report the setting and the client must render the explicit 'this relay accepts unencrypted envelopes' state.",
+      "relay_config": {
+        "WEALD_RELAY_MIN_ENC": "none"
+      },
+      "replays": "env-denied-plaintext-under-mls-floor"
+    },
+    {
+      "id": "env-reject-hash-mismatch",
+      "expect": "reject/hash_mismatch",
+      "note": "hash is valid BLAKE3 of a different ct. Must not be confused with a malformed hash.",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "hex:0000000000000000000000000000000000000000000000000000000000000001"
+      }
+    },
+    {
+      "id": "env-reject-hash-wrong-length",
+      "expect": "reject/malformed_header",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "hex:00112233"
+      }
+    },
+    {
+      "id": "env-reject-ct-oversize",
+      "expect": "reject/envelope_too_large",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "fill:1048577",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-reject-ct-empty",
+      "expect": "reject/malformed_header",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-reject-unknown-map-key",
+      "expect": "reject/unknown_required_field",
+      "note": "Unknown key 9 in the Envelope map. Envelope is closed; Payload kinds are open. Those two rules are deliberately opposite.",
+      "raw_cbor": "a90101020103582000112233445566778899aabbccddeeff00112233445566778899aabbccddeeff040705000600075820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4844d0c0ffee0901"
+    },
+    {
+      "id": "env-reject-indefinite-length-bstr",
+      "expect": "reject/noncanonical_cbor",
+      "note": "Deterministic CBOR is a validation rule, not a convention. An indefinite-length ct is refused even when it decodes to identical bytes.",
+      "raw_cbor": "indefinite-ct"
+    },
+    {
+      "id": "env-reject-unsorted-map-keys",
+      "expect": "reject/noncanonical_cbor",
+      "note": "Same eight fields, keys emitted descending. Refused so that `hash` is a stable content address rather than an encoder artifact.",
+      "raw_cbor": "descending-keys"
+    },
+    {
+      "id": "env-reject-nonshortest-integer",
+      "expect": "reject/noncanonical_cbor",
+      "note": "epoch 7 encoded as a two-byte uint.",
+      "raw_cbor": "nonshortest-epoch"
+    },
+    {
+      "id": "env-reject-float-field",
+      "expect": "reject/noncanonical_cbor",
+      "note": "ts as a float. No floats appear anywhere in this protocol.",
+      "raw_cbor": "float-ts"
+    },
+    {
+      "id": "env-denied-writer-not-in-access-set",
+      "expect": "denied/writer_not_in_access_set",
+      "note": "Well-formed, correctly hashed envelope sent on a session authenticated by a key absent from the latest ACCESS set. This is the one authorization decision the relay makes, and it makes it without reading ciphertext.",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "computed"
+      },
+      "session_device": "unenrolled"
+    },
+    {
+      "id": "env-denied-unknown-group",
+      "expect": "denied/group_unknown",
+      "fields": {
+        "v": 1,
+        "enc": 1,
+        "group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "epoch": 7,
+        "ct": "hex:d0c0ffee",
+        "hash": "computed"
+      }
+    },
+    {
+      "id": "env-denied-service-read-only",
+      "expect": "denied/service_read_only",
+      "note": "Durable SEND under WEALD_RELAY_WRITE_MODE=read_only. The paired positive assertion is that SUB, RECON, export and recovery reads all still succeed in the same run. A read-only relay that also stops reconciling is a bug, not a safer state.",
+      "relay_config": {
+        "WEALD_RELAY_WRITE_MODE": "read_only"
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-quota-storage-exhausted",
+      "expect": "quota/storage_exhausted",
+      "note": "Must carry retry-after. Must never be a silent accept.",
+      "relay_config": {
+        "storage_full": true
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-retry-backpressure",
+      "expect": "retry/backpressure",
+      "note": "Receive queue full. The relay must stop reading the socket and push back through TCP rather than accepting and discarding, because a dropped envelope is a hole in an author chain and therefore a security alarm on somebody else's screen. Must carry retry-after.",
+      "relay_config": {
+        "inject": "receive_queue_full"
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-retry-lock-timeout",
+      "expect": "retry/lock_timeout",
+      "note": "Per-group counter row lock timed out. This code appearing above noise is a REGRESSION alarm, not a capacity signal: with no relay-maintained head chain, SEND is never supposed to contend across groups. The test asserts that a concurrent write to a DIFFERENT group in the same run does not produce it.",
+      "relay_config": {
+        "inject": "counter_lock_timeout"
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-retry-failover",
+      "expect": "retry/failover",
+      "note": "Database failover mid-transaction. The client resends verbatim and the duplicate-hash path returns the original seq if the first write committed.",
+      "relay_config": {
+        "inject": "db_failover"
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-quota-rate-limited",
+      "expect": "quota/rate_limited",
+      "note": "Per-IP connection rate limit exceeded. Sized for cost control, not confidentiality: an attacker holding a key can consume bandwidth and quota and can read nothing.",
+      "relay_config": {
+        "rate_limit_connections_per_ip": 1
+      }
+    },
+    {
+      "id": "env-quota-seats-exhausted",
+      "expect": "quota/seats_exhausted",
+      "note": "Workspace seat limit reached at admission. Must name the limit and the lever that clears it.",
+      "relay_config": {
+        "seats": 1
+      }
+    },
+    {
+      "id": "env-quota-group-ingress-principal-minute",
+      "expect": "quota/group_ingress_limited",
+      "note": "The admission-blind abuse budget in relay/wire.md: 8 MiB per authenticated principal per target group per minute. This is the vector the guard exists for. Because the relay cannot establish MLS membership from opaque ciphertext, an access-set principal who merely knows a group id can otherwise inject into it; the budget is what stops a known-but-nonmember group being made expensive. Must be retryable and must carry retry-after and the limit.",
+      "session_device": "device-a",
+      "relay_config": {
+        "group_ingress_principal_bytes_per_minute": 8388608,
+        "clock": "frozen"
+      },
+      "repeat": 9,
+      "replays": "env-valid-max-ct"
+    },
+    {
+      "id": "env-accept-group-ingress-principal-minute-boundary",
+      "expect": "accept",
+      "note": "Eight maximum-size envelopes in one frozen minute, exactly at the per-principal-per-group budget. The boundary is inclusive, as it is for max_ct_bytes: wire.md sets the limit so that eight maximum-size document changes per minute stay well above normal interactive use, so the eighth must be accepted. A guard that rejects at the limit rather than above it turns a cost control into an outage.",
+      "session_device": "device-a",
+      "relay_config": {
+        "group_ingress_principal_bytes_per_minute": 8388608,
+        "clock": "frozen"
+      },
+      "repeat": 8,
+      "replays": "env-valid-max-ct"
+    },
+    {
+      "id": "env-quota-group-ingress-workspace-minute",
+      "expect": "quota/group_ingress_limited",
+      "note": "The 64 MiB per workspace per minute half of the same budget, reached across several groups by one principal so that no per-group counter alone would have caught it. Same stable code, because a client's remedy is identical and the distinction is an operator concern.",
+      "session_device": "device-a",
+      "relay_config": {
+        "group_ingress_workspace_bytes_per_minute": 67108864,
+        "clock": "frozen"
+      },
+      "repeat": 65,
+      "replays": "env-valid-max-ct"
+    },
+    {
+      "id": "env-quota-group-ingress-backlog",
+      "expect": "quota/group_ingress_limited",
+      "note": "32 MiB of not-yet-delivered envelope backlog per principal/group, with no subscriber draining it. Distinct from the two rate limits: this one is a standing volume rather than a per-minute flow, so a sender who waits out a minute must still be refused while the backlog stands. Distinct from retry/backpressure, which is the relay's own receive queue rather than an undelivered store.",
+      "session_device": "device-a",
+      "relay_config": {
+        "group_ingress_backlog_bytes": 33554432,
+        "no_subscribers": true
+      },
+      "repeat": 33,
+      "replays": "env-valid-max-ct"
+    },
+    {
+      "id": "env-quota-group-ingress-charged-before-persistence",
+      "expect": "quota/group_ingress_limited",
+      "note": "The property that makes the guard worth having: the budget is charged before persistence, so a refused SEND must leave nothing behind. After this vector the group's head, its seq and its storage footprint must be byte-identical to their values before it, and the per-group counter lock must never have been taken. A guard that rejects after writing has already paid the cost it exists to avoid.",
+      "session_device": "device-a",
+      "relay_config": {
+        "group_ingress_principal_bytes_per_minute": 0,
+        "assert_no_write": true
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "env-accept-blob-not-charged-to-group-ingress",
+      "expect": "accept",
+      "note": "wire.md is explicit that media uses BLOB and not this path, so a BLOB well past the SEND ingress budget must be accepted. Present because the cheapest wrong implementation of this guard is one counter over all inbound bytes, which would break media upload for every paying customer and would pass every other vector here.",
+      "session_device": "device-a",
+      "frame": "BLOB",
+      "relay_config": {
+        "group_ingress_principal_bytes_per_minute": 1
+      }
+    },
+    {
+      "id": "env-version-below-client-floor",
+      "expect": "version/below_client_floor",
+      "note": "Relay advertises a version below the client's pinned floor on CONNECT. The client MUST abort the connection and must never silently continue, because silently continuing is the downgrade this field exists to prevent.",
+      "relay_config": {
+        "advertise_version": 0
+      }
+    },
+    {
+      "id": "invite-denied-code-invalid",
+      "expect": "denied/invite_code_invalid",
+      "note": "Wrong code half. Counts against the 5-per-token budget and the 100-per-source-IP-per-hour budget. Argon2id cost must make guessing expensive for the attacker and unnoticeable for the joiner, so the test asserts both the rejection and the latency floor.",
+      "invite": {
+        "code": "wrong",
+        "attempt": 1
+      }
+    },
+    {
+      "id": "invite-denied-attempts-exhausted",
+      "expect": "denied/invite_code_invalid",
+      "note": "Sixth attempt on one token. Must remain the same code rather than a distinguishable one, so a guesser learns nothing from the boundary.",
+      "invite": {
+        "code": "wrong",
+        "attempt": 6
+      }
+    },
+    {
+      "id": "invite-denied-seat-spent",
+      "expect": "denied/invite_seat_spent",
+      "invite": {
+        "seats": 1,
+        "already_redeemed": 1
+      }
+    },
+    {
+      "id": "invite-denied-expired",
+      "expect": "denied/invite_expired",
+      "note": "Evaluated against the client's own clock. Paired with clock-skew-refuses-issuance-only: a client outside the skew bound refuses to ISSUE an invite precisely so that a 24-hour credential never becomes a 24-day one.",
+      "invite": {
+        "expired_minutes_ago": 1
+      }
+    },
+    {
+      "id": "wrap-accept-first-in-slot",
+      "expect": "accept",
+      "note": "A recovery wrap for an empty (group, tag) slot. The relay stores it without opening it: the tag is BLAKE3(export(weald wraptag v1) || recovery_pubkey), derived from the group's own epoch secret, so the relay holds an opaque slot and not an identity.",
+      "wrap": {
+        "tag": "aa",
+        "epoch": 4,
+        "slot": "empty"
+      }
+    },
+    {
+      "id": "wrap-accept-advances-the-slot",
+      "expect": "accept",
+      "note": "The same slot at a later epoch. The superseded wrap moves to the prior slot and is retained for 30 days, which is the overlap a two-phase cross-group recovery handoff lands in.",
+      "wrap": {
+        "tag": "aa",
+        "epoch": 5,
+        "slot": "holds-epoch-4"
+      }
+    },
+    {
+      "id": "wrap-denied-not-newer",
+      "expect": "denied/wrap_not_newer",
+      "note": "A captured wrap offered again. Equal epochs are refused by the same rule as older ones: a slot that can be rewritten at its current epoch is a slot an attacker can overwrite with a value nobody can open. The relay cannot verify the seal, so monotonicity is the entire defence available to it.",
+      "wrap": {
+        "tag": "aa",
+        "epoch": 4,
+        "slot": "holds-epoch-5"
+      }
+    },
+    {
+      "id": "wrap-reject-tag-shared-across-groups",
+      "expect": "reject/malformed_header",
+      "note": "The same tag offered in a second group. This is the one row that would turn the wrap table into a group-membership graph, since joining two groups on a common tag says they share a person. Refused by a unique index, so the refusal survives any code path that forgets to check.",
+      "wrap": {
+        "tag": "aa",
+        "epoch": 1,
+        "slot": "empty",
+        "group": "second"
+      }
+    },
+    {
+      "id": "env-denied-group-frozen",
+      "expect": "denied/group_frozen",
+      "note": "Group frozen by a retention chain or an in-flight commit. Must carry the current state hash so the client rebases rather than guesses.",
+      "relay_config": {
+        "freeze_group": true
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
+      "id": "chain-valid-dense",
+      "expect": "client_accept",
+      "note": "Client-side vector. ctr 0,1,2 with correct prev_self linkage.",
+      "chain": [
+        {
+          "ctr": 0,
+          "prev": "zero"
+        },
+        {
+          "ctr": 1,
+          "prev": "link0"
+        },
+        {
+          "ctr": 2,
+          "prev": "link1"
+        }
+      ]
+    },
+    {
+      "id": "chain-gap-no-reset-is-evidence",
+      "expect": "client_split_view_warning",
+      "note": "ctr 0 then 2. The receiving client must retain and render the payload as rejected, never drop it, and must raise the split-view warning naming the author.",
+      "chain": [
+        {
+          "ctr": 0,
+          "prev": "zero"
+        },
+        {
+          "ctr": 2,
+          "prev": "link0"
+        }
+      ]
+    },
+    {
+      "id": "chain-gap-with-reset-is-stated",
+      "expect": "client_unverified_gap",
+      "note": "Same gap preceded by a signed chain.reset (0x0072). Renders as a chain reset by that author at that date, NOT as tampering. This vector is the one that keeps the alarm from being trained into noise by ordinary crashes.",
+      "chain": [
+        {
+          "ctr": 0,
+          "prev": "zero"
+        },
+        {
+          "kind": "0x0072",
+          "last_proven": 0,
+          "resumes_at": 2
+        },
+        {
+          "ctr": 2,
+          "prev": "link0"
+        }
+      ]
+    },
+    {
+      "id": "chain-fork-same-ctr-different-content",
+      "expect": "client_split_view_warning",
+      "note": "Two distinct envelopes at ctr 1 from one author. An honest client can never produce this, because the counter is written ahead of the wire in the same transaction as the MLS state.",
+      "chain": [
+        {
+          "ctr": 0,
+          "prev": "zero"
+        },
+        {
+          "ctr": 1,
+          "prev": "link0",
+          "body": "A"
+        },
+        {
+          "ctr": 1,
+          "prev": "link0",
+          "body": "B"
+        }
+      ]
+    },
+    {
+      "id": "attest-device-silent-against-evidence",
+      "expect": "client_split_view_warning",
+      "note": "Application envelopes arrive from a device author while no head.attest from that author arrives across two consecutive rounds.",
+      "attest": {
+        "rounds": 2,
+        "author_kind": "device",
+        "sends_envelopes": true,
+        "attests": false
+      }
+    },
+    {
+      "id": "attest-device-absent-quietly-is-normal",
+      "expect": "client_accept",
+      "note": "A shut laptop. Absence alone raises nothing. This negative-of-the-negative vector exists so the detector cannot be tightened into a false-positive generator.",
+      "attest": {
+        "rounds": 4,
+        "author_kind": "device",
+        "sends_envelopes": false,
+        "attests": false
+      }
+    },
+    {
+      "id": "attest-agent-unproxied-is-warning",
+      "expect": "client_split_view_warning",
+      "note": "Agent envelopes arrive while its issuing device attested in the same round WITHOUT covering that agent. The pair contradict each other and the warning names both.",
+      "attest": {
+        "author_kind": "agent",
+        "sends_envelopes": true,
+        "issuer_attests": true,
+        "issuer_covers_agent": false
+      }
+    },
+    {
+      "id": "attest-agent-proxied-is-normal",
+      "expect": "client_accept",
+      "note": "Ordinary agent traffic, covered by the proxying device. Agents are the highest-volume writers in the system, so this must be silent or the warning is worthless.",
+      "attest": {
+        "author_kind": "agent",
+        "sends_envelopes": true,
+        "issuer_attests": true,
+        "issuer_covers_agent": true
+      }
+    },
+    {
+      "id": "attest-agent-issuer-offline-is-normal",
+      "expect": "client_accept",
+      "note": "Agent silent because its issuing device is offline. The ordinary silence of a shut laptop.",
+      "attest": {
+        "author_kind": "agent",
+        "sends_envelopes": false,
+        "issuer_attests": false
+      }
+    },
+    {
+      "id": "attest-total-silence-with-live-traffic",
+      "expect": "client_split_view_warning",
+      "note": "Envelopes arriving, zero peer attestations for 60 minutes. Warning names the RELAY rather than any author. This is the vector that closes the fail-open hole where a relay withholds every attestation from the client it is lying to.",
+      "attest": {
+        "minutes": 60,
+        "peer_attestations": 0,
+        "receiving_envelopes": true
+      }
+    },
+    {
+      "id": "attest-expected-set-comes-from-ratchet-tree",
+      "expect": "client_split_view_warning",
+      "note": "Relay serves an attestation set smaller than the client's own ratchet tree device leaves. The client must compute the expected set locally and report agreement as a fraction of it, naming who it has not heard from. A relay that can shrink the expected set can hide a partition.",
+      "attest": {
+        "relay_claims_leaves": 2,
+        "ratchet_tree_device_leaves": 5
+      }
+    },
+    {
+      "id": "seq-gap-after-rollback-is-legal",
+      "expect": "client_accept",
+      "note": "A gap left by a rolled-back transaction. Negentropy reconciles over the space that exists, not over a dense range. A client that treats a seq gap as an alarm has confused the sync cursor with the author chain."
+    },
+    {
+      "id": "clock-skew-refuses-issuance-only",
+      "expect": "client_clock_warning",
+      "note": "Local clock 6 minutes from observed relay time. Client raises the warning naming the skew and refuses to ISSUE certificates or invites, while continuing to read, write and sync. Refusing to work would be a worse failure than a stale expiry check.",
+      "clock": {
+        "skew_minutes": 6
+      }
+    },
+    {
+      "id": "clock-skew-under-bound-is-silent",
+      "expect": "client_accept",
+      "clock": {
+        "skew_minutes": 4
+      }
+    }
+  ]
+}

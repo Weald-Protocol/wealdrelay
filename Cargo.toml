@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["backend/wealdrelay", "backend/weald-mls"]
+
+[workspace.package]
+edition = "2021"
+# Apache 2.0, per the decision recorded in specs/backend/README.md (Relay license)
+# and specs/backend/cloud/onboarding-flows.md. Verification requires public source,
+# so the relay and the MLS binding are the two crates that ship under it. The macOS
+# client is not in this workspace and stays proprietary: see LICENSE.md at the root.
+license = "Apache-2.0"
+repository = "https://github.com/hunterh37/Weald"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Never panic = "abort": weald-mls relies on catch_unwind at every C ABI entry
+# point per specs/backend/relay/mls-binding.md, and abort would bypass it.
+strip = true

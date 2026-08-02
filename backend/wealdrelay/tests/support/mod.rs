@@ -1,0 +1,856 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dicyanin Labs
+//! The shared integration harness: a scratch database, a running relay, and a
+//! hand-written WebSocket client.
+//!
+//! Extracted from `tests/ws.rs` when step 5 added a second integration suite over
+//! the same wire. One harness rather than two, because two would drift and the
+//! whole value of a hand-rolled client is that it speaks the protocol a real client
+//! has to speak rather than the relay's own encoder talking to itself.
+//!
+//! Nothing here is a mock. The database is the harness Postgres from
+//! `scripts/weald-stack`, the relay is `serve::run` on ephemeral ports, and the
+//! sockets are real WebSockets with real masking and a real close handshake.
+
+#![allow(dead_code)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ed25519_dalek::{Signer, SigningKey};
+use sqlx::{Connection, Executor as _, PgConnection};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+use wealdrelay::access::AccessSet;
+use wealdrelay::config::{keys, Config, Values};
+use wealdrelay::envelope::{content_hash, Encryption, Envelope};
+use wealdrelay::frame::{Frame, PROTOCOL_VERSION};
+use wealdrelay::health::{Clock, RelayState};
+use wealdrelay::serve;
+
+// MARK: The harness
+
+pub fn postgres_port() -> String {
+    std::env::var("WEALD_STACK_PG_PORT").unwrap_or_else(|_| "54032".to_string())
+}
+
+pub fn admin_url() -> String {
+    format!(
+        "postgres://weald:weald@127.0.0.1:{}/weald_relay",
+        postgres_port()
+    )
+}
+
+/// A database of its own per test, because `testing.md` forbids two tests sharing
+/// a database name or a port.
+pub struct Scratch {
+    pub name: String,
+    pub url: String,
+}
+
+impl Scratch {
+    pub async fn new(label: &str) -> Self {
+        // The label reaches Postgres as part of an identifier, and an identifier
+        // is not a string: `recon-over-queue` is a subtraction to the parser and
+        // every statement naming it is a syntax error before it is anything else.
+        // Normalised here rather than at the call sites, because a caller has no
+        // reason to know that and the failure it produces names the harness
+        // rather than the label that caused it.
+        let label: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let name = format!("weald_step4_ws_{label}_{}", std::process::id());
+        let mut admin = PgConnection::connect(&admin_url()).await.expect(
+            "Postgres is not reachable. This is an integration test and it does not skip: \
+             run `scripts/weald-stack up`.",
+        );
+        admin
+            .execute(format!("drop database if exists {name}").as_str())
+            .await
+            .expect("drop a leftover");
+        admin
+            .execute(format!("create database {name}").as_str())
+            .await
+            .expect("create the scratch database");
+        let url = format!(
+            "postgres://weald:weald@127.0.0.1:{}/{name}",
+            postgres_port()
+        );
+        Self { name, url }
+    }
+
+    pub async fn drop_database(&self) {
+        if let Ok(mut admin) = PgConnection::connect(&admin_url()).await {
+            let _ = admin
+                .execute(format!("drop database if exists {} with (force)", self.name).as_str())
+                .await;
+        }
+    }
+}
+
+pub fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
+    Config::resolve(&Values::from_pairs([
+        (keys::HOSTNAME, "localhost".to_string()),
+        (keys::DATABASE_URL, scratch.url.clone()),
+        (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+        (keys::LISTEN, "127.0.0.1:0".to_string()),
+        (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+        (keys::RELEASE_CHECK, "off".to_string()),
+    ]))
+    .expect("the integration configuration resolves")
+}
+
+/// A relay, running, with the address a client connects to.
+pub struct Running {
+    pub address: std::net::SocketAddr,
+    pub state: Arc<RelayState>,
+    pub stop: Option<tokio::sync::oneshot::Sender<()>>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    pub async fn start(config: Config, clock: Clock) -> Self {
+        Self::start_with(config, clock, |_| {}).await
+    }
+
+    /// The same, with one hook into the prepared state before it is shared.
+    ///
+    /// Step 9 needs it: `media` behaves differently against an S3-compatible
+    /// bucket than against the filesystem backend (a real presigned request
+    /// rather than a token over the relay's own listener), and pointing a relay
+    /// at the harness MinIO means handing it a client built for that endpoint
+    /// rather than one built from the ambient AWS chain. Nothing is faked here:
+    /// the store the hook installs is the same `storage::Store` `storage::open`
+    /// returns, talking to the same MinIO the storage contract suite uses.
+    pub async fn start_with(
+        config: Config,
+        clock: Clock,
+        mutate: impl FnOnce(&mut RelayState),
+    ) -> Self {
+        let mut state = serve::prepare(config).await.expect("prepare the relay");
+        state.clock = clock;
+        mutate(&mut state);
+        let state = Arc::new(state);
+        let (public, private) = serve::bind(&state).await.expect("bind");
+        let address = public.local_addr().expect("a public address");
+        let (stop, wait) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve::run(
+            Arc::clone(&state),
+            public,
+            private,
+            async move {
+                let _ = wait.await;
+            },
+        ));
+        Self {
+            address,
+            state,
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+// MARK: A client, written the way a client has to be
+
+/// A WebSocket client over a raw TCP socket.
+///
+/// Hand rolled deliberately. A client crate would be fine for convenience, but
+/// the masking rule, the frame header and the close handshake are the parts of the
+/// protocol a real client has to get right, and a test that outsourced them would
+/// not notice a relay that only worked with one library.
+pub struct Client {
+    pub stream: TcpStream,
+    /// Bytes read from the socket and not yet consumed as a message.
+    pub buffer: Vec<u8>,
+}
+
+impl Client {
+    pub async fn connect(address: std::net::SocketAddr) -> Self {
+        Self::upgrade(TcpStream::connect(address).await.expect("connect")).await
+    }
+
+    /// A client whose kernel receive buffer is tiny and which resets rather than
+    /// closes.
+    ///
+    /// The small buffer is so that a client which stops reading blocks the relay's
+    /// writer within a few hundred frames rather than after however many the
+    /// operating system felt like buffering. `SO_LINGER` at zero is so that dropping
+    /// the socket sends a reset, which is what a killed client process looks like
+    /// from the relay's side, rather than the polite close a well behaved client
+    /// sends. Those two settings are the only thing unusual about it.
+    ///
+    /// `set_linger` is deprecated because a non-zero linger blocks the thread on
+    /// drop. Zero is the case that does not: it discards the send buffer and resets
+    /// immediately, which is the whole reason it is here.
+    #[allow(deprecated)]
+    pub async fn connect_by_a_client_that_will_die_badly(address: std::net::SocketAddr) -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket
+            .set_recv_buffer_size(1024)
+            .expect("shrink the receive buffer");
+        let stream = socket.connect(address).await.expect("connect");
+        stream
+            .set_linger(Some(Duration::ZERO))
+            .expect("reset instead of closing");
+        Self::upgrade(stream).await
+    }
+
+    pub async fn upgrade(mut stream: TcpStream) -> Self {
+        // The handshake. A fixed key, because the server's accept value is a
+        // function of it and nothing in this test depends on it being random.
+        let host = stream.peer_addr().expect("a peer address");
+        let request = format!(
+            "GET /relay HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the handshake");
+
+        // Read to the end of the headers, and no further: anything after them is a
+        // frame this client still has to consume.
+        let mut buffer = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buffer.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut byte).await.expect("read the response");
+            assert_eq!(read, 1, "the relay closed during the handshake");
+            buffer.push(byte[0]);
+        }
+        let response = String::from_utf8_lossy(&buffer);
+        assert!(
+            response.starts_with("HTTP/1.1 101"),
+            "the relay refused the upgrade: {response}"
+        );
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Send one binary message. Masked, because a client that did not mask would be
+    /// closed by any conforming server, and the relay is one.
+    pub async fn send(&mut self, payload: &[u8]) {
+        self.send_opcode(0x2, payload).await;
+    }
+
+    /// Send one message with an opcode of the caller's choosing, so a test can put a
+    /// real ping, pong or close on the wire rather than a data frame that stands in
+    /// for one.
+    pub async fn send_opcode(&mut self, opcode: u8, payload: &[u8]) {
+        let mut frame = vec![0x80 | opcode];
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        match payload.len() {
+            length if length < 126 => frame.push(0x80 | length as u8),
+            length if length <= u16::MAX as usize => {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+            length => {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % 4]);
+        }
+        self.stream.write_all(&frame).await.expect("send a frame");
+    }
+
+    pub async fn send_frame(&mut self, frame: &Frame) {
+        self.send(&frame.encode()).await;
+    }
+
+    /// Read one message payload, or `None` if the relay closed.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(message) = self.take_message() {
+                return message;
+            }
+            let mut chunk = [0u8; 8192];
+            let read = self.stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// A whole message from the buffer, if one is there. The outer option is
+    /// "enough bytes"; the inner is "a data frame rather than a close".
+    pub fn take_message(&mut self) -> Option<Option<Vec<u8>>> {
+        if self.buffer.len() < 2 {
+            return None;
+        }
+        let opcode = self.buffer[0] & 0x0f;
+        let indicator = self.buffer[1] & 0x7f;
+        // A server never masks, so there is no mask key to skip.
+        let (length, header) = match indicator {
+            126 => {
+                if self.buffer.len() < 4 {
+                    return None;
+                }
+                (
+                    u16::from_be_bytes([self.buffer[2], self.buffer[3]]) as usize,
+                    4,
+                )
+            }
+            127 => {
+                if self.buffer.len() < 10 {
+                    return None;
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&self.buffer[2..10]);
+                (u64::from_be_bytes(bytes) as usize, 10)
+            }
+            small => (small as usize, 2),
+        };
+        if self.buffer.len() < header + length {
+            return None;
+        }
+        let payload = self.buffer[header..header + length].to_vec();
+        self.buffer.drain(..header + length);
+        // 0x8 is close. 0x9 and 0xa are ping and pong, which are the transport's:
+        // consumed and skipped, and if nothing whole is left behind them the answer
+        // is "not enough bytes yet" rather than "closed". Reporting a closed
+        // connection because a pong arrived on its own would make every test that
+        // provokes one fail for the wrong reason.
+        match opcode {
+            0x8 => Some(None),
+            0x9 | 0xa => self.take_message(),
+            _ => Some(Some(payload)),
+        }
+    }
+
+    /// One decoded frame, or a failure naming what arrived instead.
+    pub async fn recv_frame(&mut self) -> Frame {
+        let payload = self.recv().await.expect("the relay closed unexpectedly");
+        Frame::decode(&payload).expect("the relay sent something that is not a frame")
+    }
+
+    /// Walk the handshake to a Ready session, and return the challenge the relay
+    /// issued so a caller can check it was used.
+    ///
+    /// Signed by ``default_device()``, which is the device every suite's genesis
+    /// access set names. Step 6 made `AUTH` a real check: the signature is verified
+    /// against the challenge this connection issued, and the key is tested against
+    /// the workspace's access set, so a handshake with a made-up key and a made-up
+    /// signature is now a closed socket rather than an `AuthAck`.
+    pub async fn handshake(&mut self, groups: Vec<Vec<u8>>, client_clock: u64) -> Vec<u8> {
+        self.handshake_as(&default_device(), groups, client_clock)
+            .await
+    }
+
+    /// The same, as a named device.
+    pub async fn handshake_as(
+        &mut self,
+        key: &SigningKey,
+        groups: Vec<Vec<u8>>,
+        client_clock: u64,
+    ) -> Vec<u8> {
+        let challenge = self.handshake_to_challenge(groups, client_clock).await;
+        self.send_frame(&Frame::Auth {
+            device_key: key.verifying_key().to_bytes().to_vec(),
+            signature: Signer::sign(key, &challenge).to_bytes().to_vec(),
+        })
+        .await;
+        match self.recv_frame().await {
+            Frame::AuthAck { .. } => {}
+            other => panic!("expected an AuthAck, got {other:?}"),
+        }
+        challenge
+    }
+
+    /// `CONNECT` and stop at the challenge, for a caller that wants to answer it
+    /// wrongly on purpose.
+    pub async fn handshake_to_challenge(
+        &mut self,
+        groups: Vec<Vec<u8>>,
+        client_clock: u64,
+    ) -> Vec<u8> {
+        self.send_frame(&Frame::Connect {
+            version: PROTOCOL_VERSION,
+            groups,
+            sent_at: client_clock,
+        })
+        .await;
+        match self.recv_frame().await {
+            Frame::ConnectAck { version, .. } => assert_eq!(version, PROTOCOL_VERSION),
+            other => panic!("expected a ConnectAck, got {other:?}"),
+        }
+        match self.recv_frame().await {
+            Frame::AuthChallenge { challenge } => challenge,
+            other => panic!("expected an AuthChallenge, got {other:?}"),
+        }
+    }
+}
+
+// MARK: Devices and the genesis access set
+
+/// The device every suite connects as unless it says otherwise.
+///
+/// Fixed bytes rather than generated, so a failure reproduces and so the entry hash
+/// in a dumped table is the same on every machine. It is a secret in no sense: it is
+/// in a test file in a public repository, which is exactly why no production path
+/// may ever accept a hard-coded key.
+pub fn default_device() -> SigningKey {
+    SigningKey::from_bytes(&[0x31; 32])
+}
+
+/// A second device, for the tests that need two.
+pub fn other_device() -> SigningKey {
+    SigningKey::from_bytes(&[0x32; 32])
+}
+
+pub fn device_from(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Publish a genesis access set naming these devices, straight into the database.
+///
+/// Seeded rather than sent over a socket, and the distinction matters. What the
+/// socket path does is proven by its own tests in `tests/access.rs`, which drive
+/// `ACCESS` frames end to end. Every *other* suite needs a workspace that admits its
+/// client, and making forty tests walk a publication to get there would make the
+/// access set the subject of every one of them.
+pub async fn seed_access_set(state: &Arc<RelayState>, workspace: &str, devices: &[SigningKey]) {
+    let pool = state.database.as_ref().expect("a database").pool();
+    let salt = wealdrelay::access::store::salt(pool, workspace)
+        .await
+        .expect("a workspace salt");
+    let signer = devices.first().expect("at least one device").clone();
+    let mut entries: Vec<Vec<u8>> = devices
+        .iter()
+        .map(|device| wealdrelay::access::entry_hash(&device.verifying_key().to_bytes(), &salt))
+        .collect();
+    // The recovery principal, which every set must have: `wire.md` requires
+    // `recovery` to be non-empty and every recovery key to hash to an entry.
+    let recovery = device_from(0x3f);
+    entries.push(wealdrelay::access::entry_hash(
+        &recovery.verifying_key().to_bytes(),
+        &salt,
+    ));
+    entries.sort();
+    entries.dedup();
+
+    let mut set = AccessSet {
+        workspace: vec![0u8; 32],
+        version: 0,
+        prev_hash: vec![0u8; 32],
+        issued_at: 0,
+        entries,
+        authorizers: vec![signer.verifying_key().to_bytes().to_vec()],
+        recovery: vec![recovery.verifying_key().to_bytes().to_vec()],
+        quorum: None,
+        pending: Vec::new(),
+        signer: signer.verifying_key().to_bytes().to_vec(),
+        sig: vec![0u8; 64],
+    };
+    set.sig = Signer::sign(&signer, &set.digest_input())
+        .to_bytes()
+        .to_vec();
+    let body = set.encode();
+    wealdrelay::access::store::publish(pool, workspace, &set, &body)
+        .await
+        .expect("the genesis access set is accepted");
+}
+
+/// The same as ``seed_access_set``, but with an explicit `authorizers` list
+/// rather than the first device alone. Needed by the media step's threshold
+/// tests, which have to exercise both the two-authorizer and the
+/// sole-authorizer paths on purpose rather than getting whichever one
+/// ``seed_access_set`` happens to produce.
+pub async fn seed_access_set_with_authorizers(
+    state: &Arc<RelayState>,
+    workspace: &str,
+    devices: &[SigningKey],
+    authorizers: &[SigningKey],
+) {
+    let pool = state.database.as_ref().expect("a database").pool();
+    let salt = wealdrelay::access::store::salt(pool, workspace)
+        .await
+        .expect("a workspace salt");
+    let signer = devices.first().expect("at least one device").clone();
+    let mut entries: Vec<Vec<u8>> = devices
+        .iter()
+        .map(|device| wealdrelay::access::entry_hash(&device.verifying_key().to_bytes(), &salt))
+        .collect();
+    let recovery = device_from(0x3f);
+    entries.push(wealdrelay::access::entry_hash(
+        &recovery.verifying_key().to_bytes(),
+        &salt,
+    ));
+    entries.sort();
+    entries.dedup();
+
+    let mut set = AccessSet {
+        workspace: vec![0u8; 32],
+        version: 0,
+        prev_hash: vec![0u8; 32],
+        issued_at: 0,
+        entries,
+        authorizers: {
+            // `AccessSet::check_shape` requires every principal list to be
+            // sorted and unique, so the caller passes the keys it means and the
+            // ordering is decided here rather than at each call site.
+            let mut keys: Vec<Vec<u8>> = authorizers
+                .iter()
+                .map(|key| key.verifying_key().to_bytes().to_vec())
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        },
+        recovery: vec![recovery.verifying_key().to_bytes().to_vec()],
+        quorum: None,
+        pending: Vec::new(),
+        signer: signer.verifying_key().to_bytes().to_vec(),
+        sig: vec![0u8; 64],
+    };
+    set.sig = Signer::sign(&signer, &set.digest_input())
+        .to_bytes()
+        .to_vec();
+    let body = set.encode();
+    wealdrelay::access::store::publish(pool, workspace, &set, &body)
+        .await
+        .expect("the genesis access set is accepted");
+}
+
+/// A group the relay knows about, in a workspace whose access set admits the two
+/// devices every suite uses.
+///
+/// The access set half is seeded here rather than at each of the thirty call sites.
+/// Step 6 made `enforce` the default in every environment, so a group in a workspace
+/// with no set puts every connecting client into `Bootstrapping`, where the only
+/// frame it may send is `ACCESS`. Before step 6 that state did not exist and this
+/// helper did not need to know about it.
+pub async fn make_group(state: &Arc<RelayState>, byte: u8) -> Vec<u8> {
+    let pool = state.database.as_ref().expect("a database").pool();
+    if wealdrelay::access::store::current(pool, "ws-step4")
+        .await
+        .expect("read the current access set")
+        .prior
+        .is_none()
+    {
+        seed_access_set(state, "ws-step4", &[default_device(), other_device()]).await;
+    }
+    let group = vec![byte; 32];
+    sqlx::query("insert into relay_group (group_id, workspace_id) values ($1, $2)")
+        .bind(&group)
+        .bind("ws-step4")
+        .execute(pool)
+        .await
+        .expect("create the group");
+    group
+}
+
+pub fn envelope_for(group: &[u8], body: &[u8]) -> Envelope {
+    let ct = body.to_vec();
+    Envelope {
+        v: 1,
+        enc: Encryption::None,
+        group: group.to_vec(),
+        epoch: 0,
+        seq: 0,
+        ts: 0,
+        hash: content_hash(1, Encryption::None, group, 0, &ct),
+        ct,
+    }
+}
+
+/// Record one reconciliation exchange's cost, for step 5's artifact.
+///
+/// Written to a file rather than only asserted, because "the reconcile round count
+/// against corpus size" is a gate deliverable and a number nobody wrote down is a
+/// number the next step cannot compare against.
+///
+/// Two things here were wrong on the first attempt and are worth the comment:
+///
+/// - The path was relative, and `cargo test` runs with the crate directory as its
+///   working directory, so the file landed in `backend/wealdrelay/target/` where the
+///   gate does not look. It is now anchored at the repository root through
+///   `CARGO_MANIFEST_DIR`, which is the only path that is the same wherever the test
+///   is invoked from.
+/// - It appended, so re-running the suite accumulated duplicate rows and the artifact
+///   grew a history nobody asked for. One file per label, truncated, and the gate
+///   concatenates them: tests run in parallel, so a single shared file cannot be
+///   truncated safely by any of them.
+pub fn record_recon_rounds(label: &str, corpus: usize, rounds: usize) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let directory = root.join("target").join("step-05");
+    let _ = std::fs::create_dir_all(&directory);
+    let slug: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let _ = std::fs::write(
+        directory.join(format!("recon-rounds-{slug}.txt")),
+        format!("{label}\tcorpus {corpus}\trounds {rounds}\n"),
+    );
+}
+
+// MARK: Step 9, media blobs
+//
+// The retention chain is signed with the same `ed25519_dalek` keys every other
+// suite uses and verified by the same `access::verify` the relay calls, so a
+// fixture here is a record a client could actually have produced. Nothing below
+// reimplements a signature: each helper fills the record's own `signing_bytes`
+// into `Signer::sign` and puts the result where the relay reads it.
+
+use wealdrelay::lifecycle::wire::DropBefore;
+use wealdrelay::media::wire::{
+    RetentionControl, RetentionDestruction, RetentionManifest, RetentionPolicy, Signature,
+};
+
+/// The configuration `config_for` builds, plus whatever else the caller needs.
+/// Written as extra pairs rather than as a second builder so there is one place
+/// the base configuration lives.
+pub fn config_with(
+    scratch: &Scratch,
+    blobs: &std::path::Path,
+    extra: impl IntoIterator<Item = (&'static str, String)>,
+) -> Config {
+    let mut pairs = vec![
+        (keys::HOSTNAME, "localhost".to_string()),
+        (keys::DATABASE_URL, scratch.url.clone()),
+        (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+        (keys::LISTEN, "127.0.0.1:0".to_string()),
+        (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+        (keys::RELEASE_CHECK, "off".to_string()),
+    ];
+    pairs.extend(extra);
+    Config::resolve(&Values::from_pairs(pairs)).expect("the integration configuration resolves")
+}
+
+/// A group in a named workspace, with an access set naming `devices` and
+/// `authorizers`. `make_group` is the one-workspace convenience over this.
+pub async fn make_group_in(
+    state: &Arc<RelayState>,
+    workspace: &str,
+    byte: u8,
+    devices: &[SigningKey],
+    authorizers: &[SigningKey],
+) -> Vec<u8> {
+    let pool = state.database.as_ref().expect("a database").pool();
+    if wealdrelay::access::store::current(pool, workspace)
+        .await
+        .expect("read the current access set")
+        .prior
+        .is_none()
+    {
+        seed_access_set_with_authorizers(state, workspace, devices, authorizers).await;
+    }
+    let group = vec![byte; 32];
+    sqlx::query("insert into relay_group (group_id, workspace_id) values ($1, $2)")
+        .bind(&group)
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .expect("create the group");
+    group
+}
+
+/// A 32-byte blob hash from one seed byte, so a failure names the blob.
+pub fn blob_hash(seed: u8) -> Vec<u8> {
+    vec![seed; 32]
+}
+
+/// The epoch-derived retention verifier a group's members would derive from
+/// their MLS state. A plain signing key here, because the relay only ever sees
+/// the public half and cannot tell how it was derived: that is the whole point
+/// of `media.md`'s division of authority.
+pub fn verifier_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+pub fn signed_control(
+    group: &[u8],
+    epoch: u64,
+    key: &SigningKey,
+    prev_control_hash: Option<Vec<u8>>,
+    authority: &SigningKey,
+) -> RetentionControl {
+    let mut record = RetentionControl {
+        group: group.to_vec(),
+        epoch,
+        verifier: key.verifying_key().to_bytes().to_vec(),
+        prev_control_hash,
+        sig: vec![0u8; 64],
+    };
+    record.sig = Signer::sign(authority, &record.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    record
+}
+
+pub fn signed_manifest(
+    group: &[u8],
+    epoch: u64,
+    sequence: u64,
+    prev_manifest_hash: Option<Vec<u8>>,
+    blobs: Vec<Vec<u8>>,
+    key: &SigningKey,
+) -> RetentionManifest {
+    let mut record = RetentionManifest {
+        group: group.to_vec(),
+        epoch,
+        sequence,
+        prev_manifest_hash,
+        blobs,
+        sig: vec![0u8; 64],
+    };
+    record.sig = Signer::sign(key, &record.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    record
+}
+
+pub fn signed_policy(
+    group: &[u8],
+    version: u64,
+    media_after_days: u32,
+    not_before: u64,
+    signers: &[SigningKey],
+) -> RetentionPolicy {
+    let mut record = RetentionPolicy {
+        group: group.to_vec(),
+        version,
+        media_after_days,
+        text_after_days: media_after_days,
+        not_before,
+        authorizers: signers
+            .iter()
+            .map(|key| key.verifying_key().to_bytes().to_vec())
+            .collect(),
+        signatures: Vec::new(),
+    };
+    record.signatures = sign_all(&record.signing_bytes(), signers);
+    record
+}
+
+pub fn signed_destruction(
+    group: &[u8],
+    kind: &str,
+    target_digest: &[u8],
+    not_before: u64,
+    signers: &[SigningKey],
+) -> RetentionDestruction {
+    let mut record = RetentionDestruction {
+        group: group.to_vec(),
+        kind: kind.as_bytes().to_vec(),
+        target_digest: target_digest.to_vec(),
+        policy_version: None,
+        not_before,
+        authorizers: signers
+            .iter()
+            .map(|key| key.verifying_key().to_bytes().to_vec())
+            .collect(),
+        signatures: Vec::new(),
+    };
+    record.signatures = sign_all(&record.signing_bytes(), signers);
+    record
+}
+
+/// One signed `drop_before`, ready for `lifecycle::drop_before` or a `DROP` frame.
+///
+/// Signed by the epoch's retention verifier, which is the same key the media
+/// chain's manifests are signed by: `lifecycle.md` says the instruction is "signed
+/// with the relay-verifiable retention signing key", and there is one such key per
+/// epoch per group.
+pub fn signed_drop(
+    group: &[u8],
+    manifest_hash: &[u8],
+    snapshots: Vec<Vec<u8>>,
+    epoch: u64,
+    policy_version: Option<u64>,
+    destruction_digest: Option<Vec<u8>>,
+    key: &SigningKey,
+) -> DropBefore {
+    let mut record = DropBefore {
+        group: group.to_vec(),
+        manifest_hash: manifest_hash.to_vec(),
+        snapshots,
+        epoch,
+        policy_version,
+        destruction_digest,
+        sig: vec![0u8; 64],
+    };
+    record.sig = Signer::sign(key, &record.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    record
+}
+
+/// One `Signature` per signer over the same canonical body, which is what
+/// `retention::authorize` checks against the workspace's access-set authorizers.
+pub fn sign_all(signing_bytes: &[u8], signers: &[SigningKey]) -> Vec<Signature> {
+    signers
+        .iter()
+        .map(|key| Signature {
+            key: key.verifying_key().to_bytes().to_vec(),
+            sig: Signer::sign(key, signing_bytes).to_bytes().to_vec(),
+        })
+        .collect()
+}
+
+/// One HTTP request against loopback, with a binary body and a binary answer.
+///
+/// Written here rather than pulled in as a dependency for the reason
+/// `tests/integration.rs` gives for its own one-line GET: the whole need is a
+/// handful of requests against a relay on 127.0.0.1, and a client crate would be
+/// a dependency the relay does not otherwise have. This one carries a body and
+/// returns bytes, because step 9 uploads ciphertext through a presigned URL and
+/// a lossy string would not survive it.
+pub async fn http_request(
+    address: std::net::SocketAddr,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let head = format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    // Both writes are allowed to fail. A server that has already decided to
+    // refuse closes the connection without draining the body, and the useful
+    // thing then is its answer, not the write error: a test that panicked here
+    // would report a broken pipe where the relay behaved exactly as intended.
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a header terminator");
+    let headers = String::from_utf8_lossy(&response[..split]).to_string();
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, response[split + 4..].to_vec())
+}
+
+/// The path and query of a presigned URL, which is all a test needs: the host in
+/// it is `WEALD_RELAY_LISTEN` as configured, and an integration relay is bound to
+/// port zero, so the request goes to the address the relay actually got.
+pub fn path_of(url: &str) -> String {
+    let without_scheme = url.strip_prefix("http://").expect("an http url");
+    let (_, path) = without_scheme.split_once('/').expect("a path");
+    format!("/{path}")
+}

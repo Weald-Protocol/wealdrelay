@@ -1,0 +1,64 @@
+# Render blueprint. specs/backend/relay/deployment.md path 1.
+#
+# Render's own managed Postgres, not a Postgres container of ours: a customer on
+# Render wants Render's Postgres backed up by Render. Object storage is not a
+# Render product, so blobs go on a persistent disk, which is a supported
+# configuration (specs/backend/relay/server.md: storage falls back to a local
+# filesystem path for single-node installs).
+#
+# TLS is issued by Render on the service subdomain. There is no Caddy on this
+# path and no port 80 to open.
+
+services:
+  - type: web
+    name: weald-relay
+    runtime: image
+    plan: starter
+    region: oregon
+    image:
+      # Replace with the digest you verified before deploying. A moving tag here
+      # would mean a customer's relay could change under them without a deploy
+      # they asked for, which is why the release workflow publishes no such tag:
+      #
+      #   url: ghcr.io/hunterh37/weald-relay@sha256:...
+      url: ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0
+    healthCheckPath: /healthz
+    disk:
+      name: blobs
+      mountPath: /var/lib/wealdrelay/blobs
+      sizeGB: 10
+    envVars:
+      - key: WEALD_RELAY_HOSTNAME
+        # Render substitutes the service's own hostname, so the one-click path
+        # has nothing at all to fill in.
+        fromService:
+          type: web
+          name: weald-relay
+          property: host
+      - key: WEALD_RELAY_DATABASE_URL
+        fromDatabase:
+          name: weald-relay-db
+          property: connectionString
+      - key: WEALD_RELAY_STORAGE_URL
+        value: file:///var/lib/wealdrelay/blobs
+      # Render terminates TLS at its edge.
+      - key: WEALD_RELAY_TLS
+        value: "off"
+      - key: WEALD_RELAY_LISTEN
+        value: 0.0.0.0:8443
+      - key: PORT
+        value: "8443"
+      # Loopback, so readiness and metrics are not reachable from the internet
+      # even though the service is.
+      - key: WEALD_RELAY_OBSERVABILITY_LISTEN
+        value: 127.0.0.1:9090
+      # Never weakened by a template (specs/backend/relay/deployment.md path 1).
+      - key: WEALD_RELAY_ACCESS_SET
+        value: enforce
+
+databases:
+  - name: weald-relay-db
+    databaseName: wealdrelay
+    user: wealdrelay
+    plan: basic-256mb
+    region: oregon

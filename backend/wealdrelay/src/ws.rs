@@ -1,0 +1,1105 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dicyanin Labs
+//! The socket. WebSocket in, frames out, and the queue bounds that make
+//! backpressure real.
+//!
+//! Every protocol rule lives in `src/session.rs`. This module does four things
+//! and nothing else: read a message, decode it, hand it to the session, and
+//! perform whatever work the session deferred. That division is why the rules are
+//! testable without a network and why this file's own tests are about framing.
+//!
+//! ## Backpressure is a bound, not an intention
+//!
+//! `specs/backend/relay/operations.md`: a relay under load slows down rather than
+//! dropping envelopes, because a dropped envelope is a hole in an author chain and
+//! therefore a security alarm on somebody else's screen. Concretely:
+//!
+//! - The per-connection send queue is bounded. When it is full the writer stops,
+//!   which stops the reader, which stops reading the socket, which pushes back
+//!   through TCP. Nothing is accepted and discarded.
+//! - A subscriber that cannot keep up is **told** and downgraded to
+//!   reconciliation, so it catches up by range fetch instead of stalling the
+//!   fanout for everyone. Silence would be indistinguishable from a relay that
+//!   had dropped its envelopes.
+//! - `ephemeral` is the only kind that may be shed, which is why it is the only
+//!   kind the relay is permitted to drop at all. Nothing in this step writes one.
+
+use std::sync::Arc;
+
+use axum::extract::ws::{Message, WebSocket};
+use futures_util::{SinkExt as _, StreamExt as _};
+use tokio::sync::mpsc;
+
+use crate::accept::{self, Accepted};
+use crate::envelope::Envelope;
+use crate::frame::{ErrorCode, Frame, FrameDecodeError, FrameError, MAX_FRAME_BYTES};
+use crate::health::RelayState;
+use crate::session::{Reaction, Session, Work, SEND_QUEUE_BOUND};
+
+/// What a connection's writer half is told to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outbound {
+    Frame(Frame),
+    /// Flush and close.
+    Close,
+}
+
+/// Why a subscriber was downgraded, as the client is told it.
+///
+/// A frame rather than a log line: the client has to know that it is now
+/// responsible for catching up by reconciliation, and a relay that only logged it
+/// would leave the client believing it was still live.
+pub fn downgrade_frame(group: &[u8]) -> Frame {
+    Frame::SubAck {
+        group: group.to_vec(),
+        // Zero rather than a head: the client is being told to reconcile from
+        // whatever it holds, and naming a head would invite it to trust a cursor
+        // that the downgrade means it cannot.
+        head_seq: 0,
+    }
+}
+
+/// The result of trying to queue one frame for a slow client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Queued {
+    Sent,
+    /// The bound was hit. The caller downgrades the subscriber rather than
+    /// dropping the envelope.
+    Full,
+    /// The connection has gone.
+    Closed,
+}
+
+/// The bytes one connection may hold queued but not yet written.
+///
+/// The frame count alone was not a bound on anything that matters. A `Push` carries
+/// an envelope, whose `ct` the schema caps at 1 MiB, so `SEND_QUEUE_BOUND` frames of
+/// it is about 257 MiB on one connection, and `handshake::MAX_MESSAGE_BYTES` gets to
+/// half of that per frame by another route. Nothing capped the number of connections
+/// doing it at once, so a handful of backlogged clients was an out-of-memory kill,
+/// which is a worse failure than the one the bound exists to prevent: the whole point
+/// of `specs/backend/relay/operations.md` "Backpressure" is that a slow consumer
+/// degrades to reconciliation while everybody else keeps going.
+///
+/// Eight mebibytes, which is eight of the largest envelope the relay will accept, or
+/// several thousand of the small ones a busy group actually produces. Sized so that a
+/// modest instance can hold a few hundred connections at their ceiling at once rather
+/// than so that any single connection is comfortable: a connection that reaches this
+/// is by definition not keeping up, and the protocol has an answer for that.
+pub const SEND_QUEUE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// The sending half of a connection's outbound queue, bounded in both units.
+///
+/// A wrapper rather than a bare `mpsc::Sender` because `tokio` bounds a channel by
+/// message count and there is no count that is also a memory bound when messages
+/// differ in size by three orders of magnitude. The frame count is still enforced by
+/// the channel underneath: it is the right bound for the many-small-frames case, and
+/// the byte budget is the right one for the few-large-frames case, so both are kept.
+///
+/// The byte budget is a `Semaphore` rather than a counter, because a caller that
+/// cannot proceed has to be able to wait for room without polling for it
+/// (`queue_all_awaiting`), and a semaphore is the primitive that both refuses
+/// immediately and waits, against the same accounting.
+#[derive(Debug, Clone)]
+pub struct OutboundSender {
+    inner: mpsc::Sender<Outbound>,
+    budget: Arc<tokio::sync::Semaphore>,
+}
+
+/// The receiving half, which returns a frame's bytes to the budget as it takes it.
+#[derive(Debug)]
+pub struct OutboundReceiver {
+    inner: mpsc::Receiver<Outbound>,
+    budget: Arc<tokio::sync::Semaphore>,
+}
+
+/// What one frame costs against the byte budget, as a permit count.
+///
+/// Clamped to the whole budget so an outsized frame is expensive rather than
+/// unsendable: a frame that could never acquire its permits would be refused on every
+/// connection forever, which is a worse failure than briefly holding the queue alone.
+/// Nothing the relay sends today comes close (`MAX_FRAME_BYTES` is one mebibyte
+/// against a budget of eight), so the clamp is a guard on a future frame rather than
+/// a path with traffic on it.
+fn permits_for(frame: &Frame) -> u32 {
+    let cost = frame.queued_bytes().min(SEND_QUEUE_BYTE_BUDGET);
+    u32::try_from(cost).unwrap_or(u32::MAX)
+}
+
+impl OutboundSender {
+    /// Bytes currently queued and not yet written.
+    pub fn queued_bytes(&self) -> usize {
+        SEND_QUEUE_BYTE_BUDGET - self.budget.available_permits()
+    }
+
+    /// Ask the channel to close, waiting for room. `Close` carries no payload and so
+    /// spends no budget: it is the frame that must always be able to get through.
+    pub async fn close(&self) -> Result<(), mpsc::error::SendError<Outbound>> {
+        self.inner.send(Outbound::Close).await
+    }
+}
+
+impl OutboundReceiver {
+    pub async fn recv(&mut self) -> Option<Outbound> {
+        let taken = self.inner.recv().await;
+        self.release(taken.as_ref());
+        taken
+    }
+
+    pub fn try_recv(&mut self) -> Result<Outbound, mpsc::error::TryRecvError> {
+        let taken = self.inner.try_recv();
+        self.release(taken.as_ref().ok());
+        taken
+    }
+
+    /// Give back what the frame reserved, measured from the frame itself rather than
+    /// carried alongside it. `queued_bytes` is a pure function of the frame and the
+    /// frame is immutable in the queue, so the two halves cannot disagree.
+    fn release(&self, taken: Option<&Outbound>) {
+        if let Some(Outbound::Frame(frame)) = taken {
+            self.budget.add_permits(permits_for(frame) as usize);
+        }
+    }
+}
+
+/// Queue one frame without waiting.
+///
+/// `try_send` and not `send`. Awaiting a full queue inside the fanout would make
+/// one slow subscriber stall every other subscriber to the same group, which is
+/// exactly the failure the downgrade rule exists to avoid.
+pub fn try_queue(sender: &OutboundSender, frame: Frame) -> Queued {
+    let cost = permits_for(&frame);
+    // Acquired before the send and given back if it fails, so two callers racing on
+    // the last of the budget cannot both be told there was room.
+    let Ok(permit) = sender.budget.try_acquire_many(cost) else {
+        return Queued::Full;
+    };
+
+    match sender.inner.try_send(Outbound::Frame(frame)) {
+        Ok(()) => {
+            // The bytes are now the receiver's to give back.
+            permit.forget();
+            Queued::Sent
+        }
+        // The permit is dropped here, which returns it.
+        Err(mpsc::error::TrySendError::Full(_)) => Queued::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => Queued::Closed,
+    }
+}
+
+/// A connection's outbound channel, bounded by ``SEND_QUEUE_BOUND`` frames and
+/// ``SEND_QUEUE_BYTE_BUDGET`` bytes, whichever is reached first.
+pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    let (inner_sender, inner_receiver) = mpsc::channel(SEND_QUEUE_BOUND);
+    let budget = Arc::new(tokio::sync::Semaphore::new(SEND_QUEUE_BYTE_BUDGET));
+    (
+        OutboundSender {
+            inner: inner_sender,
+            budget: Arc::clone(&budget),
+        },
+        OutboundReceiver {
+            inner: inner_receiver,
+            budget,
+        },
+    )
+}
+
+/// Serve one WebSocket connection.
+/// Serve one connection, told where it came from.
+///
+/// The source is used by one path and one only: the redeem budget in
+/// `specs/backend/relay/invites.md`, which is per source and per token. It is hashed
+/// with the workspace salt before it reaches a table and is never logged, so what
+/// the relay retains is a value it cannot turn back into an address. `None` when the
+/// router was mounted without connection info, which is a deployment behind a proxy
+/// that passes none: the budget then falls back to the token and the device, which
+/// narrows it rather than opening it.
+pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source: Option<String>) {
+    let (mut sink, mut stream) = socket.split();
+    let (sender, mut receiver) = outbound_channel();
+    // The hub identity for this connection. Allocated before the first frame so a
+    // `SUB` arriving in the same TCP segment as `AUTH` has somewhere to register.
+    let connection = state.hub.connect();
+
+    // The writer is its own task so the bound is real: when it is full the reader
+    // below stops making progress, which stops it reading the socket.
+    let writer = tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Some(Outbound::Frame(frame)) => {
+                    // A write that fails is a client that has gone without saying so.
+                    // Ending the task is the whole of the response: there is nobody to
+                    // tell, and a writer that kept trying would hold a task, a queue
+                    // and a socket per vanished client.
+                    if sink.send(Message::Binary(frame.encode())).await.is_err() {
+                        break;
+                    }
+                }
+                // A close the session asked for, or the reader loop ending and
+                // dropping the last sender. The same thing from the writer's side, and
+                // in both cases whatever was already queued has been written first,
+                // because a bounded channel yields what it holds before it reports
+                // that its senders have gone.
+                Some(Outbound::Close) | None => {
+                    let _ = sink.close().await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut session = Session::new(&state.config);
+    session.set_source(source);
+    while let Some(message) = stream.next().await {
+        let Ok(message) = message else { break };
+        // Receipt time belongs to this message, not to the HTTP upgrade that
+        // opened the socket. In particular, a long-lived client must not make a
+        // newly accepted envelope look as old as its connection.
+        let now_ms = state.now_ms();
+        if !handle_message(&sender, &state, &mut session, connection, message, now_ms).await {
+            break;
+        }
+    }
+
+    // Before the sender is dropped, so no fanout can queue onto a connection whose
+    // reader has stopped. A hub entry outliving its socket would be fanned out to
+    // once per accepted envelope for the life of the process.
+    state.hub.disconnect(connection).await;
+
+    // Dropped rather than sent a `Close`. Queuing one here would be a frame like any
+    // other, so it would wait for room on a queue that is full precisely when the
+    // client has stopped reading, which is the case where the relay most needs to let
+    // go of the connection.
+    drop(sender);
+    let _ = writer.await;
+}
+
+/// Decide about one incoming message. Returns false when the connection should
+/// end.
+///
+/// Public for the same reason `perform` below is: what a client is told for each
+/// kind of message it can send is a decision rather than plumbing, and the only
+/// part of it that needs a socket is the socket itself. A text message, a message
+/// past the length gate, a ping and a close are each answered differently, and a
+/// function reachable only through an upgraded WebSocket would be a function whose
+/// answers nobody had checked one at a time.
+///
+/// There is no separate check for a session that closed itself. Every reaction
+/// that ends a session is a `ReplyAndClose`, which ends the connection here, so a
+/// second check on `Session::state` would be the same decision written twice and
+/// no path could reach the copy.
+pub async fn handle_message(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    connection: crate::hub::ConnectionId,
+    message: Message,
+    now_ms: u64,
+) -> bool {
+    let bytes = match message {
+        Message::Binary(bytes) => bytes,
+        // Text is not a frame. The wire format is deterministic CBOR, and a
+        // text frame is a client that has not read it.
+        Message::Text(_) => {
+            let _ = try_queue(
+                sender,
+                Frame::Error(FrameError::new(ErrorCode::MalformedHeader)),
+            );
+            return false;
+        }
+        // Ping and pong are the transport's, and axum answers ping itself.
+        Message::Ping(_) | Message::Pong(_) => return true,
+        // So is a close. The peer has said it is going and there is no frame to send
+        // it, so the session stops here and the reader goes back for the end of the
+        // stream: letting the transport finish its own close handshake is what makes
+        // the client's close a close rather than a dropped socket.
+        Message::Close(_) => return true,
+    };
+
+    if bytes.len() > MAX_FRAME_BYTES {
+        // Refused on length before anything is parsed, so an oversized frame
+        // costs the relay a length check rather than a parse.
+        let _ = try_queue(
+            sender,
+            Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge)),
+        );
+        return false;
+    }
+
+    let frame = match Frame::decode(&bytes) {
+        Ok(frame) => frame,
+        Err(error) => {
+            // A frame, always, and then the close. `operations.md` requires
+            // that a client never gets a dropped connection without a frame:
+            // it cannot otherwise tell a protocol error from a network one.
+            let _ = try_queue(sender, Frame::Error(FrameError::new(error.code())));
+            // A version failure aborts. Anything else is one bad frame on a
+            // session that is otherwise fine, so the connection continues.
+            return !matches!(error, FrameDecodeError::UnsupportedVersion(_));
+        }
+    };
+
+    match session.handle(frame, now_ms) {
+        Reaction::Reply(frames) => queue_all(sender, frames),
+        Reaction::ReplyAndClose(frames) => {
+            let _ = queue_all(sender, frames);
+            let _ = sender.close().await;
+            false
+        }
+        Reaction::Defer(work) => perform(sender, state, session, connection, work, now_ms).await,
+    }
+}
+
+/// Send the frames a refusal produced and end the session.
+///
+/// Deferred work can decide to end a session: an `AUTH` that fails the access set is
+/// a close, and it is decided after a database round trip rather than in the frame
+/// table. `Session::rejected` returns the frames rather than a `Reaction` for exactly
+/// this caller, because a `Reaction` here needed arms for a reply that continues and
+/// for work that defers work, and neither can happen: work never defers work and a
+/// refusal never continues.
+fn refuse(sender: &OutboundSender, frames: Vec<Frame>) -> bool {
+    let _ = queue_all(sender, frames);
+    false
+}
+
+/// What the access set said about a connecting device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Admitted {
+    /// Admitted, and the salted hash this connection is known by.
+    InSet {
+        entry: Vec<u8>,
+        workspace: Option<String>,
+    },
+    Bootstrap(String),
+    Refused(ErrorCode),
+}
+
+/// May this device open this socket?
+///
+/// The workspace comes from the groups named in `CONNECT`, resolved against the
+/// relay's own group table rather than from anything the client asserts. A
+/// connection that named no group this relay knows has named no workspace, and a
+/// relay that guessed one would be a relay checking a stranger against somebody
+/// else's access set.
+///
+/// The whole read is `access::store::admission`'s, so there is one arm here for a
+/// relay that could not look rather than one per query.
+async fn admit(state: &Arc<RelayState>, session: &Session, device_key: &[u8]) -> Admitted {
+    use crate::access::store::{self, Verdict};
+    use crate::config::AccessSetMode;
+
+    if matches!(state.config.access_set, AccessSetMode::Off) {
+        // `environments.md` allows exactly one ci suite to run with enforcement off,
+        // to assert that `/readyz` reports the difference. It is `enforce` in every
+        // environment we operate, and the health surface says which one this is.
+        // Unsalted here on purpose: with no set there is no salt to be consistent
+        // with, and a hash of the key alone is a stable handle for eviction that
+        // claims nothing about membership.
+        return Admitted::InSet {
+            entry: crate::access::entry_hash(device_key, b""),
+            // This narrowly scoped CI diagnostic mode deliberately makes no
+            // membership or workspace claim. Production profiles enforce access
+            // sets and therefore bind a workspace below.
+            workspace: None,
+        };
+    }
+    let Some(database) = &state.database else {
+        // No database is no answer, not a yes. A relay that admitted everyone while
+        // it could not look would fail open in exactly the incident where the check
+        // matters.
+        return Admitted::Refused(ErrorCode::Backpressure);
+    };
+    match store::admission(database.pool(), session.requested(), device_key).await {
+        Ok(Verdict::Admitted { entry, workspace }) => Admitted::InSet {
+            entry,
+            workspace: Some(workspace),
+        },
+        Ok(Verdict::Bootstrap(workspace)) => Admitted::Bootstrap(workspace),
+        Ok(Verdict::UnknownGroup) => Admitted::Refused(ErrorCode::GroupUnknown),
+        Ok(Verdict::Refused) => Admitted::Refused(ErrorCode::WriterNotInAccessSet),
+        Err(_) => Admitted::Refused(ErrorCode::Backpressure),
+    }
+}
+
+/// Refuse a target group unless it belongs to the workspace that admitted this
+/// socket.  This check is intentionally before log, subscription, and envelope
+/// work: authenticating for workspace A must not create an oracle or a write path
+/// for workspace B (BR-013).
+/// Answers with the pool the caller may then use, rather than with unit.
+///
+/// A caller that had to look the database up again after this returned would
+/// carry a second "no database" arm that nothing can reach: the check below has
+/// already answered `retry/backpressure` in that case. Two of those arms existed
+/// and neither was reachable, which is how they were found: the coverage floor
+/// reported them as lines no test could execute, and the correct fix for
+/// unreachable code is to delete it rather than to write a test that cannot run.
+async fn authorize_group<'a>(
+    state: &'a Arc<RelayState>,
+    session: &Session,
+    group: &[u8],
+) -> Result<&'a sqlx::PgPool, ErrorCode> {
+    let Some(database) = &state.database else {
+        return Err(ErrorCode::Backpressure);
+    };
+    let Some(workspace) = session.authorized_workspace() else {
+        // Reachable with `WEALD_RELAY_ACCESS_SET=off`, the one ci diagnostic mode
+        // where a session is admitted without a workspace claim. A group is a
+        // workspace's, so a session that carries no workspace cannot be shown to
+        // be entitled to one, and the honest answer is the same refusal a stranger
+        // gets rather than an admission by default.
+        return Err(ErrorCode::WriterNotInAccessSet);
+    };
+    match crate::access::store::workspace_of(database.pool(), group).await {
+        Ok(Some(found)) if found == workspace => Ok(database.pool()),
+        Ok(Some(_)) => Err(ErrorCode::WriterNotInAccessSet),
+        Ok(None) => Err(ErrorCode::GroupUnknown),
+        Err(_) => Err(ErrorCode::Backpressure),
+    }
+}
+
+/// One `ACCESS` publication.
+///
+/// The rules are `crate::access::judge`'s and the transaction is
+/// `crate::access::store::publish`'s. What is decided here is what the client is
+/// told and what happens to other people's sockets, which is the half that needs a
+/// relay rather than a function.
+async fn rotate_access_set(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    body: Vec<u8>,
+) -> bool {
+    use crate::access::{store, AccessSet};
+
+    // An empty body is the state query rather than a publication: `wire.md` requires
+    // the genesis set's entries to be `BLAKE3(pubkey || workspace_salt)` and the salt
+    // is the relay's, so without an answer here no client could build the first set
+    // and the flow the whole section describes had no client-side path at all. The
+    // shapes cannot be confused: no encoding of an `AccessSet` is zero bytes long.
+    if body.is_empty() {
+        return report_access_state(sender, state, session).await;
+    }
+
+    let candidate = match AccessSet::decode(&body) {
+        Ok(candidate) => candidate,
+        Err(error) => return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+    };
+    let Some(database) = &state.database else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
+
+    // `publish_for` resolves the workspace from the groups this connection named,
+    // and falls back to the bootstrap reservation when they name nothing this relay
+    // knows. That fallback is the genesis case and only the genesis case: a trust
+    // root publishing the first set has no groups yet, because groups are made by
+    // the trust root. Neither half reads the session's memory, which is the rule a
+    // relay that served one workspace's state to another would have broken.
+    match store::publish_for(database.pool(), session.requested(), &candidate, &body).await {
+        Ok(store::Published::Accepted(accepted)) => {
+            // The half of offboarding the relay owns. An `ACCESS` frame that drops
+            // an entry closes that device's open connections immediately; combined
+            // with the MLS epoch change that removes read access to future content,
+            // removal becomes one action with both halves enforced.
+            for entry in &accepted.disconnect {
+                state.hub.evict(entry).await;
+            }
+            // Answered with the accepted set echoed back, so a client learns the
+            // digest its next publication must name without a second round trip.
+            queue_all(
+                sender,
+                vec![Frame::Access {
+                    body: accepted.digest.clone(),
+                }],
+            )
+        }
+        Ok(store::Published::UnknownGroup) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::GroupUnknown))],
+        ),
+        Err(store::StoreError::Refused(error)) => {
+            queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))])
+        }
+        // A relay that could not look has not learned that anything is wrong with the
+        // publication. `retry` and an open socket: the client's correct response is
+        // backoff and a verbatim resend.
+        Err(store::StoreError::Database(_)) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        ),
+    }
+}
+
+/// Store one recovery wrap under its blinded tag.
+///
+/// `specs/backend/relay/groups.md`. What the relay does here is deliberately
+/// small: it decodes a record it cannot open, checks that the slot moves forward,
+/// and writes it. It does not learn whose wrap this is, because the index is a tag
+/// derived from the group's own epoch secret and not from any recovery key, and it
+/// cannot check the seal, because it holds no key that could.
+///
+/// The group is authorized the same way a `RECON` is, so a device outside the
+/// access set cannot write into a group's wrap table.
+async fn publish_wrap(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    body: Vec<u8>,
+) -> bool {
+    use crate::recovery::{store, RecoveryWrap};
+
+    let wrap = match RecoveryWrap::decode(&body) {
+        Ok(wrap) => wrap,
+        // The same one-place mapping the refusal below uses: a record too large is
+        // a size problem and everything else is a shape problem, and a client fixes
+        // those differently.
+        Err(error) => return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+    };
+    let pool = match authorize_group(state, session, &wrap.group).await {
+        Ok(pool) => pool,
+        Err(code) => return queue_all(sender, vec![Frame::Error(FrameError::new(code))]),
+    };
+
+    match store::publish(pool, &wrap).await {
+        // Answered with the tag, so a publisher knows which slot moved without a
+        // second round trip and without the relay repeating the ciphertext.
+        Ok(_) => queue_all(
+            sender,
+            vec![Frame::Wrap {
+                body: wrap.tag.clone(),
+            }],
+        ),
+        // One arm, and the mapping lives on the error rather than here, so the
+        // wire code for a refusal is decided in one place and walked by
+        // `tests/recovery_unit.rs` rather than re-derived at each call site.
+        Err(store::StoreError::Refused(error)) => {
+            queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))])
+        }
+        // A relay that could not write has not learned anything is wrong with the
+        // wrap. `retry` and an open socket, exactly as a refused rotation gets.
+        Err(store::StoreError::Database(_)) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        ),
+    }
+}
+
+/// One step of an invite redemption.
+///
+/// `specs/backend/relay/invites.md` steps 4 to 7. The relay's part is small and
+/// deliberately so: it verifies a code it never learns, takes a seat atomically,
+/// serves ciphertext it cannot open, and records which scopes a joiner has entered.
+/// It cannot tell whether the joiner belongs in the workspace, because that is what
+/// the invite's signature says and what every other client checks.
+///
+/// Every refusal is `invite::UNAVAILABLE`. Not one code per reason: an endpoint that
+/// answered "wrong code" differently from "no such token" is an endpoint that
+/// confirms which tokens exist, and this one is reachable without authenticating.
+async fn redeem(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &Session,
+    body: Vec<u8>,
+) -> bool {
+    use crate::invite::redeem::{Request, Response};
+    use crate::invite::reserve::{self, Verdict};
+    use crate::invite::{store, UNAVAILABLE};
+
+    let refuse = |sender: &OutboundSender| {
+        queue_all(sender, vec![Frame::Error(FrameError::new(UNAVAILABLE))])
+    };
+
+    let request = match Request::decode(&body) {
+        Ok(request) => request,
+        Err(error) => return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+    };
+    let Some(database) = &state.database else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
+    let pool = database.pool();
+
+    // Which workspace this token belongs to, which the relay reads from the record
+    // rather than taking from the caller: a joiner that named its own workspace could
+    // have its device hashed against another workspace's salt.
+    let token = match &request {
+        Request::Reserve { token, .. }
+        | Request::Bundles { token, .. }
+        | Request::Commit { token, .. } => token.clone(),
+    };
+    let Ok(Some(record)) = store::fetch(pool, &token).await else {
+        // Absent, unreadable, or a body that does not decode. One answer, because
+        // the difference between them is exactly what this endpoint refuses to tell.
+        return refuse(sender);
+    };
+    let Ok(salt) = crate::access::store::salt(pool, &record.workspace_id).await else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
+
+    // The source, hashed with the workspace salt before it goes anywhere. A relay
+    // that stored an address would be storing the one fact about a joiner it has no
+    // use for after the budget is spent.
+    let source = reserve::source_hash(session.source().unwrap_or("unknown"), &salt);
+
+    match request {
+        Request::Reserve {
+            code,
+            nonce,
+            device,
+            ..
+        } => {
+            let device_hash = crate::access::entry_hash(&device, &salt);
+            match reserve::reserve(
+                pool,
+                &token,
+                &code,
+                &nonce,
+                &device_hash,
+                &source,
+                state.now_ms() as i64,
+            )
+            .await
+            {
+                Ok(Verdict::Reserved { expires_at_ms }) => queue_all(
+                    sender,
+                    vec![Frame::Join {
+                        body: Response::Reserved { expires_at_ms }.encode(),
+                    }],
+                ),
+                Ok(Verdict::Unavailable) => refuse(sender),
+                // One arm, and the mapping lives on the error: a relay that could not
+                // look answers `retry`, and everything else is the one generic
+                // refusal this path is allowed to give.
+                Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+            }
+        }
+        Request::Bundles { group, .. } => match store::bundles_for(pool, &token, &group).await {
+            // Ciphertext, served back. The relay holds no key for any of it: the
+            // private half of `update_pub` is derived by the joiner from bytes that
+            // travelled in a URL fragment.
+            Ok(bundles) => queue_all(
+                sender,
+                vec![Frame::Join {
+                    body: Response::Bundles(bundles).encode(),
+                }],
+            ),
+            Err(_) => queue_all(
+                sender,
+                vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+            ),
+        },
+        Request::Commit {
+            nonce,
+            device,
+            group,
+            ..
+        } => {
+            let device_hash = crate::access::entry_hash(&device, &salt);
+            match reserve::scope_commit(
+                pool,
+                &token,
+                &nonce,
+                &device_hash,
+                &group,
+                state.now_ms() as i64,
+            )
+            .await
+            {
+                Ok(Some(receipt)) => queue_all(
+                    sender,
+                    vec![Frame::Join {
+                        body: Response::Committed { receipt }.encode(),
+                    }],
+                ),
+                Ok(None) => refuse(sender),
+                Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+            }
+        }
+    }
+}
+
+/// Store one MLS handshake message and hand it to everybody else in the group.
+///
+/// `specs/backend/relay/groups.md`: the relay stores and forwards this and cannot
+/// derive a group secret from it. What it adds is an order, which the group cannot
+/// supply for itself: two members committing at the same moment produce two
+/// messages, and every member has to apply them in one agreed sequence or the group
+/// forks.
+///
+/// The publisher is acknowledged with the assigned sequence number and everybody
+/// else is pushed the message. Both are the same frame, because a member that
+/// reconnects and replays the log has to see exactly what a member that was
+/// connected saw.
+async fn publish_handshake(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    connection: crate::hub::ConnectionId,
+    group: Vec<u8>,
+    message: Vec<u8>,
+) -> bool {
+    use crate::handshake::{store, Handshake};
+
+    // The bounds are not checked here. `store::append` checks them, and a second
+    // check in front of it would be a second place for the two to disagree while
+    // making the store's own refusal arm unreachable from the socket.
+    //
+    // So the group is authorized first and the bytes are judged second, which is
+    // the same order every other group-addressed frame uses: a session that has no
+    // business in a group learns that, and learns nothing about whether its
+    // message would otherwise have been acceptable.
+    let handshake = Handshake { group, message };
+    let pool = match authorize_group(state, session, &handshake.group).await {
+        Ok(pool) => pool,
+        Err(code) => return queue_all(sender, vec![Frame::Error(FrameError::new(code))]),
+    };
+
+    match store::append(pool, &handshake).await {
+        Ok(appended) => {
+            let frame = Frame::Handshake {
+                group: handshake.group.clone(),
+                seq: appended.seq(),
+                message: handshake.message.clone(),
+            };
+            // Everybody else first, then the acknowledgement to the publisher. The
+            // order matters for nobody's correctness and it keeps the publisher's
+            // own `seq` the last thing it sees for this message, which is what its
+            // cursor advances on.
+            state
+                .hub
+                .fanout_frame(&handshake.group, &frame, connection)
+                .await;
+            queue_all(sender, vec![frame])
+        }
+        Err(store::StoreError::Refused(error)) => {
+            queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))])
+        }
+        // A relay that could not store a commit has not learned anything is wrong
+        // with it. `retry` and an open socket: the client's correct response is to
+        // resend the same bytes, which the content address makes free.
+        Err(store::StoreError::Database(_)) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        ),
+    }
+}
+
+/// Answer the state query: the workspace salt and the head of the set chain.
+///
+/// Deliberately narrow. It reports what a publisher needs to address its next
+/// publication and nothing else: not the entries, not the authorizers, not a count.
+/// A client that wanted the set itself is asking for a membership fact, and the
+/// relay does not hand those out to whoever opened a socket.
+async fn report_access_state(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &Session,
+) -> bool {
+    use crate::access::store;
+
+    let Some(database) = &state.database else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
+    // Resolved from the groups this connection named, every time, never from what
+    // the session remembers: a relay answering from memory would hand out one
+    // workspace's salt after that workspace stopped being its.
+    //
+    // The one exception is the founding device, and it is re-established from the
+    // tables rather than remembered: a device holding the live, unconsumed
+    // reservation on a workspace's bootstrap invite is asking for the salt with
+    // which to build that workspace's first set, and there are no groups to resolve
+    // it from because the set it is building is what admits the device that will
+    // make them.
+    let found = match store::state_for(database.pool(), session.requested()).await {
+        Ok(Some(state)) => Ok(Some(state)),
+        Ok(None) => {
+            // A session with no device key has not authenticated, and an empty key
+            // matches no reservation, so it finds no workspace by exactly the same
+            // route rather than by a second arm no request can reach.
+            let key = session.device_key().unwrap_or_default();
+            match crate::invite::genesis::founding_workspace(database.pool(), key).await {
+                Ok(Some(workspace)) => store::state_of(database.pool(), &workspace).await.map(Some),
+                Ok(None) => Ok(None),
+                Err(error) => Err(crate::access::store::StoreError::Database(
+                    error.to_string(),
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    match found {
+        Ok(Some(found)) => queue_all(
+            sender,
+            vec![Frame::Access {
+                body: crate::access::encode_state(&found),
+            }],
+        ),
+        Ok(None) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::GroupUnknown))],
+        ),
+        Err(_) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        ),
+    }
+}
+
+/// Queue a run of frames, in order, ending the connection if one cannot be queued.
+///
+/// Public because `crate::sync` queues the `SUB` and `RECON` answers and must do it
+/// under exactly this rule: a control frame that cannot be queued means the client
+/// has stopped reading, and holding the socket open for it is worse than closing.
+pub fn queue_all(sender: &OutboundSender, frames: Vec<Frame>) -> bool {
+    for frame in frames {
+        // A control frame that cannot be queued means the client is not reading
+        // and the queue is full of things it has not taken. Ending the connection
+        // is the honest outcome: the alternative is holding a socket open for a
+        // peer that has stopped listening.
+        if try_queue(sender, frame) != Queued::Sent {
+            return false;
+        }
+    }
+    true
+}
+
+/// How long one frame of a run that cannot be truncated waits for room.
+///
+/// Ten seconds, and the number is chosen against what exhausting it means rather
+/// than as a round figure: the writer task's only job is to move a queued frame onto
+/// the socket, so ten seconds without room is not a slow client, it is a client that
+/// has stopped taking bytes at all. A healthy peer on a bad connection drains
+/// continuously and never spends this.
+pub const REPLAY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Queue a run of frames that may not be shortened, waiting for room between them.
+///
+/// The difference from ``queue_all`` is the whole reason this exists. `queue_all`
+/// treats a full queue as a client that has stopped reading, which is right for a
+/// control frame and right for anything the client can ask for again. It is wrong
+/// for a run whose length is a property of the data rather than of the client: an
+/// MLS replay longer than ``SEND_QUEUE_BOUND`` would fail against a peer that is
+/// reading as fast as it can, and no amount of reconnecting would help, because the
+/// group's history is what does not fit.
+///
+/// So room is waited for rather than demanded. The connection still ends if the
+/// wait is exhausted, which keeps the behaviour a genuinely stalled client gets, and
+/// the queue bound still holds: at most ``SEND_QUEUE_BOUND`` frames are outstanding
+/// at any moment no matter how long the run is. Waiting here stops the reader loop
+/// for this connection, which is the backpressure `operations.md` asks for: it
+/// travels out through TCP rather than being absorbed by the relay.
+pub async fn queue_all_awaiting(sender: &OutboundSender, frames: Vec<Frame>) -> bool {
+    for frame in frames {
+        let cost = permits_for(&frame);
+        // Both bounds are waited on, in the order they are spent. The byte budget
+        // first, because acquiring the permits is what reserves the memory, and then
+        // room in the channel itself. A timeout on either ends the connection: there
+        // is no arm here that sends part of a run and reports success.
+        let Ok(Ok(permit)) = tokio::time::timeout(
+            REPLAY_DRAIN_TIMEOUT,
+            sender.budget.clone().acquire_many_owned(cost),
+        )
+        .await
+        else {
+            return false;
+        };
+
+        match tokio::time::timeout(
+            REPLAY_DRAIN_TIMEOUT,
+            sender.inner.send(Outbound::Frame(frame)),
+        )
+        .await
+        {
+            // The bytes are now the receiver's to give back, exactly as in
+            // `try_queue`.
+            Ok(Ok(())) => permit.forget(),
+            // The permit is dropped with the frame, which returns it.
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Perform the work a session deferred. Returns false when the connection should
+/// end.
+///
+/// Public so the deferred-work answers are reachable without a socket. What is
+/// being checked is which frame a client receives for each kind of work, and that
+/// is a decision rather than a piece of plumbing: a `SEND` carrying an
+/// undecodable envelope must come back as a `reject`, and a relay whose database
+/// has gone must answer `retry` rather than closing the socket in silence.
+pub async fn perform(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    connection: crate::hub::ConnectionId,
+    work: Work,
+    now_ms: u64,
+) -> bool {
+    match work {
+        Work::Authenticate {
+            device_key,
+            signature,
+            challenge,
+        } => {
+            // Possession first. The signature is over the challenge **this**
+            // connection issued, so a signature captured from another session
+            // proves nothing here.
+            if !crate::access::verify(&device_key, &challenge, &signature) {
+                return refuse(sender, session.rejected(ErrorCode::WriterNotInAccessSet));
+            }
+            // Then membership. This is the check that makes revocation real: a
+            // device the current access set does not carry cannot open a socket at
+            // all, whatever it once held.
+            match admit(state, session, &device_key).await {
+                Admitted::InSet { entry, workspace } => {
+                    // Told to the hub before the acknowledgement goes out, so a
+                    // revocation that lands in the same instant closes this socket
+                    // rather than missing it by a frame.
+                    state.hub.identify(&entry, connection, sender.clone()).await;
+                    let remaining = key_packages_remaining(state, &device_key).await;
+                    let ack = session.authenticated(remaining);
+                    if let Some(workspace) = workspace {
+                        session.bind_workspace(workspace);
+                    }
+                    // Remembered for one reader, which asks the database again with
+                    // it: a device admitted on a provisional grant is founding a
+                    // workspace whose groups do not exist yet, and the salt it needs
+                    // for its first access set can only be resolved through the seat
+                    // it holds.
+                    session.bind_device(device_key.clone());
+                    queue_all(sender, vec![ack])
+                }
+                Admitted::Bootstrap(workspace) => {
+                    let remaining = key_packages_remaining(state, &device_key).await;
+                    let ack = session.bootstrapping(remaining);
+                    session.bind_workspace(workspace);
+                    session.bind_device(device_key.clone());
+                    queue_all(sender, vec![ack])
+                }
+                Admitted::Refused(code) => refuse(sender, session.rejected(code)),
+            }
+        }
+        Work::Accept { envelope } => {
+            let decoded = match Envelope::decode(&envelope) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))])
+                }
+            };
+            let pool = match authorize_group(state, session, &decoded.group).await {
+                Ok(pool) => pool,
+                Err(code) => return queue_all(sender, vec![Frame::Error(FrameError::new(code))]),
+            };
+            match accept::accept(pool, &state.config, &decoded, now_ms).await {
+                Ok(outcome) => {
+                    // The live path. Only a fresh store is fanned out: a duplicate
+                    // is an envelope every subscriber has already been sent, and
+                    // pushing it again would double a retry on every other screen.
+                    if let Accepted::Stored { seq } = outcome {
+                        crate::sync::deliver(state, &decoded, seq, now_ms, connection).await;
+                    }
+                    // Both outcomes carry a sequence number, and the client cannot
+                    // tell them apart. That is deliberate: a retry is answered with
+                    // the number the original write was given, so the client's
+                    // cursor never moves backwards and it never renumbers a chain
+                    // link.
+                    let seq = match outcome {
+                        Accepted::Stored { seq } | Accepted::Duplicate { seq } => seq,
+                    };
+                    queue_all(
+                        sender,
+                        vec![Frame::SendAck {
+                            hash: decoded.hash,
+                            seq,
+                        }],
+                    )
+                }
+                Err(error) => queue_all(sender, vec![Frame::Error(error.to_frame())]),
+            }
+        }
+        Work::Subscribe { group, from_seq } => {
+            if let Err(code) = authorize_group(state, session, &group).await {
+                return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
+            }
+            crate::sync::subscribe(sender, state, connection, group, from_seq).await
+        }
+        Work::Reconcile { group, payload } => {
+            if let Err(code) = authorize_group(state, session, &group).await {
+                return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
+            }
+            crate::sync::reconcile(sender, state, group, payload).await
+        }
+        Work::RotateAccessSet { body } => rotate_access_set(sender, state, session, body).await,
+        Work::PublishWrap { body } => publish_wrap(sender, state, session, body).await,
+        Work::Redeem { body } => redeem(sender, state, session, body).await,
+        Work::PublishHandshake { group, message } => {
+            publish_handshake(sender, state, session, connection, group, message).await
+        }
+        Work::BlobTicket { payload } => {
+            let answer = crate::media::handle(state, session, payload, &state.media_rate).await;
+            queue_all(sender, vec![answer])
+        }
+        Work::DropBefore { payload } => {
+            let answer = crate::lifecycle::handle(state, session, payload).await;
+            queue_all(sender, vec![answer])
+        }
+    }
+}
+
+/// What the relay answers when it cannot look.
+///
+/// Public, and for the same reason `storage::object_name` and
+/// `logging::redact_ranges` are: the honest answer from a relay with no database is
+/// reachable in production only when a dependency has gone, and a function that
+/// could only be tested by taking the database away mid-request would be a
+/// function whose answer nobody had checked. `/readyz` reports the outage; these
+/// decide what a client in flight is told meanwhile.
+///
+/// Unused key packages for one device.
+///
+/// `operations.md`: the relay reports the connecting device's own unused count on
+/// `AUTH`, so a client tops up before it runs out rather than after. Zero when
+/// there is no database, because the honest answer to "how many do you hold" from
+/// a relay that cannot look is none.
+pub async fn key_packages_remaining(state: &Arc<RelayState>, device_key: &[u8]) -> u32 {
+    let Some(database) = &state.database else {
+        return 0;
+    };
+    let hash = blake3::hash(device_key);
+    let count: Option<i64> = sqlx::query_scalar(
+        "select count(*) from relay_key_package \
+         where device_hash = $1 and consumed_at is null and expires_at > now()",
+    )
+    .bind(hash.as_bytes().as_slice())
+    .fetch_optional(database.pool())
+    .await
+    .ok()
+    .flatten();
+    u32::try_from(count.unwrap_or_default()).unwrap_or(u32::MAX)
+}
+
+/// The highest sequence number a group holds, or zero for an empty one.
+pub async fn head_seq(state: &Arc<RelayState>, group: &[u8]) -> u64 {
+    let Some(database) = &state.database else {
+        return 0;
+    };
+    let head: Option<Option<i64>> =
+        sqlx::query_scalar("select max(seq) from relay_envelope where group_id = $1")
+            .bind(group)
+            .fetch_optional(database.pool())
+            .await
+            .ok();
+    u64::try_from(head.flatten().unwrap_or_default()).unwrap_or_default()
+}

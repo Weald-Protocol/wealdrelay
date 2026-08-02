@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Tailscale serve configuration for path 4.",
+    "TLS on the tailnet name, proxied to the relay's loopback listener inside",
+    "the shared network namespace. Only /relay and /healthz exist there; the",
+    "private observability listener on 9090 is deliberately not served, so",
+    "/readyz and /metrics stay off even the tailnet.",
+    "AllowFunnel is absent and must stay absent: Funnel would put this relay on",
+    "the public internet, which is the one thing this deployment path exists to",
+    "prevent (specs/backend/relay/deployment.md path 4)."
+  ],
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    }
+  },
+  "Web": {
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:8443"
+        }
+      }
+    }
+  }
+}

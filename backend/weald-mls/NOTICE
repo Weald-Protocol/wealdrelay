@@ -1,0 +1,21 @@
+Weald MLS binding (weald-mls)
+Copyright 2026 Dicyanin Labs
+
+This product includes software developed at Dicyanin Labs.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License in the LICENSE file alongside this notice, or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This crate is the C ABI surface over OpenMLS described in
+specs/backend/relay/mls-binding.md. It ships under the same license as the relay
+because an independent implementation cannot be verified against a binding it
+cannot read.
+
+This crate links OpenMLS and its dependencies, which carry their own licenses.
+Their terms are unchanged by this notice.
+
+The Weald macOS client is a separate work and is NOT covered by this license.
+See LICENSE.md at the repository root for the boundary.

@@ -1,0 +1,46 @@
+# TLS termination for the compose bundle.
+#
+# One hostname, taken from .env. Caddy gets a certificate from Let us Encrypt on
+# first request and renews it forever with no further configuration, which is
+# why it is in the bundle rather than nginx.
+#
+# CADDY_TLS is an escape hatch with exactly two intended values:
+#   unset            public hostname, automatic ACME. The normal case.
+#   internal         Caddy's own local CA. For a hostname that is not publicly
+#                    resolvable: a laptop, a private network, or the local
+#                    integration proof in scripts/backend-gate.sh.
+# specs/backend/relay/deployment.md path 4 uses `internal` or a private CA,
+# because there is no ACME without public ingress.
+
+{
+	# No admin API on a published port. The bundle exposes 80 and 443 and
+	# nothing else.
+	admin off
+}
+
+{$WEALD_RELAY_HOSTNAME} {
+	tls {$CADDY_TLS}
+
+	# The WebSocket and /healthz. Both are on the relay's public listener; the
+	# private observability listener on 9090 is deliberately not proxied, so
+	# /readyz and /metrics stay off the internet
+	# (specs/backend/relay/server.md).
+	reverse_proxy relay:8443 {
+		health_uri /healthz
+		health_interval 10s
+		health_timeout 5s
+	}
+
+	log {
+		# The relay cannot read content and neither can this log. Request paths
+		# are /relay and /healthz; there is nothing else to leak.
+		output stdout
+		format json
+	}
+}
+
+# Plain HTTP is a redirect and nothing else, except for the ACME challenge which
+# Caddy answers itself before this block is consulted.
+http://{$WEALD_RELAY_HOSTNAME} {
+	redir https://{host}{uri} permanent
+}

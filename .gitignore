@@ -1,0 +1,20 @@
+# Build output.
+target/
+**/target/
+*.profraw
+
+# Reproducible build artifacts. `scripts/relay-reproduce.sh --out` writes here;
+# the manifest is evidence for a release, not a checked-in file.
+repro/
+repro-*/
+
+# Local environment. The deploy bundle ships `.env.example` files; the filled-in
+# copies hold a genesis key and a database password.
+.env
+.env.*
+!.env.example
+**/wealdrelay.env
+!**/wealdrelay.env.example
+
+.DS_Store
+*.swp

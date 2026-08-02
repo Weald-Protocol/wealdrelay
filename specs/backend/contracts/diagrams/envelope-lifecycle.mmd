@@ -1,0 +1,50 @@
+---
+title: Envelope lifecycle, with every rejection branch
+---
+flowchart TB
+  A["Client composes Payload<br/>kind, author, ctr, prev_self, sent_at, body"] --> B["Ed25519 sign over all fields<br/>sign-then-encrypt"]
+  B --> C["Reserve (ctr, prev_self, hash) in the SAME local<br/>transaction as the MLS state write, THEN send"]
+  C --> D["MLS encrypt to current epoch -> ct"]
+  D --> E["Wrap in Envelope<br/>v, enc, group, epoch, hash, ct"]
+  E --> F["SEND over WebSocket/TLS 443"]
+
+  F --> G{"v supported?"}
+  G -- no --> X1["version/protocol_unsupported<br/>client aborts connection"]
+  G -- yes --> H{"enc >= WEALD_RELAY_MIN_ENC?"}
+  H -- no --> X2["denied/plaintext_refused<br/>always on hosted, never configurable there"]
+  H -- yes --> I{"group in access set<br/>and writer permitted?"}
+  I -- no --> X3["denied/writer_not_in_access_set"]
+  I -- yes --> J{"BLAKE3 hash matches<br/>(v, enc, group, epoch, ct)?"}
+  J -- no --> X4["reject/hash_mismatch"]
+  J -- yes --> K{"ct within size limit?"}
+  K -- no --> X5["reject/envelope_too_large"]
+  K -- yes --> L{"duplicate hash?"}
+  L -- yes --> M["Return the ORIGINAL seq.<br/>No counter lock taken. Resend is free."]
+  L -- no --> N{"storage / db healthy?"}
+  N -- over quota --> X6["quota/storage_exhausted"]
+  N -- saturated --> X7["retry/backpressure<br/>never a silent accept"]
+  N -- ok --> O["UPDATE per-group counter RETURNING seq,<br/>inside the insert transaction. Per-group lock only."]
+
+  O --> P{"kind == 0x00F0 ephemeral?"}
+  P -- yes --> Q["Fan out to connected subscribers.<br/>Never written to Postgres. Only droppable kind."]
+  P -- no --> R["Persist envelope"]
+  R --> S["PUSH to live subscribers via Redis fanout<br/>(fanout only, never source of truth)"]
+  S --> T{"subscriber keeping up?"}
+  T -- no --> U["Downgrade to reconciliation, tell it so in a frame.<br/>Slow consumers poll, they do not stall the fanout."]
+  T -- yes --> V["Client receives PUSH"]
+  U --> W["Negentropy RECON over the per-group seq space<br/>O(diff) round trips. Gaps in seq are legal."]
+  W --> V
+
+  V --> Y["MLS decrypt, verify inner Ed25519 signature"]
+  Y --> Z{"author chain dense?<br/>ctr increments by one, prev_self matches"}
+  Z -- yes --> AA["Apply event"]
+  Z -- "gap, with matching chain.reset (0x0072)" --> AB["Render as unverified gap.<br/>Encryption panel shows a chain reset by that author."]
+  Z -- "gap, no chain.reset" --> AC["SPLIT-VIEW / TAMPER EVIDENCE.<br/>Retained and rendered as rejected, never dropped."]
+
+  AA --> AD["head.attest (0x0070) every 15 minutes<br/>vs expected attesters = current DEVICE leaves of the ratchet tree"]
+  AD --> AE{"agreement?"}
+  AE -- disagree past 2 rounds --> AC
+  AE -- "agent author with no proxying attester" --> AC
+  AE -- "device author sending envelopes but silent 2 rounds" --> AC
+  AE -- "zero peer attestations for 60 min with live traffic" --> AC
+  AE -- agree --> AF["Encryption panel: agreement as a fraction<br/>of the expected set, absent members named"]

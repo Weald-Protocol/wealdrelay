@@ -1,0 +1,165 @@
+# The Weald relay, self-hosted, one file.
+#
+# specs/backend/relay/server.md distribution channel 2, and
+# specs/backend/relay/deployment.md path 2. Postgres, MinIO, Redis and Caddy,
+# with one hostname to edit in .env and a working default for everything else.
+#
+# The relay is blind (specs/backend/relay/groups.md). It holds no key and there
+# is no secret in this file that is worth stealing beyond the database password,
+# which protects ciphertext.
+#
+# Every image is pinned by digest, never by tag, per
+# specs/backend/build/environments.md. A digest change here is a deliberate edit.
+
+name: weald-relay
+
+services:
+  # Envelope log, group heads, key packages, quotas. Not optional.
+  postgres:
+    image: postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wealdrelay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: wealdrelay
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wealdrelay -d wealdrelay"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
+
+  # Encrypted media blobs. Replaceable with any S3-compatible endpoint, or with
+  # a plain directory: see STORAGE in .env.example.
+  minio:
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
+
+  # One shot. Creates the bucket and exits. The relay does not create buckets:
+  # a service that can create a bucket is a service with a credential that can
+  # delete one.
+  minio-init:
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/"$$BUCKET"
+        mc anonymous set none local/"$$BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      BUCKET: ${MINIO_BUCKET:-weald-blobs}
+    restart: "no"
+    networks: [weald]
+
+  # Fanout across relay processes, presence, ephemeral kinds. Optional: a
+  # single-process install can delete this service and unset WEALD_RELAY_REDIS_URL,
+  # and the binary uses in-process channels instead.
+  redis:
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
+
+  relay:
+    # Pinned by digest in a real deployment. The tag is here so that
+    # `docker compose pull` works before the digest for your version is known;
+    # `wealdrelay --version` and the client's encryption panel both report what
+    # is actually running (specs/backend/relay/verification.md).
+    #
+    # The default is a release tag and not `:latest`, because the release
+    # workflow pushes `ghcr.io/<owner>/weald-relay:<tag>` and never publishes a
+    # moving tag. A `:latest` default would 404 even after a successful release,
+    # which reads as a broken registry rather than as the deliberate absence of
+    # a moving tag. Set WEALD_RELAY_IMAGE to the digest you verified:
+    #
+    #   WEALD_RELAY_IMAGE=ghcr.io/hunterh37/weald-relay@sha256:...
+    #
+    # Until the first release is published this reference does not resolve. That
+    # is the honest state of the world, not a configuration error: see
+    # specs/backend/build/container-image.md.
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      WEALD_RELAY_HOSTNAME: ${WEALD_RELAY_HOSTNAME:?set WEALD_RELAY_HOSTNAME in .env}
+      WEALD_RELAY_DATABASE_URL: postgres://wealdrelay:${POSTGRES_PASSWORD}@postgres:5432/wealdrelay
+      WEALD_RELAY_STORAGE_URL: s3://${MINIO_BUCKET:-weald-blobs}
+      WEALD_RELAY_REDIS_URL: redis://redis:6379
+      # Caddy terminates TLS in front. The relay speaks plaintext only on the
+      # private compose network and is never published to the host.
+      WEALD_RELAY_TLS: "off"
+      WEALD_RELAY_LISTEN: 0.0.0.0:8443
+      # Readiness and metrics are private. Bound to the compose network so Caddy
+      # can health check, never published (specs/backend/relay/server.md).
+      WEALD_RELAY_OBSERVABILITY_LISTEN: 0.0.0.0:9090
+      WEALD_RELAY_ACCESS_SET: enforce
+      WEALD_RELAY_MAX_STORAGE_GB: ${WEALD_RELAY_MAX_STORAGE_GB:-unlimited}
+      WEALD_RELAY_RETENTION_DAYS: ${WEALD_RELAY_RETENTION_DAYS:-unlimited}
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-wealdrelay}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    # No ports. The only way in is Caddy.
+    networks: [weald]
+
+  # Automatic TLS. On a public hostname with ports 80 and 443 open, Caddy gets a
+  # certificate from Let us Encrypt with no configuration beyond the hostname.
+  caddy:
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    restart: unless-stopped
+    depends_on: [relay]
+    ports:
+      # Port 80 is not decoration. ACME's HTTP challenge needs it, and a closed
+      # port 80 is the single most common reason this bundle fails to get a
+      # certificate (specs/backend/relay/deployment.md path 2).
+      - "80:80"
+      - "443:443"
+    environment:
+      WEALD_RELAY_HOSTNAME: ${WEALD_RELAY_HOSTNAME:?set WEALD_RELAY_HOSTNAME in .env}
+      CADDY_TLS: ${CADDY_TLS:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [weald]
+
+volumes:
+  postgres:
+  minio:
+  caddy-data:
+  caddy-config:
+
+networks:
+  weald:

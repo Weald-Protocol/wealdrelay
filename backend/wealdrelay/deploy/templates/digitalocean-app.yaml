@@ -1,0 +1,74 @@
+# DigitalOcean App Platform. specs/backend/relay/deployment.md path 1.
+#
+# DigitalOcean's own managed Postgres and DigitalOcean Spaces, not containers of
+# ours, so backups and durability stay the provider's job.
+#
+#   doctl apps create --spec digitalocean-app.yaml
+#
+# The Spaces keys are the one thing this spec cannot fill in: App Platform has no
+# binding that mints them. Create a Spaces access key and set the two SECRET
+# values before applying, or set WEALD_RELAY_STORAGE_URL to a file:// path on an
+# attached volume instead.
+
+name: weald-relay
+region: nyc
+
+services:
+  - name: relay
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    http_port: 8443
+    image:
+      registry_type: GHCR
+      registry: hunterh37
+      repository: weald-relay
+      # Pinned to a digest at release time.
+      tag: latest
+    health_check:
+      http_path: /healthz
+      initial_delay_seconds: 10
+      period_seconds: 15
+    envs:
+      - key: WEALD_RELAY_HOSTNAME
+        scope: RUN_TIME
+        value: ${APP_DOMAIN}
+      - key: WEALD_RELAY_DATABASE_URL
+        scope: RUN_TIME
+        value: ${weald-relay-db.DATABASE_URL}
+      - key: WEALD_RELAY_STORAGE_URL
+        scope: RUN_TIME
+        value: s3://weald-blobs
+      - key: AWS_ENDPOINT_URL_S3
+        scope: RUN_TIME
+        value: https://nyc3.digitaloceanspaces.com
+      - key: AWS_REGION
+        scope: RUN_TIME
+        value: nyc3
+      - key: AWS_ACCESS_KEY_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_A_SPACES_KEY
+      - key: AWS_SECRET_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_A_SPACES_SECRET
+      # App Platform terminates TLS on the app domain.
+      - key: WEALD_RELAY_TLS
+        scope: RUN_TIME
+        value: "off"
+      - key: WEALD_RELAY_LISTEN
+        scope: RUN_TIME
+        value: 0.0.0.0:8443
+      - key: WEALD_RELAY_OBSERVABILITY_LISTEN
+        scope: RUN_TIME
+        value: 127.0.0.1:9090
+      # Never weakened by a template.
+      - key: WEALD_RELAY_ACCESS_SET
+        scope: RUN_TIME
+        value: enforce
+
+databases:
+  - name: weald-relay-db
+    engine: PG
+    version: "16"
+    production: false

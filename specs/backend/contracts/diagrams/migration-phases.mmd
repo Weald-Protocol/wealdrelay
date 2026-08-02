@@ -1,0 +1,45 @@
+---
+title: Migration from git, with rollback edges
+---
+stateDiagram-v2
+  direction TB
+  [*] --> P0
+
+  P0: Phase 0. Extract the transport seam
+  P0: Git path untouched. Only phase with tickets today.
+  P1: Phase 1. Event model, git-backed
+  P1: Envelope and payload land, still stored in git.
+  P2: Phase 2. Relay as an accelerator
+  P2: wealdrelay ships. enc=0 signed-not-encrypted.<br/>WEALD_RELAY_MIN_ENC=none permitted for self-hosters ONLY.
+  P3: Phase 3. Encryption on
+  P3: MLS groups. enc=1. Hosted is min_enc=mls and not configurable.
+  P4: Phase 4. Git as the archive tier
+  P4: A designated device holds plaintext and mirrors. Additive.
+
+  P0 --> P1
+  P1 --> P2
+  P2 --> P3: GATE. property suite + fuzzing +<br/>mls-binding.md 12-function FFI test suite +<br/>the six proofs in verification.md
+  P3 --> P4
+
+  P1 --> P0: rollback by transport flag. nothing was encrypted.
+  P2 --> P1: rollback by transport flag.
+  P3 --> P2: ROLLBACK IS A DECRYPTION EVENT, not a config change.<br/>Requires explicit per-group decision and a written record.
+  P4 --> P3: rollback by turning the mirror off.
+
+  state DualTransport {
+    direction LR
+    git: Git transport
+    relay: Relay transport
+    git --> relay: both live during Phases 2 and 3
+    relay --> git
+  }
+  P2 --> DualTransport
+  DualTransport --> P3
+
+  P4 --> [*]
+
+  note left of P2
+    Shipping Phase 2 to paying customers would make the
+    product's one claim false for everyone who bought it.
+    Hosted therefore never accepts enc=0 at any phase.
+  end note

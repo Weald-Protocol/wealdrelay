@@ -1,0 +1,66 @@
+---
+title: MLS group and epoch lifecycle
+---
+stateDiagram-v2
+  [*] --> Genesis: relay provisioned, genesis key created
+
+  Genesis --> RootEpoch0: bootstrap invite redeemed<br/>first device self-admits as trust root and admin
+  note right of Genesis
+    The genesis key signs exactly one bootstrap invite
+    and is destroyed on redemption. There is no reissue.
+  end note
+
+  state RootEpoch0 {
+    [*] --> Stable
+    Stable --> Committing: member add / remove / update / rekey
+    Committing --> Stable: epoch advances, new epoch secret derived
+  }
+
+  RootEpoch0 --> WorkspaceRoot: roster document established
+
+  state WorkspaceRoot {
+    [*] --> Active
+    Active --> Active: roster.update (0x0020)
+    Active --> Revoking: roster.revoke (0x0021)
+    Revoking --> Active: epoch advance ENFORCES the revocation
+    Active --> RecoveryWrapped: recovery.wrap (0x0061) per recovery principal per epoch<br/>stored under a per-epoch blinded tag
+    RecoveryWrapped --> Active
+    Active --> DirectoryUpdate: recovery.directory (0x0063)<br/>current, candidate, fallback tags bound to a target commit
+    DirectoryUpdate --> Active
+  }
+
+  WorkspaceRoot --> ChannelGroup: channel created, enrolment key<br/>exported from the parent epoch secret
+
+  state ChannelGroup {
+    [*] --> Published
+    Published --> Published: groupinfo.publish (0x0060)<br/>relay keeps only the latest per group
+    Published --> SelfJoined: member external-commits using that GroupInfo
+    SelfJoined --> Published: republished by whichever member committed
+    Published --> PendingAdd: target device out of key packages<br/>or its packages expired past 90 days
+    PendingAdd --> Published: device tops back up to the 20 target
+  }
+
+  state HistoryPolicy <<choice>>
+  ChannelGroup --> HistoryPolicy
+  HistoryPolicy --> OpenHistory: policy = open
+  HistoryPolicy --> ClosedHistory: policy = closed
+
+  OpenHistory: history.publish (0x0062)<br/>historical epoch secrets sealed to the long-lived history key,<br/>that key wrapped under the parent-derived enrolment key
+  ClosedHistory: joiner reads from its joining epoch forward only
+
+  OpenHistory --> Compaction
+  ClosedHistory --> Compaction
+
+  Compaction: checkpoint (0x0071) signed manifest.<br/>Author barriers, index snapshot, every document snapshot/head.<br/>Server-side pruning is a separate signed operation, never a relay decision.
+  Compaction --> WorkspaceRoot
+
+  WorkspaceRoot --> AgentLeaf: agent certificate issued by a device
+  AgentLeaf: Holds no MLS state, never opens a socket.<br/>Never an expected attester. Its issuing device attests on its behalf.
+  AgentLeaf --> WorkspaceRoot: agent leaf eviction, epoch advance
+
+  WorkspaceRoot --> Offboarded: offboarding as ONE action
+  Offboarded: removal plus the epoch change that enforces it.<br/>Removed members cannot decrypt post-removal epochs.
+  Offboarded --> [*]
+
+  WorkspaceRoot --> Compromised: key compromise declared
+  Compromised --> WorkspaceRoot: full rekey, recovery wraps reissued for the new epoch

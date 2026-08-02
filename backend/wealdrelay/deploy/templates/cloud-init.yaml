@@ -1,0 +1,70 @@
+#cloud-config
+# A generic VPS, Hetzner included. specs/backend/relay/deployment.md path 1,
+# the no-provider-template case.
+#
+# Paste this into the user-data box when creating the server, having replaced
+# RELAY_HOSTNAME below. Point DNS at the machine first, or the certificate
+# cannot be issued on first boot.
+#
+# What it does: installs Docker, fetches the compose bundle, generates the two
+# passwords, writes .env, and starts the stack. It then writes the one-time
+# enrollment URL to /root/weald-enrollment.txt as well as the log, because on
+# this path there is no provider log viewer to read it out of.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - ufw
+
+write_files:
+  - path: /etc/weald-relay-install.sh
+    permissions: "0700"
+    owner: root:root
+    content: |
+      #!/bin/sh
+      set -eu
+
+      # Edit this. Everything else on this page has a working default.
+      RELAY_HOSTNAME="relay.example.com"
+
+      # Docker, from the official convenience script. Pinned to the repository
+      # rather than to a version because Docker does not publish a stable
+      # versioned installer URL.
+      if ! command -v docker >/dev/null 2>&1; then
+        curl -fsSL https://get.docker.com | sh
+      fi
+      systemctl enable --now docker
+
+      cd /opt
+      WEALD_RELAY_DIR=weald-relay
+      curl -fsSL https://get.weald.team/relay | sh
+
+      cd /opt/weald-relay
+      sed -i "s|^WEALD_RELAY_HOSTNAME=.*|WEALD_RELAY_HOSTNAME=${RELAY_HOSTNAME}|" .env
+      docker compose up -d
+
+      # The enrollment URL expires in 24 hours or on first use. Kept here as
+      # well as in the log because on this path nobody is watching a log view.
+      sleep 20
+      docker compose logs relay > /root/weald-enrollment.txt 2>&1
+      chmod 600 /root/weald-enrollment.txt
+
+runcmd:
+  # Only 22, 80 and 443. Nothing else on this machine has any reason to be
+  # reachable, and the relay's observability listener in particular must not be
+  # (specs/backend/relay/server.md).
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+  - /etc/weald-relay-install.sh
+
+final_message: |
+  The Weald relay is starting. The one-time enrollment URL is in
+  /root/weald-enrollment.txt and in `docker compose logs relay` under
+  /opt/weald-relay. It expires in 24 hours or on first use.
