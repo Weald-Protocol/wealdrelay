@@ -4,33 +4,37 @@
 # Base images are pinned by digest and never by tag, per
 # specs/backend/build/environments.md. A digest change is a deliberate commit.
 #
-# The builder platform is PINNED to linux/amd64, and that is a correctness
-# requirement rather than a preference. It used to be $BUILDPLATFORM, on the
-# reasoning that cross-compiling from whatever host you happen to have is much
-# faster than emulating the target: true, and it made the image unreproducible
-# across hosts, which is the one property the whole verification story rests on.
+# The builder platform is PINNED, and it is pinned to linux/arm64. Both halves of
+# that sentence were bought with a failed release, so both are written down.
 #
-# Measured by wealdrelay-v0.1.2's release, which is what the two-runner compare
-# exists to catch. Same commit, same context digest, same SOURCE_DATE_EPOCH, and
-# the two runners disagreed on BOTH platform binaries:
+# It used to be $BUILDPLATFORM, cross-compiling to the target, on the reasoning
+# that emulating a target is slow and cross-compiling from whatever host you have
+# is fast. True, and it made the image unreproducible across hosts, which is the
+# property the whole verification story rests on. wealdrelay-v0.1.2 was refused at
+# `the digests must match` with identical inputs and different artifacts on both
+# platforms:
 #
 #   runner a (x86_64 host)  amd64 sha256:cfbb4e44...  arm64 sha256:7f15d636...
 #   runner b (aarch64 host) amd64 sha256:350f1aba...  arm64 sha256:b9d9c0e3...
 #
-# With $BUILDPLATFORM, each target is built natively on one host and
-# cross-compiled on the other, so "the same target" was two different toolchain
-# paths through two different C compilers. Pinning the builder makes the toolchain
-# a property of this file instead of a property of whoever ran it.
+# Each target had been built natively on one host and cross-compiled on the other,
+# so "the same target" was two toolchain paths through two different C compilers,
+# and blake3 and ring compile C.
 #
-# The cost is real and lands on arm64 hosts: an Apple developer running
-# scripts/relay-reproduce.sh now emulates an amd64 builder under QEMU, and this
-# crate is not quick that way. That is the honest trade. A build that is only
-# reproducible among hosts of one architecture is not a reproducible build, and
-# saying so in a release note would be worse than waiting.
+# The insight that fixes it: emulation changes how long a compiler takes, not what
+# it emits. A pinned builder platform means every host runs the same toolchain on
+# the same inputs, natively or under QEMU, and a deterministic compiler then gives
+# the same bytes either way. Cross-compiling cannot promise that, because the
+# compiler itself differs.
+#
+# arm64 rather than amd64 because v0.1.3 tried amd64 and QEMU could not run it:
+# on GitHub's aarch64 runner, `rustc -vV` under qemu-x86_64 dies with
+# "uncaught target signal 11 (Segmentation fault)" in the first second. The other
+# direction is the one that has always worked, and it puts the emulation on ci
+# where there is a 180 minute budget rather than on a developer's laptop, where an
+# Apple machine now runs the builder natively.
 
-# rust:1.97.1-bookworm, matching rust-toolchain.toml. glibc/bookworm so the
-# artifact matches the distroless cc-debian12 runtime below.
-FROM --platform=linux/amd64 rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+FROM --platform=linux/arm64 rust:1.97.1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
 ARG TARGETARCH
 ARG TARGETPLATFORM
@@ -43,8 +47,8 @@ ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 # blake3 and ring compile C, so a C cross-compiler is required for the target,
-# not just the Rust std for it. With the builder pinned to amd64 this resolves
-# the same way everywhere: amd64 is native and arm64 is cross, on every host.
+# not just the Rust std for it. With the builder pinned to arm64 this resolves
+# the same way everywhere: arm64 is native and amd64 is cross, on every host.
 # The comparison against dpkg's architecture is kept rather than hard-coded,
 # because it is the thing that would fail loudly if the pin above were ever
 # changed back.
