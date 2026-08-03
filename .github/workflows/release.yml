@@ -291,8 +291,13 @@ jobs:
           # No moving tag. A `:latest` that changed under a self-hoster without
           # a deploy they asked for is exactly the failure digest pinning
           # exists to prevent, so it is never published.
+          # Written out rather than derived from `github.repository_owner`.
+          # The owner is `Weald-Protocol` and a registry path must be lowercase,
+          # so the derived form would have failed the push on the first release
+          # and only on the first release. The name is settled in
+          # specs/backend/build/container-image.md and it is pinned here.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/weald-relay:${{ github.ref_name }}
+            ghcr.io/weald-protocol/wealdrelay:${{ github.ref_name }}
           build-args: |
             SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
             VCS_REF=${{ github.sha }}
@@ -305,7 +310,7 @@ jobs:
         run: |
           set -eux
           cosign sign --yes \
-            "ghcr.io/${{ github.repository_owner }}/weald-relay@${{ steps.push.outputs.digest }}"
+            "ghcr.io/weald-protocol/wealdrelay@${{ steps.push.outputs.digest }}"
 
   verify-published:
     name: a clean clone at the tag matches the published digest
@@ -354,7 +359,7 @@ jobs:
           cosign verify \
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "ghcr.io/${{ github.repository_owner }}/weald-relay@${{ needs.image.outputs.digest }}" \
+            "ghcr.io/weald-protocol/wealdrelay@${{ needs.image.outputs.digest }}" \
             | tee cosign-verify.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -393,8 +398,7 @@ jobs:
           ls -l assets
           {
             printf '## Image\n\n'
-            printf '```\nghcr.io/%s/weald-relay@%s\n```\n\n' \
-              "${{ github.repository_owner }}" "$DIGEST"
+            printf '```\nghcr.io/weald-protocol/wealdrelay@%s\n```\n\n' "$DIGEST"
             printf 'Pin the digest, not the tag. '
             printf 'Two independent runners and a clean clone of this tag each built it and agreed:\n\n'
             printf '```\n%s\n```\n\n' "$AGREED"
@@ -405,7 +409,7 @@ jobs:
             printf '```sh\ncosign verify \\\n'
             printf '  --certificate-identity-regexp "^https://github.com/%s/" \\\n' "${{ github.repository }}"
             printf '  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n'
-            printf '  ghcr.io/%s/weald-relay@%s\n```\n\n' "${{ github.repository_owner }}" "$DIGEST"
+            printf '  ghcr.io/weald-protocol/wealdrelay@%s\n```\n\n' "$DIGEST"
             printf '## Checksums\n\n'
             printf 'Every asset below is listed with its SHA-256. `install.sh` is '
             printf 'attached beside `install.sh.sha256`: check it before you run it, '

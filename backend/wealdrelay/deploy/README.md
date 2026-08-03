@@ -199,7 +199,7 @@ the others produces a broken install:
 
 ## The image reference, and what to update at release time
 
-Every published image is `ghcr.io/weald-protocol/weald-relay`, tagged
+Every published image is `ghcr.io/weald-protocol/wealdrelay`, tagged
 `wealdrelay-vX.Y.Z` and pinned by digest in the release notes. The release
 workflow publishes no moving tag, deliberately: `latest` would let a customer's
 relay change under them without a deploy they asked for, which is the thing the

@@ -132,7 +132,7 @@ services:
     # RELEASE PIN. The one line in this file to update per release, and
     # ../README.md lists the others. Set WEALD_RELAY_IMAGE in .env to the digest
     # you verified from the release notes.
-    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/weald-relay:wealdrelay-v0.1.0}
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.0}
     restart: unless-stopped
     depends_on:
       postgres:

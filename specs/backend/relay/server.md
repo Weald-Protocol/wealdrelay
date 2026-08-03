@@ -48,7 +48,7 @@ privacy property and the operational simplicity are the same property.
 
 Shipped for every install path a customer might already be standing in.
 
-**1. Container image.** `ghcr.io/weald-protocol/weald-relay:<version>`, multi-arch amd64 and
+**1. Container image.** `ghcr.io/weald-protocol/wealdrelay:<version>`, multi-arch amd64 and
 arm64, distroless base, non-root, no shell. Signed with cosign, SBOM attached,
 provenance attestation via SLSA level 3.
 

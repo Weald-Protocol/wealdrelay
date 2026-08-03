@@ -24,11 +24,11 @@ services:
       # would mean a customer's relay could change under them without a deploy
       # they asked for, which is why the release workflow publishes no such tag:
       #
-      #   url: ghcr.io/weald-protocol/weald-relay@sha256:...
+      #   url: ghcr.io/weald-protocol/wealdrelay@sha256:...
       #
       # RELEASE PIN. The one line in this file to update per release, and
       # deploy/README.md lists the others.
-      url: ghcr.io/weald-protocol/weald-relay:wealdrelay-v0.1.0
+      url: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.0
     healthCheckPath: /healthz
     disk:
       name: blobs
