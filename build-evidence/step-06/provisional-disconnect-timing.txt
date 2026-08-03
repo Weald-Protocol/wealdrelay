@@ -1,5 +1,0 @@
-step 6, revocation of a device holding a live provisional grant
-grant_expiry_remaining=about 100 years
-elapsed_ms=13
-budget_ms=5000
-grant_after_removal=refused

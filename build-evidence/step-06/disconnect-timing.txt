@@ -1,6 +1,0 @@
-step 6, revocation to socket close
-device removed by an ACCESS publication over another device's socket
-elapsed_ms=19
-budget_ms=5000
-reconnect_after_revocation=denied/writer_not_in_access_set
-publisher_session_survived=true

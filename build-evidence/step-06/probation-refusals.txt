@@ -1,4 +1,0 @@
-step 6, a recovery-introduced device attempting an unpinned removal
-immediately: denied/writer_not_in_access_set
-after a year of simulated age: denied/writer_not_in_access_set
-cleared only by a publication from the authorizer that predates the rotation

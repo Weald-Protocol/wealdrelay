@@ -22,3 +22,6 @@ repro-*/
 # Python bytecode from the helper scripts.
 __pycache__/
 *.pyc
+
+# Gate evidence written by test runs. Generated, never published.
+build-evidence/
