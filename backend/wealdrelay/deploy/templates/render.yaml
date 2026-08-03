@@ -28,7 +28,7 @@ services:
       #
       # RELEASE PIN. The one line in this file to update per release, and
       # deploy/README.md lists the others.
-      url: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.0
+      url: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.1
     healthCheckPath: /healthz
     disk:
       name: blobs

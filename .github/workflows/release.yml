@@ -25,7 +25,20 @@ jobs:
   test:
     name: build and test
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # 180 rather than 90, raised 2026-08-03 by the first release attempt, which
+    # was cancelled at the 90 minute mark with the suite still passing. The
+    # measurement rather than the impression: `every_frame_in_every_state_follows
+    # _the_documented_rule` alone ran from 03:26 to 04:10 on a two-core runner,
+    # and a second model test was still going when the job was killed. These are
+    # property tests over the whole frame state machine and they are supposed to
+    # be expensive.
+    #
+    # Deliberately not fixed by lowering `PROPTEST_CASES` here. This workflow is
+    # the part a third party runs to disbelieve us, and a release gate that
+    # quietly ran a tenth of the cases would be a weaker claim wearing the same
+    # green tick. A release is rare; two hours of runner time is the cheaper
+    # side of that trade.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml is the pin and has to be the pin here too.
