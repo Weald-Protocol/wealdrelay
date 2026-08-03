@@ -7,19 +7,20 @@
 //! customer and an invitee address in their own mail server is not a disclosure to
 //! anyone. On the **hosted** tier relay-sent mail is off and cannot be enabled,
 //! because otherwise we would hold the email addresses of people being invited, in
-//! the data plane, which contradicts the hosted tier's standing claim that the
-//! operator of the hosted service cannot tell which humans exist.
+//! the data plane, which contradicts the claim in
+//! `specs/backend/cloud/overview.md` that we cannot tell which humans exist.
 //!
 //! ## Why there is no `if hosted` in this file
 //!
-//! The hosted binary must be the audited binary, so a build must never branch on
-//! its environment. The difference is therefore carried entirely by one
-//! configuration value: this module asks whether an SMTP endpoint is configured,
-//! and `crate::profile` refuses `WEALD_RELAY_SMTP_URL` at startup on the hosted
-//! profile. A hosted relay reaches ``decide`` with `None` because it could not have
-//! started with anything else, and a self-hoster who sets the hosted profile
-//! watches their own relay refuse the same thing ours refuses, which is the only
-//! version of this claim checkable from outside.
+//! `specs/backend/build/environments.md` requires the hosted binary to be the
+//! audited binary, so a build must never branch on its environment. The difference
+//! is therefore carried entirely by one configuration value: this module asks
+//! whether an SMTP endpoint is configured, and `crate::profile` refuses
+//! `WEALD_RELAY_SMTP_URL` at startup on the hosted profile. A hosted relay reaches
+//! ``decide`` with `None` because it could not have started with anything else, and
+//! a self-hoster who sets the hosted profile watches their own relay refuse the same
+//! thing ours refuses, which is the only version of this claim checkable from
+//! outside.
 //!
 //! ``decide`` takes the resolved value rather than the `Config`, so the type system
 //! carries the rule: there is no `Profile` in scope here to branch on.

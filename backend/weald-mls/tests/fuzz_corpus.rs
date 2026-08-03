@@ -3,9 +3,9 @@
 //! The fuzz corpus, replayed by `cargo test` with no nightly and no sanitizer.
 //!
 //! `specs/backend/relay/mls-binding.md` requires fuzzing of `weald_mls_process` "with
-//! malformed and hostile messages", and the corpus has to be carried forward rather than
-//! rediscovered. A libFuzzer target satisfies the first and only half of the second: it
-//! explores, but it explores in a nightly build with a sanitizer,
+//! malformed and hostile messages", and `specs/backend/build/phases-relay.md` step 7 adds
+//! that the corpus is "carried forward". A libFuzzer target satisfies the first and only
+//! half of the second: it explores, but it explores in a nightly build with a sanitizer,
 //! on a schedule, and nobody notices for a week when it stops being run.
 //!
 //! So the seeds are checked in under `fuzz/corpus/process/` and this file replays every

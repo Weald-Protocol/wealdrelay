@@ -8,8 +8,8 @@
 # is no secret in this file that is worth stealing beyond the database password,
 # which protects ciphertext.
 #
-# Every supporting image is pinned by digest, never by a moving tag. A digest
-# change here is a deliberate edit and shows up in review as one.
+# Every image is pinned by digest, never by tag, per
+# specs/backend/build/environments.md. A digest change here is a deliberate edit.
 
 name: weald-relay
 
@@ -32,7 +32,7 @@ services:
     networks: [weald]
 
   # Encrypted media blobs. Replaceable with any S3-compatible endpoint, or with
-  # a plain directory: point WEALD_RELAY_STORAGE_URL at a file:// path instead.
+  # a plain directory: see STORAGE in .env.example.
   minio:
     image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
@@ -101,11 +101,9 @@ services:
     #   WEALD_RELAY_IMAGE=ghcr.io/weald-protocol/wealdrelay@sha256:...
     #
     # Until the first release is published this reference does not resolve. That
-    # is the honest state of the world and not a configuration error.
-    #
-    # RELEASE PIN. This is the one line in this file to update per release, and
-    # deploy/README.md lists the others.
-    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.5}
+    # is the honest state of the world, not a configuration error: see
+    # specs/backend/build/container-image.md.
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.0}
     restart: unless-stopped
     depends_on:
       postgres:

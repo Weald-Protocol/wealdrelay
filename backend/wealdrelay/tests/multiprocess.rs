@@ -2,10 +2,11 @@
 // Copyright 2026 Dicyanin Labs
 //! Sequence assignment across three relay processes.
 //!
-//! The invariant under test: sequence assignment is total-ordered and gap-free
-//! under randomised concurrent publishes across three processes. `ci` runs a
-//! two-process relay specifically to exercise this, because single-process runs
-//! cannot.
+//! Step 4's property gate: "sequence assignment is total-ordered and gap-free
+//! under randomised concurrent publishes across three processes"
+//! (`specs/backend/build/phases-relay.md`), and the configuration note says `ci`
+//! runs a two-process relay specifically to exercise this, "which single-process
+//! runs cannot".
 //!
 //! Three real processes, not three tasks. That distinction is the whole test. A
 //! single process assigning sequence numbers can be correct by accident: an
@@ -16,17 +17,17 @@
 //!
 //! ## Why Redis is not in this test
 //!
-//! The gate this suite answers was first worded as "sequence assignment, correct
-//! across multiple relay processes via Redis", and
-//! `specs/backend/relay/operations.md` is clearer about the division: Redis
-//! carries **fanout**, and "a missed Redis message costs a subscriber its live
-//! push and is repaired by reconciliation on the next round trip, so Redis is
-//! never the source of truth for whether an envelope was accepted".
+//! `phases-relay.md` says "sequence assignment, correct across multiple relay
+//! processes via Redis", and `specs/backend/relay/operations.md` is clearer about
+//! the division: Redis carries **fanout**, and "a missed Redis message costs a
+//! subscriber its live push and is repaired by reconciliation on the next round
+//! trip, so Redis is never the source of truth for whether an envelope was
+//! accepted".
 //!
 //! Sequence assignment is therefore Postgres's, and it has to be: a counter in
 //! Redis would be a second source of truth for a number that has to agree with the
-//! rows in the envelope table, and the two could diverge on any failover. That
-//! wording is corrected in the same commit as this test, because a gate that
+//! rows in the envelope table, and the two could diverge on any failover. The plan
+//! file's wording is corrected in the same commit as this test, because a gate that
 //! asked for the number to come from Redis would have been asking for the weaker
 //! design.
 
@@ -278,8 +279,8 @@ mod client {
             match opcode {
                 // A close frame is the relay refusing this connection, and reading
                 // its body as CBOR would report `Truncated` rather than the refusal
-                // that actually happened. Access-set enforcement made that a
-                // reachable outcome, so it is named here.
+                // that actually happened. Step 6 made that a reachable outcome, so
+                // it is named here.
                 0x8 => panic!("the relay closed the connection: {payload:?}"),
                 // Ping and pong carry no frame, so they are consumed and the caller
                 // keeps waiting for the next data frame.
@@ -290,10 +291,9 @@ mod client {
 
         /// Walk the handshake to Ready as this device.
         ///
-        /// `AUTH` is a real check, so the challenge the relay issued has to be
-        /// signed by a key the workspace's access set admits. Before access-set
-        /// enforcement landed, a made-up key and 64 bytes of `0x22` walked
-        /// straight through.
+        /// Step 6 made `AUTH` a real check, so the challenge the relay issued has to
+        /// be signed by a key the workspace's access set admits. Before that, a
+        /// made-up key and 64 bytes of `0x22` walked straight through.
         pub fn handshake(&mut self, group: &[u8], key: &SigningKey) {
             self.send(&Frame::Connect {
                 version: PROTOCOL_VERSION,
@@ -335,9 +335,9 @@ fn device() -> SigningKey {
 ///
 /// Seeded rather than published over a socket for the same reason
 /// `tests/support/mod.rs` seeds it: the socket path is proven by `tests/access.rs`,
-/// and this suite is about sequence assignment across processes. All it needs is a
-/// workspace that admits its client, since `WEALD_RELAY_ACCESS_SET` is `enforce` in
-/// every environment including this one.
+/// and this suite is about sequence assignment across processes. What it needs from
+/// step 6 is a workspace that admits its client, since `WEALD_RELAY_ACCESS_SET`
+/// is `enforce` in every environment including this one.
 async fn seed_access_set(database: &str, workspace: &str, devices: &[SigningKey]) {
     let pool = sqlx::PgPool::connect(&format!(
         "postgres://weald:weald@127.0.0.1:{}/{database}",

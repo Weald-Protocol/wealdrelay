@@ -1,11 +1,20 @@
 # Relay: proving the encryption
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 The claim is that an operator cannot read content. An unverifiable claim is
 marketing. This spec is the set of surfaces that let a customer, a security
 reviewer or a journalist check it without taking our word for anything.
 
 Design rule throughout: **proof is a UI surface, not a documentation page.** A
-security write-up is read once by one person before purchase. A panel in the app
+`/security` page is read once by one person before purchase. A panel in the app
 is seen by everyone, every week, and it is what turns a claim into something
 users would notice breaking.
 
@@ -36,7 +45,7 @@ Reproducible builds, published digests, and client-side release comparison as de
 `specs/backend/relay/server.md`. The part that makes it live rather than
 ceremonial:
 
-The client fetches `/releases` from the control plane (`specs/backend/hosted-service.md`),
+The client fetches `/releases` from the control plane (`specs/backend/cloud/api.md`),
 reads the digest its relay reports, and compares. A mismatch is not a log line:
 it is a banner naming the expected and reported digests, shown to every connected
 user until acknowledged. This detects ordinary deployment drift and operator
@@ -64,7 +73,7 @@ gated up front.
 
 Third-party audit of the MLS integration and envelope handling before general
 availability, scope and firm named, report published whole rather than
-summarised. `specs/backend/hosted-service.md` sequences this ahead of SOC 2,
+summarised. `specs/backend/cloud/compliance.md` sequences this ahead of SOC 2,
 because for this audience it is worth more and costs less.
 
 ## Proof 3: nobody was silently added
@@ -154,10 +163,8 @@ being misled by the lock icon three inches away.
 
 ## Verification runbook
 
-Written as a runnable procedure, not prose. A reviewer with a terminal should be
-able to work through it in under an hour. The operator-facing version, with the
-commands and the counterpart each step has in the test suite, is
-`specs/backend/relay/verification-runbook.md`.
+Published at `/docs/verify` and written as a runnable procedure, not prose. A
+reviewer with a terminal should be able to work through it in under an hour:
 
 1. Clone the relay source at the tag matching your running digest.
 2. Run the reproducible build. Compare the resulting digest.
@@ -183,10 +190,9 @@ commands and the counterpart each step has in the test suite, is
     the wrap index being a membership graph
     (`specs/backend/relay/groups.md`).
 
-If you only run one of these, run step 5. It is the one that convinces people:
-`SELECT * FROM envelopes` against the relay's own database returns nothing but
-blobs, and no amount of prose about encryption carries the same weight as seeing
-that yourself.
+Step 5 is the one that convinces people, and it is the one we should demo. A
+screen recording of `SELECT * FROM envelopes` returning nothing but blobs does
+more than any amount of copy on the landing page.
 
 ## What we must never ship
 

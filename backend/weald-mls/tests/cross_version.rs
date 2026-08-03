@@ -5,7 +5,7 @@
 //! `specs/backend/relay/mls-binding.md`, "Testing": "Cross-version tests. An old client
 //! and a new client in one group, since forward compatibility is claimed in
 //! `specs/backend/relay/wire.md` and claimed compatibility that is never tested is a
-//! rumour."
+//! rumour." `specs/backend/build/phases-relay.md` step 7 lists it as a gate item.
 //!
 //! # What this file proves
 //!
@@ -49,9 +49,9 @@
 //! To become a two-binary test it would need: the previous released crate published or
 //! vendored at a pinned revision, a second test target that links it, and a harness that
 //! passes byte buffers between the two rather than calling both through one `use`. That
-//! is a build-system change rather than a test change, and it belongs with the release
-//! packaging, which is where the pinned checksums for previous builds would come from.
-//! Until then the honest claim is the one
+//! is a build-system change rather than a test change, and it belongs with the
+//! XCFramework work in `specs/backend/build/environments.md`, which is where the pinned
+//! checksums for previous builds would come from. Until then the honest claim is the one
 //! above: compatibility is proved at the protocol-version and capability level, which is
 //! the level MLS actually negotiates at, and not at the level of two compiled artefacts.
 

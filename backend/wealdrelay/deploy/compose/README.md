@@ -1,63 +1,16 @@
 # The Weald relay, on your own VPS
 
-A TLS-terminated relay in three commands. `specs/backend/relay/deployment.md`
+Three commands to a TLS-terminated relay. `specs/backend/relay/deployment.md`
 path 2.
 
-There are two routes and they do not mix. Pick one. The difference that matters
-is where the two passwords come from: `install.sh` generates them, and by hand
-you generate them yourself.
-
-**Status.** Until the first signed release is tagged there is no release page to
-download from and the image reference in `docker-compose.yml` cannot be pulled.
-Route B works from a clone today if you build the image yourself with
-`scripts/relay-reproduce.sh` and set `WEALD_RELAY_IMAGE` to what you built.
-Everything else on this page is accurate now. This notice comes down with the
-first published, signed, digest-pinned release.
-
-## Route A: install.sh
-
-`install.sh` is attached to every release. Download it from the release page for
-the tag you want, https://github.com/Weald-Protocol/wealdrelay/releases, then:
-
 ```
-sh install.sh
-cd weald-relay && $EDITOR .env
+curl -fsSL https://get.weald.team/relay | sh
+cd weald-relay && cp .env.example .env && $EDITOR .env
 docker compose up -d
 ```
 
-`install.sh` fetches the compose bundle for the release, verifies its SHA-256,
-copies `.env.example` to `.env` and fills in `POSTGRES_PASSWORD` and
-`MINIO_ROOT_PASSWORD` with 40 random characters each. It does not start
-anything: that decision is yours.
-
-The `.env` edit is then one line, `WEALD_RELAY_HOSTNAME`. Everything else has a
+The `.env` edit is one line: `WEALD_RELAY_HOSTNAME`. Everything else has a
 working default.
-
-**Do not run `cp .env.example .env` after `install.sh`.** That puts the empty
-example passwords back over the generated ones, and compose will refuse to
-start until you fill them in again.
-
-## Route B: by hand, from a clone
-
-No release needed, and nothing is downloaded that you have not read.
-
-```
-git clone https://github.com/Weald-Protocol/wealdrelay.git
-cd wealdrelay/backend/wealdrelay/deploy/compose
-cp .env.example .env
-$EDITOR .env
-docker compose up -d
-```
-
-On this route the `.env` edit is three lines, not one:
-
-- `WEALD_RELAY_HOSTNAME`, your hostname.
-- `POSTGRES_PASSWORD`, from `openssl rand -base64 30`.
-- `MINIO_ROOT_PASSWORD`, from a second `openssl rand -base64 30`.
-
-Both passwords ship empty. Compose refuses to start on an empty password and
-names the variable, so there is no way to follow this route and end up running a
-placeholder.
 
 ## Before you start
 
@@ -92,28 +45,17 @@ one-time enrollment URL:
 docker compose logs relay
 ```
 
-**Copy that URL and the one-time code printed with it.** The first device to
-open the URL and enter the code becomes the workspace trust root, and the
-genesis private key is destroyed in the same transaction. It expires in 24 hours
-or on first use.
-
-If you close the log before copying, read it again with the same command: the
-log is still there. If the log itself is gone, restart the relay. While the
-workspace is still unenrolled, every start reprints the enrollment link.
-
-**The one-time code is not reprinted, ever.** The relay stores only its Argon2id
-hash, so there is nothing left to print, and there is no reissue command and
-never will be: reissuing a bootstrap invite is forbidden by the threat model. If
-you lose the code before a device enrols, the only recovery is to start again
-from an empty database:
+**Copy that URL.** The first device to open it becomes the workspace trust root
+and the genesis private key is destroyed in the same transaction. It expires in
+24 hours or on first use. If you close the log before copying it, and no device
+has claimed it yet:
 
 ```
-docker compose down --volumes
-docker compose up -d
+docker compose exec relay wealdrelay bootstrap --reissue
 ```
 
-That destroys the workspace. At this point in the sequence there is nothing in
-it yet, which is why this is a recovery and not a disaster.
+That works only while the workspace has no trust root, and refuses afterwards,
+permanently.
 
 ## When it does not work
 
@@ -150,10 +92,10 @@ docker compose run --rm --entrypoint sh minio-init -c \
    && mc mirror local/"$BUCKET" /backup' -v "$PWD/weald-blobs:/backup"
 ```
 
-Put both in cron. A single `wealdrelay backup` command that wraps both is
-specified in `specs/backend/relay/server.md` and is **not implemented**. Until
-it ships, the two commands above are the supported procedure, and no runbook
-should be written around the single command.
+Put both in cron. `wealdrelay backup`, the single command that wraps the two into
+one tarball, is specified in `specs/backend/relay/server.md` and is **not shipped
+yet**; it is an open item on relay step 13. The two commands above are the
+supported procedure until it is.
 
 Restore is the same two in reverse, against any other install, then repoint the
 client. Clients hold a full
@@ -161,13 +103,6 @@ copy and reconcile the delta on next connect, so a restore from a slightly stale
 backup self-heals.
 
 ## Upgrade
-
-There is no moving tag to pull, deliberately: a relay that changed under its
-operator without a deploy they asked for is the thing digest pinning exists to
-prevent. An upgrade is an edit.
-
-Set `WEALD_RELAY_IMAGE` in `.env` to the tag or digest of the release you are
-moving to, then:
 
 ```
 docker compose pull && docker compose up -d

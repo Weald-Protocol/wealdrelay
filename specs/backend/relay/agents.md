@@ -1,5 +1,14 @@
 # Relay: how agents actually connect
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 `specs/backend/relay/identity.md` says an agent is a principal with its own
 keypair and an MLS leaf. It does not say what software holds that leaf, and the
 answer decides how much MLS integration work exists
@@ -10,9 +19,9 @@ control-C.
 ## Decision: agents proxy through the local Weald app
 
 An agent does not speak the relay wire protocol, does not hold MLS state, and
-does not open a socket. It talks to the local Weald app over the MCP and HTTP server the app already
-exposes on loopback, and the app performs every cryptographic operation on its
-behalf.
+does not open a socket. It talks to the local Weald app over the existing MCP
+and HTTP server (`Sources/MCP/`), and the app performs every cryptographic
+operation on its behalf.
 
 The rejected alternative was giving each agent process its own MLS stack, which
 would have meant shipping the Rust FFI layer into every agent runtime, and would

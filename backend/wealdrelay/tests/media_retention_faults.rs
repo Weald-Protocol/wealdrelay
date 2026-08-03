@@ -201,7 +201,7 @@ async fn a_control_that_cannot_be_written_is_not_reported_as_accepted() {
 
 #[tokio::test]
 async fn a_successor_race_the_relay_cannot_record_or_freeze_is_never_reported_as_settled() {
-    // The negative proof for retention control, failing at the database rather than
+    // The negative proof the step 9 gate names, failing at the database rather than
     // at the protocol. A second, differently signed control for a settled epoch
     // "is not rejected and forgotten": it is stored as evidence and it freezes the
     // group. Neither half may be reported as done when it did not happen. A

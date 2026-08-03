@@ -1,5 +1,14 @@
 # Relay test harness
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 The relay harness proves behavior at the same boundaries customers operate:
 real Postgres, a running relay, raw WebSockets, filesystem or MinIO storage,
 and process lifecycle. It is not a mock wrapper around `src/`.
@@ -11,25 +20,19 @@ boundary.
 
 ## Entry points
 
+| Agent | Command | Use |
+| --- | --- | --- |
+| Claude | `/relay-test-harness BR-005` | Add or validate a bounded-risk relay scenario. |
+| Codex | `$relay-test-harness BR-005` | Same workflow through `AGENTS.md` and the portable skill. |
+| Shell | `scripts/backend-test-loop.sh run LABEL -- COMMAND...` | Save a focused test command and its output. |
+
+Start a material test cycle by reading the master test plan, testing contract,
+review register, relevant wire contract, and current diff. Then capture a
+snapshot:
+
 ```bash
-scripts/weald-stack up          # Postgres, MinIO and Redis, on loopback
-cargo test --workspace --locked
-scripts/weald-stack down
+scripts/backend-test-loop.sh snapshot
 ```
-
-`scripts/weald-stack status` says what is listening and whether it is ready, and
-`scripts/weald-stack reset` drops the scratch databases a run killed with ctrl-c
-leaves behind. Ports and credentials are fixed and public, in
-`backend/compose/weald-stack.yml`, because every integration test hard-codes them:
-a contract run that silently pointed at some other endpoint would prove nothing
-about the deployment being built.
-
-Weald's own development loop wraps these commands in a recorder that files each
-run's output as gate evidence, in the private build repository. Nothing in the
-tests depends on it; the commands above are the whole interface.
-
-Start a material test cycle by reading the relevant wire contract, this document,
-and the current diff.
 
 ## Harness contract
 
@@ -85,17 +88,20 @@ Start the local stack before a real-boundary run:
 
 ```bash
 scripts/weald-stack up --budget 120
-cargo test --package wealdrelay --test reconcile \
+scripts/backend-test-loop.sh run br-005-recon-over-queue -- \
+  cargo test --package wealdrelay --test reconcile \
   a_client_missing_more_than_the_send_queue_converges_without_disconnect
-cargo test --package wealdrelay --test reconcile \
+scripts/backend-test-loop.sh run br-005-sub-over-queue -- \
+  cargo test --package wealdrelay --test reconcile \
   a_subscription_larger_than_the_send_queue_can_finish_by_reconciliation
+scripts/backend-test-loop.sh gate 5
 ```
 
-Record the fixture count, the fixed clock, the command and the result alongside
-the change. A scenario that changes access-set admission or any workspace-scoped
-`SEND`, `SUB` or `RECON` path also needs the access suites
-(`cargo test --package wealdrelay --test access_socket`), because those paths share
-an admission decision and a regression in it shows up there first.
+Run gate 6 as well if the scenario changes access-set admission or any
+workspace-scoped `SEND`, `SUB`, or `RECON` path. Preserve the evidence directory
+and record fixture count, fixed clock, command, result, and next action in the
+test-loop output. Do not update the build ledger or resolve the review ticket
+until the owning gate is green.
 
 ## Blocked environments
 

@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! The hosted profile refuses what `specs/backend/relay/server.md` says it must.
 //!
-//! The negative proof is one line of that spec: `SMTP_URL` set on a
+//! Step 13's negative proof is one line of that spec: `SMTP_URL` set on a
 //! hosted-profile build is refused at startup. The other three refusals are here
 //! for the same reason: they are the settings the spec says are not
 //! customer-configurable on the hosted tier, and a rule that is only written down

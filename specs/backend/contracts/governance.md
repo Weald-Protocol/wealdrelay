@@ -1,16 +1,25 @@
 # Governance and change control
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 Until this file existed, "the Weald Protocol" meant "whatever our current wire
 format happens to be". The difference between those two things is not the quality
 of the specification. It is whether somebody who is not us can depend on it: know
 what may change, know how much warning they get, know how to object, and know
-what will still be true in two years. That is what this document supplies. It was
-written alongside the ciphersuite pin in `../relay/mls-binding.md`, and the two
-of them together are what turned a specification into something dependable.
+what will still be true in two years. That is what this document supplies, and it
+is the last of the two genuine gaps recorded in `PROTOCOL-READINESS.md`, the
+other being the ciphersuite pin now written in `../relay/mls-binding.md`.
 
-Scope: the protocol surface listed below. Not the reference client, which is not
-open source and carries no compatibility promise; not any operator's internal
-schema; not pricing, packaging or the operations of a managed deployment.
+Scope: the protocol surface listed below. Not the macOS client, which is not
+open source and carries no compatibility promise; not the control plane's
+internal schema; not pricing, packaging or the hosted tier's operations.
 
 ## 1. What is governed
 
@@ -31,8 +40,7 @@ Everything else is ordinary engineering.
 Explicitly not governed: the relay's database schema (an implementation detail
 of one implementation, documented for operators, free to change on any release),
 log formats, metric names, the control plane's HTTP API (versioned separately by
-its own OpenAPI document, which is not part of this repository), and the build
-programme's own bookkeeping.
+`api/openapi.yaml`), and anything under `../build/`.
 
 ## 2. Versioning
 
@@ -202,4 +210,4 @@ routinely do to their implementers.
 
 | Date | Change |
 | --- | --- |
-| 2026-08-02 | Created. First governance and change control document for the protocol, written alongside the cryptographic pin in `../relay/mls-binding.md`. |
+| 2026-08-02 | Created. First governance and change control document for the protocol. Closes the second of the two real gaps in `PROTOCOL-READINESS.md`, alongside the cryptographic pin in `../relay/mls-binding.md`. |

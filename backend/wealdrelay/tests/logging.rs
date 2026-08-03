@@ -2,10 +2,10 @@
 // Copyright 2026 Dicyanin Labs
 //! The scrubbing log layer, and the two level rules it exists to enforce.
 //!
-//! The negative proof the relay owes here is that the log scrubber drops a planted
-//! token, and that test is written below under exactly that name so a reader
-//! looking for the proof finds it rather than inferring it from a pile of smaller
-//! assertions.
+//! Step 3's negative proof in `specs/backend/build/phases-relay.md` is "the log
+//! scrubber drops a planted token", and that test is written here under exactly
+//! that name so a reader looking for the proof finds it rather than inferring it
+//! from a pile of smaller assertions.
 //!
 //! The rest of the suite pulls in two directions at once, deliberately. Half of it
 //! asserts that credentials do not survive, which is the point of the layer. The
@@ -61,12 +61,12 @@ fn planted() -> Vec<Planted> {
     ]
 }
 
-// MARK: The scrubber's negative proof
+// MARK: The step 3 negative proof
 
 #[test]
 fn the_log_scrubber_drops_a_planted_token() {
-    // This is the named negative proof for the log layer. Each line below is a
-    // shape a credential has actually taken in a relay's output: a database URL in a
+    // This is the named negative proof for step 3. Each line below is a shape a
+    // credential has actually taken in a relay's output: a database URL in a
     // connection error, an Authorization header echoed back from a rejected
     // request, an AWS secret key inside an SDK error message, raw key material, a
     // token in a query string, and a password in a JSON body. The claim being

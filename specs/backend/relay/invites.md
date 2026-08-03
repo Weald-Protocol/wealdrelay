@@ -1,5 +1,14 @@
 # Relay: invites
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 An admin issues an invite, the person gets an email, clicks it, enters a code,
 and is in. No teammate needs to be online, no approval queue, no waiting state.
 
@@ -81,8 +90,8 @@ The link goes to email. The code does not.
 
 At invite creation the admin's client displays a one-time **12-character
 Crockford Base32 code**, grouped `ABCD-EFGH-JKLM`, and the admin sends it over
-whatever channel they already use, typically the same conversation where they
-said "I'm adding you". The email contains only the link. The grouping makes it
+whatever channel they already use, typically the Slack thread where they said
+"I'm adding you". The email contains only the link. The grouping makes it
 comfortable to paste or read aloud while the 60-bit value remains safe even
 against distributed guessing.
 
@@ -119,7 +128,7 @@ client of suspicious attempt volume without naming a source IP.
    The reason is narrow and worth stating. If our relay sent invite mail, we
    would hold the email addresses of people being invited into a workspace, in
    the data plane, which contradicts the claim in
-   `specs/backend/hosted-service.md` that we cannot tell which humans exist.
+   `specs/backend/cloud/overview.md` that we cannot tell which humans exist.
    No feature is worth putting a name list inside the blind half of the system.
 
    Either way, no admin is ever forced to configure mail to onboard someone.
@@ -140,17 +149,13 @@ reservation is what makes it admissible. Everything that would otherwise be a
 session check is a property of the record instead, and the endpoint's single generic
 answer is what keeps it from being an oracle.
 
-**A known limitation of the reference client, stated here rather than left to be
-discovered.** The signature verification the fetch step requires is specified
-above but is not yet implemented: the client fetches the sealed bundles and opens
+Step 5's signature verification is **not yet implemented**, and it is named here
+rather than left to be discovered: the client fetches the sealed bundles and opens
 them, but does not yet fetch the signed record and verify that its issuer chains to
-the workspace trust root. The security consequence, for as long as that holds, is
-that a client trusts the relay for which scopes an invite covers. A relay can
-shrink that list, which costs a joiner a channel it would have entered, and cannot
-widen it: a scope it invented has no bundle anybody can open, and the commit for it
-is refused against the record's own scope list. An implementation that performs the
-verification does not interoperate any differently; it simply stops extending the
-relay that trust.
+the workspace trust root. Until it does, a client trusts the relay for which scopes
+an invite covers. A relay can shrink that list, which costs a joiner a channel it
+would have entered, and cannot widen it: a scope it invented has no bundle anybody
+can open, and the commit for it is refused against the record's own scope list.
 
 4. **Local setup, then reserve.** Before spending an invite seat, the client
    generates its device key, collects a display name, and generates and confirms
@@ -354,7 +359,7 @@ link again inside its 24 hours, on a new nonce and a new device key. A buyer
 who completes setup has a workspace whose first
 log entry is genesis, and no second bootstrap exists at any price.
 
-The client's trust-root check (`specs/backend/hosted-service.md`) runs
+The client's trust-root check (`specs/backend/cloud/provisioning.md`) runs
 against the accepted genesis set rather than against a roster it wrote itself,
 so an interception is caught by the relay's own accepted state and not by the
 client agreeing with itself.
@@ -392,29 +397,27 @@ blocking.
    no unlogged prefix.
 
 For self-hosters the genesis key never leaves their machine and this whole
-section is a formality. Where somebody else provisions the relay it is the crux
-of the trust-root race
-(`specs/backend/contracts/threat-model/bootstrap-handoff.md`), and it is worth
-watching rather than reading: the key being destroyed and the log entry being
-written are both observable, which is more than this paragraph can be.
+section is a formality. For hosted it is the crux of the trust-root race in
+`specs/backend/cloud/provisioning.md`, and it should be demoed rather than
+described: a screen recording of the key being destroyed and the log entry being
+written is worth more than the paragraph above.
 
 ### Delivery
 
-The relay prints the link and the code to its own stdout for self-hosters. Where
-somebody else provisions the relay, the two halves are split across channels:
+The relay prints the link and the code to its own stdout for self-hosters, and
+for the hosted tier the two halves are split across channels:
 
-- **Link** to the browser session that ordered the instance.
-- **Code** to an address the operator verified before provisioning began, and
-  which no later profile or billing edit can move. A mutable address is never
-  used for this security factor.
+- **Link** on the post-checkout page, in the browser session that paid.
+- **Code** emailed to the verified Clerk email of the owner who initiated
+  Checkout, locked into that Checkout session. A mutable Stripe invoice address
+  is never used for this security factor.
 
 That split protects against an accidentally forwarded link and against a
 browser-only or inbox-only compromise. It does **not** turn email delivery into
-an independent security boundary against the provisioning operator: the service
-requesting delivery handles the code. The trust-root race is instead made visible
-by the client's hard-fail and permanently attributable through the genesis entry,
-and the customer can have the instance replaced without asking anyone
-(`specs/backend/contracts/threat-model/bootstrap-handoff.md`). This distinction is
+an independent control-plane security boundary: the service requesting delivery
+handles the code. The hosted trust-root race is instead made visible by the
+client's hard-fail and permanently attributable through the genesis entry; the
+customer can replace the instance without a support ticket. This distinction is
 deliberate because a reassuring but false "two independent compromises" claim
 would be worse than naming the remaining risk.
 
@@ -424,6 +427,31 @@ empty workspace to protect with a tight window. This removes the "token expired
 while I was downloading" failure that the short-lived bootstrap token created.
 
 ## Admin controls
+
+These are carried by `INVITE`, frame tag 20, which is separate from `JOIN` (tag 18)
+and refused on any session that has not authenticated. `JOIN` is the one frame a
+client may send before `AUTH`, because a device redeeming an invite has no
+membership yet; issuing is the opposite, and folding the two together would put a
+privileged operation on the one path that by construction has no session behind it.
+
+The relay gates `INVITE` on the access set's `authorizers` list, not on the `admit`
+capability. It cannot check the capability: capabilities live in the roster and the
+roster is encrypted to the workspace group. `identity.md` makes the authority to
+rotate the access set and the authority to admit the same power in practice, so the
+authorizer list is the relay-visible form of it. The record's own signed `caps` list
+is where the capability rule is really enforced, by every client that reads it.
+Unlike the redeem path, answers here are specific: the caller is an authenticated
+member who just uploaded a record, and telling them which rule they broke is safe.
+
+The joiner's side gains one step on `JOIN`: `Record`, which serves the stored record
+exactly as its issuer signed it. Step 5 below has always required a client to verify
+that signature before presenting anything, and there was no verb for it, so a client
+had to trust the relay for which scopes an invite covered and a joiner who knows
+nothing about the workspace could not name a group to ask about at all. It is not
+gated on a reservation: the record carries no code and no secret, and gating it would
+mean spending a code attempt to discover an invite was malformed.
+
+The client module above all of this is `specs/invite-module.md`.
 
 - **Live invite list.** Outstanding invites, scopes, expiry, uses remaining,
   revocable individually. Revocation first writes the opaque enforcement

@@ -1,5 +1,14 @@
 # Relay: multiple workspaces in one client
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 **One workspace is one project.** That is the load-bearing rule of the whole
 programme and every other spec under `specs/backend/` assumes it. A workspace has
 one relay, one roster, one recovery phrase, one device keypair, and exactly one

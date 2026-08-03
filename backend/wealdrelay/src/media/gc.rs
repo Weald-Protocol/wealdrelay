@@ -17,9 +17,9 @@
 //! placed directly), which neither of the above could ever see because both
 //! start from a database row.
 //!
-//! Every pass writes one `relay_gc_run` row, so that the GC run log and the
-//! storage accounting against the quota are both recoverable after the fact
-//! rather than only visible while the pass is running.
+//! Every pass writes one `relay_gc_run` row, which is the artifact
+//! `phases-relay.md` step 9 asks for: "the GC run log and the storage accounting
+//! against the quota."
 
 use sqlx::PgPool;
 

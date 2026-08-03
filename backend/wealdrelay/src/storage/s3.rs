@@ -2,10 +2,11 @@
 // Copyright 2026 Dicyanin Labs
 //! The S3 backend, held to the same contract as the filesystem one.
 //!
-//! Real S3 in deployed environments, real MinIO in the test harness. The same code
-//! path in both, because the difference between environments is configuration and
-//! never code: MinIO is reached by pointing `AWS_ENDPOINT_URL_S3` at it and turning
-//! on path-style addressing, which is what every S3-compatible provider expects.
+//! Real S3 in staging and production, real MinIO in `ci`
+//! (`specs/backend/build/environments.md`). The same code path in both, because
+//! the difference between environments is configuration and never code: MinIO is
+//! reached by pointing `AWS_ENDPOINT_URL_S3` at it and turning on path-style
+//! addressing, which is what every S3-compatible provider expects.
 //!
 //! Credentials come from the standard AWS chain, so an operator on a provider
 //! that injects a role gets it for free and one on a VPS sets two variables. No
@@ -398,7 +399,7 @@ impl S3Store {
     /// A presigned PUT for `key`, valid for `ttl`.
     ///
     /// `media.md`: "a presigned PUT URL valid for 15 minutes". One object per
-    /// call: the multipart upload path issues one of these per part rather than
+    /// call: the multipart path (step 9) issues one of these per part rather than
     /// using S3's own multipart API, so both storage backends share exactly one
     /// finalization path in `media::gc` and `media::store` instead of two.
     pub async fn presign_put(

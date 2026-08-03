@@ -53,3 +53,21 @@ You can ignore this file entirely. `backend/wealdrelay/deploy/README.md` is the
 runbook, `specs/backend/relay/server.md` is the configuration surface, and
 `specs/backend/relay/verification.md` is how you check that the binary you are
 running is the source you are reading.
+
+## Why some comments here cite files you cannot open
+
+This repository is generated from a monorepo that also holds the hosted service,
+and the generation is a byte-exact copy rather than a rewrite. So a doc comment
+occasionally cites `specs/backend/build/...` or `specs/backend/cloud/...`, and
+those are the unpublished specifications described above.
+
+That is deliberate, and the alternative was worse. Rewriting those citations by
+hand meant maintaining two versions of the same comment, and it silently failed
+the first time a file's code changed and the copy overwrote the rewrite.
+Rewriting them mechanically produced broken sentences. An honest citation to a
+document we do not publish is a smaller cost than prose that has to be maintained
+twice, and it tells you the reasoning exists rather than pretending it does not.
+
+Nothing in those files changes what this code does. Where a rule matters to the
+protocol it is stated in `specs/backend/relay/` or `specs/backend/contracts/`,
+both of which are here in full.

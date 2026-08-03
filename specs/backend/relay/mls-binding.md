@@ -1,5 +1,14 @@
 # Relay: the MLS binding
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 The highest-risk engineering in this programme, and until now the only piece
 documented nowhere. The client is Swift on macOS; the mature MLS
 implementations are Rust. Something has to bridge them, and doing that badly
@@ -40,7 +49,7 @@ Everything above them, including envelope construction, author chains,
 certificates, retention and every product decision in this spec family, lives in
 Swift. Everything below is OpenMLS unmodified.
 
-**Revised from twelve functions to fourteen.** The original list could
+**Corrected in step 7, from twelve functions to fourteen.** The list above could
 consume a key package in `add` and could never produce one, and could accept a
 `Welcome` from nobody: `add` returns a welcome for the joiner and no function took
 one. So the ordinary invite path in `specs/backend/relay/invites.md` was
@@ -59,7 +68,8 @@ package the relay already stores a count of and keeps its private half in the
 provider's storage, and `join_welcome` consumes bytes the same way `process`
 does. The exporter is still the only function that returns key material.
 
-Two further corrections of the same kind, both narrower than they look:
+Two further corrections of the same kind, both made in step 7 and both narrower
+than they look:
 
 - **`weald_mls_epoch` returns the epoch authenticator, not the tree hash.**
   OpenMLS exposes `MlsGroup::tree_hash` only behind its `test-utils` feature, and
@@ -75,7 +85,7 @@ Two further corrections of the same kind, both narrower than they look:
   why. It is the same ordering rule `wire.md` uses for the author chain: reserve,
   send, then advance.
 
-**A third correction: the recovery wrap is sealed below the boundary,
+**A third correction, made in step 7: the recovery wrap is sealed below the boundary,
 not above it.** `specs/backend/relay/groups.md` describes `recovery.wrap` as a record
 the committer emits, and everything about it reads like a product concern: who is
 entitled, when it is re-emitted, the 30-day retention of the prior slot, the weekly
@@ -100,7 +110,7 @@ The tag derivation is here for the same reason: it is
 `BLAKE3(export(weald wraptag v1) || recovery_pubkey)`, so computing it above the boundary
 would mean exporting that secret too.
 
-**An open gap, found late and still open.** The seam list above writes
+**An open gap, found in step 8 and not closed there.** The seam list above writes
 the self-join entry point as `join_external(group_info, auth)`, and the shipped C
 ABI is `weald_mls_join_external(handle, group_info, len, out, commit_out)`: there
 is no `auth` parameter, so nothing can be placed in the external commit's
@@ -111,7 +121,7 @@ the parameter exists, that record travels beside the commit rather than inside i
 and is validated against the same two values; the difference is that a commit and
 its claim are two objects an adversary could try to pair differently rather than
 one signed object. Closing it is a change to an existing function rather than a new
-one, so the seam stays at fourteen, but it is
+one, so the seam stays at fourteen and step 7's count gate is unaffected, but it is
 a change to the crypto boundary and is reviewed as one.
 
 Rules that keep it safe:
@@ -129,7 +139,7 @@ Rules that keep it safe:
   Written down because the first version waited on its condition variable while
   holding the executor strongly, which is a wait that never ends: every device
   ever opened kept a thread for the life of the process, and the `deinit` that
-  was supposed to stop it could not run. Corrected in a later revision.
+  was supposed to stop it could not run. Corrected in step 8.
 - **Secrets are zeroed on free**, and the exporter is the only way to get key
   material out. No function returns a raw epoch secret.
 
@@ -200,10 +210,10 @@ enforced, so the list is specific:
 
 | Risk | Mitigation |
 | --- | --- |
-| OpenMLS API churn across versions. | Pinned version, the fourteen-function seam absorbs changes, upgrade is a deliberate task with the property suite as the gate. |
+| OpenMLS API churn across versions. | Pinned version, the twelve-function seam absorbs changes, upgrade is a deliberate task with the property suite as the gate. |
 | The FFI becomes the place bugs live. | Keep it at twelve functions. Any proposal to widen it is reviewed as a security change. |
 | Nobody on the team is a Rust engineer. | The binding is small and mostly marshalling, but the third-party audit in `specs/backend/relay/verification.md` is scoped to include it, and that audit is release-blocking. |
-| Swift concurrency plus a non-Sendable handle. | **An actor is not enough.** An actor serialises access and does not pin a thread, and Swift's cooperative pool moves one across suspensions (measured at five threads for one actor). The Rust side compares thread ids and shares a non-atomic `Rc` between a device and its sessions, so a hop is a refusal at best and a data race at worst. Confinement has to be supplied by a `SerialExecutor` over one dedicated thread, one per device and shared by its groups. The compiler still enforces that the pointer cannot escape. |
+| Swift concurrency plus a non-Sendable handle. | **Corrected in step 7: an actor is not enough.** An actor serialises access and does not pin a thread, and Swift's cooperative pool moves one across suspensions (measured at five threads for one actor). The Rust side compares thread ids and shares a non-atomic `Rc` between a device and its sessions, so a hop is a refusal at best and a data race at worst. Confinement is supplied by a `SerialExecutor` over one dedicated thread, one per device and shared by its groups, in `Sources/MLS/MLSExecutor.swift`. The compiler still enforces that the pointer cannot escape. Evidence and the failing-without-the-fix proof: `build-evidence/step-07/confinement.md`. |
 | iOS later needs the same binding in an extension. | The XCFramework already targets it, and the notification service extension case in `specs/backend/relay/notifications.md` is the reason to keep the state store shareable via a Keychain access group. |
 
 ## The pinned cryptographic profile

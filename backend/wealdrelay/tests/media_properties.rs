@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! The property media collection has to hold: a blob is reclaimed if and only if no
-//! live reference exists, across randomised delete and compaction interleavings.
+//! The property step 9's gate names: a blob is reclaimed if and only if no live
+//! reference exists, across randomised delete and compaction interleavings.
 //!
 //! Tier 2, against a real Postgres and a real object store rather than a model of
 //! them, because the thing under test is a decision made by joining four tables

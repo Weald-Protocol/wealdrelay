@@ -158,8 +158,8 @@ async fn a_principal_is_filed_once_per_connection_and_evicting_it_closes_every_s
     hub.identify(&entry, second, other_sender).await;
     assert_eq!(hub.connections_for(&entry).await, 2);
 
-    // Eviction closes both and reports how many, which is what the recorded
-    // revocation-to-disconnect timing is measured against.
+    // Eviction closes both and reports how many, which is what the disconnect timing
+    // in step 6's evidence is measured against.
     assert_eq!(hub.evict(&entry).await, 2);
     assert!(matches!(receiver.try_recv(), Ok(Outbound::Close)));
     assert!(matches!(other_receiver.try_recv(), Ok(Outbound::Close)));

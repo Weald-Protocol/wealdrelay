@@ -38,9 +38,8 @@
 //! `wire.md` names the `RECON` frame and leaves its bytes to this step, so they
 //! are fixed here, in the same deterministic CBOR subset as every other frame
 //! (`crate::cbor`). One encoding per message, because the client's half is a
-//! separate Swift implementation and the two are held to the shared vectors in
-//! `specs/backend/contracts/wire/vectors/` rather than to each other's good
-//! intentions.
+//! separate implementation in `Sources/Sync` and the two are held to shared
+//! vectors rather than to each other's good intentions.
 //!
 //! ```text
 //! Message = [version: uint, ranges: [Range]]

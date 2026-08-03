@@ -1,5 +1,14 @@
 # Relay: wire protocol
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 The envelope, the event kinds, the sync algorithm and the transport. Layers 1,
 2 and 4 of the stack in `specs/backend/relay/overview.md`.
 
@@ -78,7 +87,7 @@ So the encryption state is a header field the relay reads and enforces against
   `denied/plaintext_refused`. **This is the only permitted value on the hosted
   tier and it is not configurable there**, so a hosted operator cannot receive
   plaintext even by accident, and the claim in
-  `specs/backend/hosted-service.md` is a property of the deployment rather than
+  `specs/backend/cloud/overview.md` is a property of the deployment rather than
   a promise about client behaviour.
 - `WEALD_RELAY_MIN_ENC=none` accepts both and is available to self-hosters
   during Phases 2 and 3 of their own rollout. The relay reports the setting on
@@ -243,12 +252,12 @@ line paste reads it twenty times. Folding the whole group each time made that
 Theta(N squared) in decodes, SHA-256 validations, HKDF derivations and AEAD
 opens.
 
-The fold is kept instead of repeated. A conformant client caches the cursor
-together with how
+The fold is kept instead of repeated. `EnvelopeCursorCache`
+(`Sources/Sync/EnvelopeCursorCache.swift`) records the cursor together with how
 many bytes of each day file it has already consumed, persisted under
 `.weald/log-cursor/` (ephemeral, per machine, never committed: another checkout
 merged those files differently) and memoized in-process. Day files only grow, so
-a later call resumes at the recorded offset by tailing the file from there.
+a later call resumes at the recorded offset via `EnvelopeLog.tail(of:from:)`.
 
 Nothing about this may let a counter be reissued, so the saved position is
 validated on every use and any mismatch costs one full replay, which is exactly
@@ -277,8 +286,8 @@ Separately, `EnvelopeContentKeyCache` memoizes the content key by
 hold different exporter output for the same group and epoch, and keying on the
 pair alone would hand back a key derived from somebody else's secret.
 
-Each of those cases is worth a test that asserts the cached result against a
-cold, cacheless replay. The reference client has one per case.
+Covered by `Tests/EnvelopeCursorCacheTests.swift`, which asserts every case
+against a cold, cacheless replay.
 
 A self-fork observed without a matching `chain.reset` remains what it always
 was: evidence, surfaced loudly. The distinction between a crash and an attack is
@@ -308,7 +317,7 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0070` | `head.attest` | Per-author highest `ctr` and hash, per group. Split-view detection. |
 | `0x0072` | `chain.reset` | Signed declaration by an author that it lost local state, naming the last link it can prove and the counter it resumes at. Turns an honest gap into a stated one. See the author chain above. |
 | `0x0071` | `checkpoint` | Signed complete snapshot manifest: author barriers, index snapshot and every document snapshot/head required to replace dropped history. Makes compaction chain-safe. See `specs/backend/relay/lifecycle.md`. |
-| `0x0073` | `snapshot` | The replacement content a `checkpoint` names: a document snapshot, or the index snapshot that discovers the inventory. Referenced by envelope hash from the checkpoint and from the `drop_before` instruction, and kept forever by the relay as an anchor. Added in a later revision, because `lifecycle.md` requires the relay to verify "that all named snapshot envelopes are present and retained before deleting anything below the barrier", and this table had no kind for the envelopes that rule names. See `specs/backend/relay/lifecycle.md`. |
+| `0x0073` | `snapshot` | The replacement content a `checkpoint` names: a document snapshot, or the index snapshot that discovers the inventory. Referenced by envelope hash from the checkpoint and from the `drop_before` instruction, and kept forever by the relay as an anchor. Added in step 10: `lifecycle.md` requires the relay to verify "that all named snapshot envelopes are present and retained before deleting anything below the barrier", and this table had no kind for the envelopes that rule names. See `specs/backend/relay/lifecycle.md`. |
 | `0x0080` | `media.retain` | Signed set of media ciphertext hashes this group still references. Input to blob GC. See `specs/backend/relay/media.md`. |
 | `0x00F0` | `ephemeral` | Presence, typing, cursor. Not persisted by the relay. |
 
@@ -322,23 +331,23 @@ currently-connected subscribers and is never written to Postgres.
 
 Layer 4. Automerge, one document per logical object.
 
-- One document per ticket. Where a client also keeps tickets as human-editable
-  files on disk, round-trip safety with that on-disk format is preserved by
-  treating the file as the materialized view and the document as the truth. A
-  human editing the file produces a diff that is converted to Automerge changes
-  on save. This is the same write contract a file-backed client already needs,
-  with a different backing store.
+- One document per ticket. Round-trip safety with the on-disk `.wealdticket`
+  format (see `specs/ticket-format.md`) is preserved by treating the file as the
+  materialized view and the document as the truth. A human editing the file
+  produces a diff that is converted to Automerge changes on save. This is the
+  same contract as `specs/ticket-write-contract.md` with a different backing
+  store.
 - One index document per workspace, which is one per project, holding ticket
   ordering, groups and board state. It lives in the workspace root group
   (`specs/backend/relay/groups.md`).
-- One document per channel per UTC day, mirroring the shard layout the git path
-  already uses for chat, so that the two paths shard identically.
+- One document per channel per UTC day, mirroring the existing shard layout in
+  `specs/chat.md` so that the git path and the relay path shard identically.
 
-Why CRDT at all, when a git-backed chat log deliberately does not use one: the
-objection was that Automerge files are not human-readable, and that is still
+Why CRDT at all, given `specs/sync-substrate.md` rejected it for chat: the
+rejection was that Automerge files are not human-readable, and that is still
 true. It does not apply here, because the relay path never writes Automerge to
-disk in a place a human edits. The human-editable files stay JSONL and the
-plain-text ticket format. The CRDT is the transport representation.
+disk in a place a human edits. The human-editable file stays JSONL and
+`.wealdticket`. The CRDT is the transport representation.
 
 Checkpointing: after 512 changes or 256 KB, whichever first, a client with the
 full history writes a `doc.snapshot` and clients may prune preceding changes
@@ -350,7 +359,7 @@ decides on its own.
 ## Sync
 
 Range-based set reconciliation, the same algorithm family `iroh-docs` uses and
-the right shape for a client that reconnects holding most of what it needs.
+that `specs/sync-substrate.md` already identified as correct for this shape.
 
 Negentropy over the per-group sequence space. A reconnecting client and the
 relay exchange fingerprints over sequence ranges, recursing only into ranges
@@ -387,8 +396,8 @@ BLOB      media upload and download tickets, per specs/backend/relay/media.md
 BYE       clean close
 ```
 
-`WRAP` was added in a later revision, and the reason is a hole in the sentence
-this document already contained. The event-kind table below says `recovery.wrap` is
+`WRAP` was added in step 8, and the reason is a hole in the sentence this
+document already contained. The event-kind table below says `recovery.wrap` is
 "stored by the relay under a per-epoch blinded tag", and a kind lives inside
 `Payload`, which lives inside `ct`. Under `enc: 1` the relay cannot read `ct`, so
 that instruction was one the relay could not carry out on any deployment where the
@@ -404,8 +413,8 @@ ciphertext, and nothing else. It cannot open `ct`, it holds no recovery key, and
 `tag` is derived from the group's own epoch secret rather than from any recovery
 key, so what it stores is a set of opaque per-epoch slots per group.
 
-`HANDSHAKE` was added at the same time for a reason with the same shape and a
-sharper edge. A commit is what moves a group to its next epoch, and it has to reach every
+`HANDSHAKE` was added in step 8 for a reason with the same shape and a sharper
+edge. A commit is what moves a group to its next epoch, and it has to reach every
 member or the group forks. It cannot be an envelope: an envelope's `ct` under
 `enc: 1` is an encrypted `Payload`, and a handshake message is the object that
 establishes the key such a payload is encrypted under, so a member who has not
@@ -440,7 +449,7 @@ Welcomes.
 structural rather than a concession. `AUTH` checks a device against the workspace's
 access set; a device redeeming an invite is not in it, and cannot be, because what
 it is asking for is the reservation that makes it admissible
-(`specs/backend/relay/invites.md`, the reserve step). A relay that required authentication
+(`specs/backend/relay/invites.md`, step 4). A relay that required authentication
 first would make the first device of a workspace unable to join the workspace it is
 founding.
 

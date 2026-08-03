@@ -1,5 +1,14 @@
 # Relay: running it under load and under attack
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 The parts of the relay that are not protocol and not packaging: what it does when
 frames are malformed, when a client floods it, when two processes share a
 workspace, when a clock is wrong, and what it promises about its own
@@ -157,7 +166,7 @@ returns `denied/service_read_only`, while `SUB`, `RECON`, backups and recovery
 reads remain available. The state and a non-content reason code appear in
 `AUTH` and `/readyz`; clients never guess it from a control-plane clock. The
 relay has no billing client. Hosted orchestration of the setting is specified in
-`specs/backend/hosted-service.md`.
+`cloud/service-lifecycle.md`.
 
 - Public `/healthz` is liveness only. Detailed `/readyz` is private and reports
   database reachability, storage reachability, access-set enforcement state,
@@ -167,10 +176,10 @@ relay has no billing client. Hosted orchestration of the setting is specified in
   `WEALD_RELAY_METRICS_GROUP_LABELS=on`, which exists for a self-hoster debugging
   their own instance and is never enabled on hosted, so that per-group counts are
   not merely unretained by the control plane but unavailable to it
-  (`specs/backend/hosted-service.md`).
+  (`specs/backend/cloud/billing.md`).
 - Structured logs carry group ids at debug level only and never carry envelope
   bytes, header or body, at any level.
 
 The hosted SLO and its measurement live in
-`specs/backend/hosted-service.md`. This document is what the binary does; that
+`specs/backend/cloud/compliance.md`. This document is what the binary does; that
 one is what we promise about it.

@@ -1,130 +1,306 @@
 #!/usr/bin/env bash
-# Public-repository spec check. The full 30-step gate lives in Weald's private
-# build repository; this is the subset that is meaningful here and that an
-# outside contributor can run.
+# Enforce the contracts in specs/backend/contracts/.
 #
-#   1. every relay error code has a conformance vector
-#   2. wire.cddl compiles
-#   3. every spec cross-reference resolves, and every documented path either
-#      exists or is a declared private reference
-#   4. the licence boundary holds
-#   5. house style
+# Wired into the same gate the backend-build skill runs. A contract nobody can
+# violate accidentally is worth more than a document everybody agrees with.
 #
-# `WEALD_SPEC_CHECK_STRICT=1` turns every skip into a failure. Set it in ci.
-# A skip is the right answer on a contributor's laptop, where installing a CDDL
-# compiler to fix a typo is a tax nobody should pay, and the wrong answer in a
-# pipeline, where a check that quietly did not run is reported as a check that
-# passed.
+# External tools. Each check skips loudly if its tool is missing:
+#   spectral   npm i -g @stoplight/spectral-cli
+#   cddl       cargo install cddl
+#   mmdc       npm i -g @mermaid-js/mermaid-cli
+#   yq         pip3 install yq --break-system-packages
+#   jq
+#
+#   scripts/spec-check.sh --strict    a skipped check is a failure
+#
+# `--strict` exists because of what happened the first time these four were
+# actually installed: three checks that had been skipping for the life of the
+# project went red immediately. `wire.cddl` had never been compiled, two mermaid
+# diagrams had never been parsed (one used `FK UK` where the grammar wants
+# `FK,UK`, the other put a `;` in a sequence Note, which is a statement separator),
+# and the OpenAPI document had nine operations with no description and no ruleset
+# to check them against. None of that was a hard problem. All of it survived
+# because a yellow skip line reads, to anyone scanning output, exactly like a
+# green pass. CI runs this with --strict so that the tools are not optional
+# anywhere it matters, and a laptop missing one still gets a useful run.
+
 set -uo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STRICT="${WEALD_SPEC_CHECK_STRICT:-}"
-FAIL=0; SKIP=0
-red() { printf '\033[31m%s\033[0m\n' "$*"; }
-grn() { printf '\033[32m%s\033[0m\n' "$*"; }
-ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
-pass() { grn "ok    $*"; }
-fail() { red "FAIL  $*"; FAIL=1; }
-skip() {
-  if [ -n "$STRICT" ]; then
-    red "FAIL  $* (WEALD_SPEC_CHECK_STRICT is set, so a skip is a failure)"
-    FAIL=1
-  else
-    ylw "skip  $*"; SKIP=1
-  fi
-}
 
-C="$ROOT/specs/backend/contracts"
-
-# 1. Every relay error code has a vector. A code nobody can produce a failing
-#    case for is a code no implementer can test against.
-CODES="$C/registries/error-codes.md"
-VECTORS="$C/wire/vectors"
-if [ -f "$CODES" ] && [ -d "$VECTORS" ]; then
-  MISSING=""
-  for code in $(grep -oE '^\| `[a-z_]+`' "$CODES" | tr -d '|` ' | sort -u); do
-    grep -rq "$code" "$VECTORS" || MISSING="$MISSING $code"
-  done
-  if [ -n "$MISSING" ]; then fail "error codes with no vector:$MISSING"
-  else pass "every relay error code has a vector"; fi
-fi
-
-# 2. The formal wire schema compiles.
-if command -v cddl >/dev/null 2>&1; then
-  if cddl compile-cddl --cddl "$C/wire/wire.cddl" >/dev/null 2>&1; then
-    pass "wire.cddl compiles"
-  else fail "wire.cddl does not compile"; fi
-else
-  skip "wire.cddl not compiled (install the cddl crate: cargo install cddl)"
-fi
-
-# 3. Every spec cross-reference resolves. This is the check that catches a file
-#    left behind when specifications move between repositories.
-DANGLING=""
-while IFS= read -r ref; do
-  [ -e "$ROOT/$ref" ] || DANGLING="$DANGLING $ref"
-done < <(grep -rhoE '`specs/backend/[a-zA-Z0-9/._-]+`' "$ROOT/specs" | tr -d '`' | sort -u)
-if [ -n "$DANGLING" ]; then
-  fail "spec references that resolve to nothing:"
-  for d in $DANGLING; do echo "      $d"; done
-else pass "every spec reference resolves"; fi
-
-# 3b. The same check over the whole tree, and over source as well as prose.
-#
-#     Source is included deliberately. This repository's house style is that a
-#     comment records why, which in practice means comments cite specifications,
-#     and a comment citing a document that does not ship is worse than no comment:
-#     it tells a reader that the reasoning exists somewhere they cannot go. When
-#     the relay was split out of its monorepo, 33 such citations came with it and
-#     this check did not scan `.rs`, so all 33 passed.
-#
-#     PRIVATE_REFS is the escape hatch and it is deliberately empty. Nothing in
-#     this repository may cite a `specs/` or `scripts/` path that does not ship.
-#     If that ever has to change, an entry here is a decision somebody made on
-#     purpose rather than a broken link joining a background of broken links.
-PRIVATE_REFS=$(cat <<'EOF'
-EOF
-)
-UNKNOWN=""
-while IFS= read -r ref; do
-  [ -n "$ref" ] || continue
-  [ -e "$ROOT/$ref" ] && continue
-  printf '%s\n' "$PRIVATE_REFS" | grep -qxF "$ref" && continue
-  UNKNOWN="$UNKNOWN $ref"
-done < <(grep -rhoE '`(specs|scripts)/[a-zA-Z0-9/._-]+`' "$ROOT" \
-  --include='*.md' --include='*.rb' --include='*.service' --include='*.yml' \
-  --include='*.rs' --include='*.toml' --include='*.py' --include='*.sh' \
-  --exclude-dir=target --exclude-dir=.git 2>/dev/null | tr -d '`' | sort -u)
-if [ -n "$UNKNOWN" ]; then
-  fail "documentation references a path that does not ship, and is not on the known-private list:"
-  for u in $UNKNOWN; do echo "      $u"; done
-else pass "every documented path either exists or is a declared private reference"; fi
-
-# 4. The licence boundary. This repository is wholly Apache 2.0, so every crate
-#    carries the licence and every source file says so.
-LIC_FAIL=""
-for crate in backend/wealdrelay backend/weald-mls; do
-  [ -f "$ROOT/$crate/LICENSE" ] || LIC_FAIL="$LIC_FAIL $crate/LICENSE"
-  [ -f "$ROOT/$crate/NOTICE" ]  || LIC_FAIL="$LIC_FAIL $crate/NOTICE"
+STRICT=0
+for arg in "$@"; do
+  case "$arg" in
+    --strict) STRICT=1 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "spec-check: unknown argument: $arg" >&2; exit 64 ;;
+  esac
 done
-[ -f "$ROOT/LICENSE" ] || LIC_FAIL="$LIC_FAIL LICENSE"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+C="$ROOT/specs/backend/contracts"
+FAIL=0
+SKIP=0
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+fail() { red "FAIL  $*"; FAIL=1; }
+pass() { grn "ok    $*"; }
+skip() { ylw "skip  $*"; SKIP=1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+echo "spec-check: $C"
+echo
+
+# --------------------------------------------------------------------------
+# 1. OpenAPI lints clean
+# --------------------------------------------------------------------------
+OAS="$C/api/openapi.yaml"
+if [ ! -f "$OAS" ]; then
+  fail "openapi.yaml missing"
+elif have spectral; then
+  # The ruleset is named explicitly rather than discovered. Spectral searches from
+  # the process working directory, not from the document, so discovery would make
+  # this check pass or fail depending on where it was invoked from, which is worse
+  # than not having it.
+  if spectral lint "$OAS" --ruleset "$C/api/.spectral.yaml" --fail-severity=warn >/tmp/spectral.out 2>&1; then
+    pass "openapi lints clean"
+  else
+    fail "openapi lint"; sed 's/^/      /' /tmp/spectral.out
+  fi
+elif have yq; then
+  if yq -e '.openapi' "$OAS" >/dev/null 2>&1; then
+    pass "openapi parses (install spectral for a real lint)"
+  else
+    fail "openapi does not parse"
+  fi
+else
+  skip "openapi lint (no spectral, no yq)"
+fi
+
+# --------------------------------------------------------------------------
+# 2. Every problem type declared in the OpenAPI exists in the registry,
+#    and every registry code is referenced by at least one operation.
+# --------------------------------------------------------------------------
+REG="$C/registries/error-codes.md"
+if [ -f "$OAS" ] && [ -f "$REG" ]; then
+  DECLARED=$(grep -o 'x-problem-types: \[[^]]*\]' "$OAS" \
+    | sed 's/x-problem-types: \[//; s/\]//' | tr ',' '\n' | tr -d ' ' | sort -u | grep -v '^$')
+  REGISTERED=$(grep -oE '^\| `[a-z_]+` \| [0-9]{3} \|' "$REG" \
+    | sed 's/^| `//; s/` .*//' | sort -u)
+
+  MISSING=$(comm -23 <(echo "$DECLARED") <(echo "$REGISTERED"))
+  if [ -n "$MISSING" ]; then
+    fail "problem types declared in openapi but absent from the registry:"
+    echo "$MISSING" | sed 's/^/      /'
+  else
+    pass "every declared problem type is registered"
+  fi
+
+  ORPHAN=$(comm -13 <(echo "$DECLARED") <(echo "$REGISTERED"))
+  if [ -n "$ORPHAN" ]; then
+    fail "registered problem types no operation declares:"
+    echo "$ORPHAN" | sed 's/^/      /'
+  else
+    pass "every registered problem type is reachable"
+  fi
+fi
+
+# --------------------------------------------------------------------------
+# 3. Every relay frame error code has a negative vector
+# --------------------------------------------------------------------------
+MAN="$C/wire/vectors/manifest.json"
+if [ -f "$MAN" ] && [ -f "$REG" ]; then
+  CODES=$(grep -oE '^\| `(retry|reject|denied|quota|version)/[a-z_]+`' "$REG" \
+    | sed 's/^| `//; s/`$//' | sort -u)
+  if have jq; then
+    COVERED=$(jq -r '.vectors[].expect' "$MAN" | sort -u)
+  else
+    COVERED=$(grep -oE '"expect": "[^"]+"' "$MAN" | sed 's/"expect": "//; s/"//' | sort -u)
+  fi
+  UNCOVERED=$(comm -23 <(echo "$CODES") <(echo "$COVERED"))
+  if [ -n "$UNCOVERED" ]; then
+    fail "relay error codes with no negative vector in the corpus:"
+    echo "$UNCOVERED" | sed 's/^/      /'
+  else
+    pass "every relay error code has a vector"
+  fi
+
+  # The silence-is-normal vectors are load-bearing. Losing one turns the
+  # split-view detector into a false-positive generator.
+  for v in attest-device-absent-quietly-is-normal attest-agent-proxied-is-normal \
+           attest-agent-issuer-offline-is-normal clock-skew-under-bound-is-silent; do
+    grep -q "\"$v\"" "$MAN" || fail "required silence-is-normal vector removed: $v"
+  done
+  pass "silence-is-normal vectors present"
+fi
+
+# --------------------------------------------------------------------------
+# 4. CDDL is valid, and every event kind in wire.md appears in it
+# --------------------------------------------------------------------------
+CDDL="$C/wire/wire.cddl"
+if [ ! -f "$CDDL" ]; then
+  fail "wire.cddl missing"
+elif have cddl; then
+  if cddl compile-cddl --cddl "$CDDL" >/tmp/cddl.out 2>&1; then
+    pass "wire.cddl compiles"
+  else
+    fail "wire.cddl"; sed 's/^/      /' /tmp/cddl.out
+  fi
+else
+  skip "cddl compile (cargo install cddl)"
+fi
+
+WIRE="$ROOT/specs/backend/relay/wire.md"
+if [ -f "$WIRE" ] && [ -f "$CDDL" ]; then
+  MISSINGKIND=""
+  while read -r hexk; do
+    dec=$((16#${hexk#0x}))
+    grep -qE "= *$dec\b" "$CDDL" || MISSINGKIND="$MISSINGKIND $hexk"
+  done < <(grep -oE '`0x[0-9A-F]{4}`' "$WIRE" | tr -d '`' | sort -u)
+  if [ -n "$MISSINGKIND" ]; then
+    fail "event kinds in wire.md missing from wire.cddl:$MISSINGKIND"
+  else
+    pass "every event kind is in the CDDL"
+  fi
+fi
+
+# --------------------------------------------------------------------------
+# 5. Every mermaid diagram parses
+# --------------------------------------------------------------------------
+if have mmdc; then
+  BAD=""
+  # mmdc drives headless Chrome. On a CI runner the default sandbox cannot be
+  # entered, and every diagram then "fails to parse" for a reason that has
+  # nothing to do with the diagram. The flags are passed everywhere so local and
+  # ci run the same command, and the last error is kept so a real syntax break
+  # is still diagnosable instead of being swallowed with the launch failure.
+  PUPPETEER_CFG="$(mktemp -t puppeteer-XXXXXX)"
+  printf '{"args":["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]}\n' >"$PUPPETEER_CFG"
+  MMDC_LOG="$(mktemp -t mmdc-XXXXXX)"
+  for f in "$C"/diagrams/*.mmd; do
+    mmdc -p "$PUPPETEER_CFG" -i "$f" -o "/tmp/$(basename "$f").svg" >"$MMDC_LOG" 2>&1 ||
+      BAD="$BAD $(basename "$f")"
+  done
+  if [ -n "$BAD" ]; then
+    fail "mermaid parse:$BAD"
+    sed 's/^/      /' "$MMDC_LOG" >&2
+  else
+    pass "every diagram parses"
+  fi
+  rm -f "$PUPPETEER_CFG" "$MMDC_LOG"
+else
+  skip "mermaid parse (npm i -g @mermaid-js/mermaid-cli)"
+fi
+
+# --------------------------------------------------------------------------
+# 6. Every relative link across specs/backend resolves
+# --------------------------------------------------------------------------
+BROKEN=0
+while IFS= read -r f; do
+  d="$(dirname "$f")"
+  while read -r link; do
+    [ -z "$link" ] && continue
+    case "$link" in http*|mailto:*|\#*) continue;; esac
+    tgt="${link%%#*}"
+    if [ -e "$d/$tgt" ] || [ -e "$ROOT/$tgt" ]; then continue; fi
+    fail "broken link in ${f#$ROOT/}: $tgt"; BROKEN=1
+  done < <(grep -oE '\]\([^)]+\)' "$f" | sed 's/](//; s/)$//')
+  # Backtick-quoted spec paths are the dominant convention in this tree.
+  while read -r p; do
+    [ -e "$ROOT/$p" ] || { fail "dangling spec reference in ${f#$ROOT/}: $p"; BROKEN=1; }
+  done < <(grep -oE '`specs/[A-Za-z0-9._/-]+\.(md|yaml|cddl|json|mmd)`' "$f" | tr -d '`' | sort -u)
+done < <(find "$ROOT/specs/backend" -name '*.md')
+[ "$BROKEN" -eq 0 ] && pass "every spec reference resolves"
+
+# --------------------------------------------------------------------------
+# 7. State machine tables: every `To` state is a declared state
+# --------------------------------------------------------------------------
+SM="$C/state-machines/instance-lifecycle.md"
+if [ -f "$SM" ]; then
+  STATES=$(awk '/^## States/,/^## Transitions/' "$SM" \
+    | grep -oE '^\| `[a-z_]+`' | sed 's/^| `//; s/`//' | sort -u)
+  TARGETS=$(awk '/^## Transitions/,/^## Illegal/' "$SM" \
+    | grep -oE '\| `[a-z_]+` \| [A-Z]' | sed 's/^| `//; s/`.*//' | sort -u)
+  UNDEF=$(comm -13 <(echo "$STATES") <(echo "$TARGETS"))
+  if [ -n "$UNDEF" ]; then
+    fail "transition targets that are not declared states:"; echo "$UNDEF" | sed 's/^/      /'
+  else
+    pass "no undefined transition targets"
+  fi
+  for s in $STATES; do
+    grep -q "\`$s\`" <<<"$(awk '/^## Transitions/,0' "$SM")" \
+      || fail "unreachable state, no transition mentions it: $s"
+  done
+fi
+
+# --------------------------------------------------------------------------
+# 8. Every control plane column is classified
+# --------------------------------------------------------------------------
+CP="$ROOT/specs/backend/cloud/control-plane.md"
+DC="$C/registries/data-classification.md"
+if [ -f "$CP" ] && [ -f "$DC" ]; then
+  # `see below` and `unique` are prose inside the schema fence, not columns.
+  NOISE='^(see|below|unique|and|the|for|with)$'
+  UNCLASSIFIED=""
+  for col in $(awk '/^```$/{f=0} f{print} /^accounts /{f=1}' "$CP" \
+      | grep -oE '[a-z_]{3,}' | grep -vE "$NOISE" | sort -u); do
+    grep -q "$col" "$DC" || UNCLASSIFIED="$UNCLASSIFIED $col"
+  done
+  if [ -n "$UNCLASSIFIED" ]; then
+    fail "schema fields with no data-classification row:$UNCLASSIFIED"
+  else
+    pass "every schema field is classified"
+  fi
+fi
+
+# --------------------------------------------------------------------------
+# 9. The open source boundary holds
+#
+# The relay is Apache 2.0 and the client is not, which is a claim the website,
+# the self-host guide and the protocol specification all make on our behalf.
+# A crate that loses its LICENSE, a source file that ships without an SPDX
+# header, or a workspace that quietly reverts to a different license would make
+# every one of those documents wrong, and nobody would notice from the outside
+# until someone tried to fork us.
+# --------------------------------------------------------------------------
+LICENSE_FAIL=""
+for crate in backend/wealdrelay backend/weald-mls; do
+  [ -f "$ROOT/$crate/LICENSE" ] || LICENSE_FAIL="$LICENSE_FAIL $crate/LICENSE"
+  [ -f "$ROOT/$crate/NOTICE" ] || LICENSE_FAIL="$LICENSE_FAIL $crate/NOTICE"
+done
+[ -f "$ROOT/LICENSE.md" ] || LICENSE_FAIL="$LICENSE_FAIL LICENSE.md"
 grep -q '^license = "Apache-2.0"' "$ROOT/Cargo.toml" \
-  || LIC_FAIL="$LIC_FAIL Cargo.toml:workspace.package.license"
-MISSING_SPDX=$(find "$ROOT/backend" -name '*.rs' -not -path '*/target/*' -print0 2>/dev/null \
-  | xargs -0 grep -L 'SPDX-License-Identifier: Apache-2.0' 2>/dev/null | sed "s|$ROOT/||")
-if [ -n "$LIC_FAIL" ]; then fail "the licence boundary is missing files:$LIC_FAIL"
+  || LICENSE_FAIL="$LICENSE_FAIL Cargo.toml:workspace.package.license"
+
+MISSING_SPDX=$(find "$ROOT/backend/wealdrelay" "$ROOT/backend/weald-mls" \
+  -name '*.rs' -not -path '*/target/*' -print0 2>/dev/null \
+  | xargs -0 grep -L 'SPDX-License-Identifier: Apache-2.0' 2>/dev/null \
+  | sed "s|$ROOT/||")
+
+if [ -n "$LICENSE_FAIL" ]; then
+  fail "the open source boundary is missing files:$LICENSE_FAIL"
 elif [ -n "$MISSING_SPDX" ]; then
-  fail "Rust sources with no SPDX header:"; echo "$MISSING_SPDX" | sed 's/^/      /'
-else pass "Apache 2.0, NOTICE and SPDX headers all present"; fi
+  fail "Rust sources with no SPDX header:"
+  echo "$MISSING_SPDX" | sed 's/^/      /'
+else
+  pass "relay and MLS binding carry Apache 2.0, NOTICE and SPDX headers"
+fi
 
-# 5. House style, over the specs and over the documents a reader meets first.
-#    This file is excluded for the obvious reason that the character it looks for
-#    has to appear in it.
-EM=$(grep -rln $'—' "$ROOT/specs" "$ROOT/README.md" "$ROOT/CONTRIBUTING.md" \
-  "$ROOT/SECURITY.md" "$ROOT/HISTORY.md" "$ROOT/NOTICE" 2>/dev/null)
-if [ -n "$EM" ]; then fail "em dash found in:"; echo "$EM" | sed "s|$ROOT/||; s/^/      /"
-else pass "no em dashes"; fi
+# --------------------------------------------------------------------------
+# 10. House style. These are project rules, not preferences.
+# --------------------------------------------------------------------------
+EM=$(grep -rln $'—' "$ROOT/specs/backend" 2>/dev/null)
+if [ -n "$EM" ]; then fail "em dash found in:"; echo "$EM" | sed "s|$ROOT/||; s/^/      /"; else pass "no em dashes"; fi
 
+# --------------------------------------------------------------------------
 echo
 if [ "$FAIL" -ne 0 ]; then red "spec-check FAILED"; exit 1; fi
-[ "$SKIP" -ne 0 ] && ylw "spec-check passed with skipped checks"
+if [ "$SKIP" -ne 0 ]; then
+  if [ "$STRICT" -eq 1 ]; then
+    red "spec-check FAILED: a check was skipped and --strict was asked for."
+    red "Install the tool named beside the skip. Every skip above has one."
+    exit 1
+  fi
+  ylw "spec-check passed with skipped checks"
+fi
 grn "spec-check passed"

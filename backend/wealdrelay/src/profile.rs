@@ -15,12 +15,12 @@
 //!   deployment rather than of the default.
 //! - `WEALD_RELAY_METRICS_GROUP_LABELS` "is never enabled on the hosted tier",
 //!   so per-group counts are not merely something the control plane declines to
-//!   retain: they are something it is not offered, and billing is computed
-//!   without them.
+//!   retain: they are something it is not offered
+//!   (`specs/backend/cloud/billing.md`).
 //!
-//! **This is configuration, not a code fork.** The hosted binary has to be the
-//! audited binary, which means a build must never branch on its environment. It
-//! does not mean the binary
+//! **This is configuration, not a code fork.** The rule that the hosted binary
+//! must be the audited binary (`specs/backend/build/environments.md`) means a
+//! build must never branch on its environment. It does not mean the binary
 //! cannot be told which deployment it is and refuse a setting that deployment
 //! forbids: both profiles are compiled into every build, both are reachable from
 //! every build's tests, and the digest is the same either way. A self-hoster can

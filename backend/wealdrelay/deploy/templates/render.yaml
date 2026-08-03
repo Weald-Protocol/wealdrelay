@@ -8,10 +8,6 @@
 #
 # TLS is issued by Render on the service subdomain. There is no Caddy on this
 # path and no port 80 to open.
-#
-# Status: the image below is published from the first signed release onwards and
-# not before. Until then, build it yourself with scripts/relay-reproduce.sh and
-# push it somewhere Render can pull from.
 
 services:
   - type: web
@@ -25,10 +21,7 @@ services:
       # they asked for, which is why the release workflow publishes no such tag:
       #
       #   url: ghcr.io/weald-protocol/wealdrelay@sha256:...
-      #
-      # RELEASE PIN. The one line in this file to update per release, and
-      # deploy/README.md lists the others.
-      url: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.5
+      url: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.0
     healthCheckPath: /healthz
     disk:
       name: blobs

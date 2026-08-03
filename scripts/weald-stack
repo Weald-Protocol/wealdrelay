@@ -1,209 +1,2058 @@
 #!/usr/bin/env bash
-# The local test harness: real Postgres, real MinIO, real Redis, on loopback.
+# The local harness. One command stands the entire backend up on a laptop with
+# no credentials. See specs/backend/build/local-harness.md.
 #
-# The integration tiers in this repository do not skip. A suite that cannot reach
-# a database fails and prints `run scripts/weald-stack up`, because a skipped
-# integration proof reports success for something nobody checked. This script is
-# the other half of that sentence.
+#   weald-stack up [--relay] [--budget SECONDS]
+#   weald-stack status
+#   weald-stack clients N
+#   weald-stack scenario NAME
+#   weald-stack register [--fresh]
+#   weald-stack demo [--peers N]
+#   weald-stack kill relay --at POINT
+#   weald-stack dump envelopes
+#   weald-stack fixture [--seed N]
+#   weald-stack prove-blind
+#   weald-stack down [--volumes]
 #
-#   scripts/weald-stack up [--budget SECONDS]   bring it up, wait until healthy
-#   scripts/weald-stack down [--keep-data]      stop it, and remove its volumes
-#   scripts/weald-stack status                  what is listening, and is it ready
-#   scripts/weald-stack reset                   drop every leftover scratch database
-#   scripts/weald-stack psql [ARGS...]          a shell on the harness Postgres
-#   scripts/weald-stack prove-blind SENTINEL    no plaintext survives in the store
-#
-# Ports and credentials are in backend/compose/weald-stack.yml and are fixed,
-# weak and public on purpose: every test hard-codes them so that a contract run
-# cannot silently point somewhere else. Override a port, for a machine that is
-# already using one, by exporting the same variable the tests read:
-# WEALD_STACK_PG_PORT, WEALD_STACK_MINIO_PORT, WEALD_STACK_REDIS_PORT.
+# Components that a later step builds are reported as such and exit 69
+# (EX_UNAVAILABLE), which is how the gate tells "not built yet" apart from
+# "broken". Nothing here pretends a component exists.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="$ROOT/backend/compose/weald-stack.yml"
-PROJECT="weald-stack"
+cd "$ROOT"
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 
-PG_PORT="${WEALD_STACK_PG_PORT:-54032}"
-MINIO_PORT="${WEALD_STACK_MINIO_PORT:-54090}"
-REDIS_PORT="${WEALD_STACK_REDIS_PORT:-54079}"
-PG_USER="weald"
-PG_PASSWORD="weald"
-PG_DB="weald_relay"
+COMPOSE_FILE="backend/compose/weald-stack.yml"
+STACK_STATE="$ROOT/.weald-stack"
+EX_UNAVAILABLE=69
 
-say()  { printf '%s\n' "$*"; }
-die()  { printf 'weald-stack: %s\n' "$*" >&2; exit 1; }
-ok()   { printf '\033[32mok\033[0m    %s\n' "$*"; }
-bad()  { printf '\033[31mdown\033[0m  %s\n' "$*"; }
+: "${WEALD_STACK_PG_PORT:=54032}"
+: "${WEALD_STACK_MINIO_PORT:=54090}"
+: "${WEALD_STACK_MINIO_CONSOLE_PORT:=54091}"
+: "${WEALD_STACK_REDIS_PORT:=54079}"
+: "${WEALD_STACK_SMTP_PORT:=54025}"
+: "${WEALD_STACK_MAILPIT_UI_PORT:=54080}"
+: "${WEALD_STACK_RELAY_PORT:=54040}"
+: "${WEALD_STACK_CLOUD_PORT:=54030}"
+export WEALD_STACK_PG_PORT WEALD_STACK_MINIO_PORT WEALD_STACK_MINIO_CONSOLE_PORT \
+  WEALD_STACK_REDIS_PORT WEALD_STACK_SMTP_PORT WEALD_STACK_MAILPIT_UI_PORT
 
-compose() {
-  docker compose --project-name "$PROJECT" --file "$COMPOSE_FILE" "$@"
-}
+INFRA_SERVICES=(postgres minio redis mailpit)
 
-require_docker() {
-  command -v docker >/dev/null 2>&1 \
-    || die "docker is not installed. Docker Desktop, OrbStack, Colima or a Linux docker daemon all work."
-  docker compose version >/dev/null 2>&1 \
-    || die "the docker compose plugin is not installed."
-  docker info >/dev/null 2>&1 \
-    || die "the docker daemon is not running. Start it and try again."
-}
+dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
-listening() {
-  # No nc, no lsof, no assumption about which one a machine has: bash's own
-  # /dev/tcp is present wherever bash is, which is the only dependency here.
-  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
-}
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
-# MARK: up
+note() { printf "  %-14s %s\n" "$1" "$2"; }
 
-cmd_up() {
-  local budget=180
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --budget) budget="${2:-}"; [ -n "$budget" ] || die "--budget needs a number of seconds"; shift 2 ;;
-      *) die "unknown option for up: $1" ;;
-    esac
-  done
-  require_docker
-
-  for port in "$PG_PORT" "$MINIO_PORT" "$REDIS_PORT"; do
-    if listening "$port" && [ -z "$(compose ps --quiet 2>/dev/null)" ]; then
-      die "something already listens on 127.0.0.1:$port and it is not this harness. Stop it, or export WEALD_STACK_PG_PORT, WEALD_STACK_MINIO_PORT or WEALD_STACK_REDIS_PORT and use the same value when running the tests."
-    fi
-  done
-
-  say "Bringing up Postgres, MinIO and Redis."
-  compose up --detach --wait --wait-timeout "$budget" \
-    || die "the stack did not become healthy within ${budget}s. \`scripts/weald-stack status\` and \`docker compose --project-name $PROJECT --file $COMPOSE_FILE logs\` say why."
-
-  cmd_status
-  say ""
-  say "Ready. The real-boundary suites will find it:"
-  say "  cargo test --workspace --locked"
-}
-
-# MARK: down
-
-cmd_down() {
-  local keep=no
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --keep-data) keep=yes; shift ;;
-      *) die "unknown option for down: $1" ;;
-    esac
-  done
-  require_docker
-  if [ "$keep" = yes ]; then
-    compose down
-    say "Stopped. Volumes kept."
-  else
-    # Volumes go by default. A suite that passes only because of state left by
-    # the previous run is a suite that passes once.
-    compose down --volumes
-    say "Stopped, and the fixture data is gone."
-  fi
-}
-
-# MARK: status
-
-cmd_status() {
-  local failed=0
-  if listening "$PG_PORT"; then ok "Postgres    127.0.0.1:$PG_PORT   ($PG_USER/$PG_DB)"
-  else bad "Postgres    127.0.0.1:$PG_PORT"; failed=1; fi
-  if listening "$MINIO_PORT"; then ok "MinIO       127.0.0.1:$MINIO_PORT   (weald/weald-local-only)"
-  else bad "MinIO       127.0.0.1:$MINIO_PORT"; failed=1; fi
-  if listening "$REDIS_PORT"; then ok "Redis       127.0.0.1:$REDIS_PORT   (multi-process fan-out only)"
-  else bad "Redis       127.0.0.1:$REDIS_PORT"; failed=1; fi
-  [ "$failed" -eq 0 ] || return 1
-}
-
-# MARK: reset
-
-# A run killed with ctrl-c leaves its scratch databases behind. They are harmless
-# and they accumulate, so this removes every database the suites name and nothing
-# else: the pattern is theirs, not a wildcard over the server.
-cmd_reset() {
-  require_docker
-  local sql
-  sql="select datname from pg_database where datname like 'weald\\_step%' or datname like 'weald\\_relay\\_test%'"
-  local names
-  names="$(psql_quiet -tAc "$sql")"
-  if [ -z "$names" ]; then say "No leftover scratch databases."; return 0; fi
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    psql_quiet -c "drop database if exists \"$name\" with (force)" >/dev/null
-    say "dropped $name"
-  done <<< "$names"
-}
-
-psql_quiet() {
-  compose exec -T -e PGPASSWORD="$PG_PASSWORD" postgres \
-    psql --username "$PG_USER" --dbname "$PG_DB" "$@"
-}
-
-cmd_psql() {
-  require_docker
-  compose exec -e PGPASSWORD="$PG_PASSWORD" postgres \
-    psql --username "$PG_USER" --dbname "$PG_DB" "$@"
-}
-
-# MARK: prove-blind
-
-# Step 5 of the verification runbook, mechanised: dump every table of every
-# database the harness holds and prove a known plaintext is not in any of them.
-#
-# The sentinel is supplied rather than guessed. A reviewer's version of this is
-# to send a message through their own relay containing a phrase only they know,
-# then run this and watch it not be found. That is a stronger check than any
-# assertion inside our own test suite, because the phrase never touched our code.
-cmd_prove_blind() {
-  local sentinel="${1:-}"
-  [ -n "$sentinel" ] || die "prove-blind needs the plaintext to look for: scripts/weald-stack prove-blind 'some phrase you sent'"
-  require_docker
-  listening "$PG_PORT" || die "the harness is not up. Run \`scripts/weald-stack up\` first."
-
-  local databases
-  databases="$(psql_quiet -tAc "select datname from pg_database where not datistemplate and datname <> 'postgres'")"
-  local found=0
-  while IFS= read -r database; do
-    [ -n "$database" ] || continue
-    local dump
-    # --inserts so values appear as literal text rather than in COPY's escaped
-    # stream, because a grep over an escaped stream can miss what is in it.
-    dump="$(compose exec -T -e PGPASSWORD="$PG_PASSWORD" postgres \
-      pg_dump --username "$PG_USER" --inserts --dbname "$database" 2>/dev/null || true)"
-    if printf '%s' "$dump" | grep -qF -- "$sentinel"; then
-      printf '\033[31mFOUND\033[0m in database %s\n' "$database"
-      found=1
-    fi
-  done <<< "$databases"
-
-  if [ "$found" -ne 0 ]; then
-    printf '\033[31mprove-blind FAILED: the plaintext is in the relay store.\033[0m\n'
+require_daemon() {
+  if ! docker info >/dev/null 2>&1; then
+    echo "weald-stack: no docker daemon. Start OrbStack and try again." >&2
     exit 1
   fi
-  ok "the sentinel appears in no table of any database the relay holds"
-  say ""
-  say "What this does and does not show. It shows that this exact plaintext is"
-  say "not in the relay's own store. It does not show that the relay could not"
-  say "read it, which is a property of the keys and is argued in"
-  say "specs/backend/relay/verification.md."
 }
 
-# MARK: dispatch
-
-usage() {
-  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+# A step that has not been built yet. Named so every message reads the same and
+# so the exit code is uniform.
+not_yet() {
+  echo "weald-stack: $1 arrives in step $2 (specs/backend/build/phases-relay.md)." >&2
+  exit "$EX_UNAVAILABLE"
 }
 
-case "${1:-}" in
-  up)          shift; cmd_up "$@" ;;
-  down)        shift; cmd_down "$@" ;;
-  status)      shift; cmd_status "$@" ;;
-  reset)       shift; cmd_reset "$@" ;;
-  psql)        shift; cmd_psql "$@" ;;
-  prove-blind) shift; cmd_prove_blind "$@" ;;
-  ""|-h|--help|help) usage ;;
-  *) die "unknown command: $1. Run \`scripts/weald-stack --help\`." ;;
-esac
+relay_binary() {
+  local bin="$ROOT/target/debug/wealdrelay"
+  [ -x "$bin" ] && echo "$bin"
+}
+
+RELAY_PID_FILE="$STACK_STATE/relay.pid"
+RELAY_LOG_FILE="$STACK_STATE/relay.log"
+RELAY_OBSERVABILITY_PORT=$(( WEALD_STACK_RELAY_PORT + 1 ))
+
+# The relay the client instances talk to.
+#
+# Three overrides, and they exist for one case: driving a relay this harness did
+# not start, which is what step 13's hosted-deployment proof needs. Without them
+# the only relay a supervised client can reach is the one on the loopback port,
+# and "a real client connected over the public socket" would have to be a second
+# implementation of the instance bootstrap rather than the one everything else
+# uses. Unset, every value here is exactly what it was.
+#
+# Nothing else changes: the same binary, the same `relay-client` entry point, the
+# same group registration, the same access set.
+relay_ws_url() {
+  echo "${WEALD_STACK_RELAY_URL:-ws://127.0.0.1:$WEALD_STACK_RELAY_PORT/relay}"
+}
+
+relay_pid() {
+  [ -f "$RELAY_PID_FILE" ] || return 1
+  local pid
+  pid="$(cat "$RELAY_PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+# Is a relay answering on the harness port right now? Asked of the socket rather
+# than of the pidfile, because a pidfile that outlived its process is exactly the
+# state that makes a suite hang waiting for a connection nobody is serving.
+relay_answers() {
+  # A hosted relay on a free plan spins down when idle and takes tens of seconds
+  # to come back, so the timeout is the caller's when the health URL is
+  # overridden and stays at two seconds for the loopback case, where anything
+  # slower is a relay that is not there.
+  if [ -n "${WEALD_STACK_RELAY_HEALTH_URL:-}" ]; then
+    curl -fsS --max-time "${WEALD_STACK_RELAY_HEALTH_TIMEOUT:-90}" \
+      "$WEALD_STACK_RELAY_HEALTH_URL" >/dev/null 2>&1
+    return
+  fi
+  curl -fsS --max-time 2 "http://127.0.0.1:$WEALD_STACK_RELAY_PORT/healthz" >/dev/null 2>&1
+}
+
+# Start `wealdrelay` against the harness Postgres and a file-backed blob store.
+#
+# A real process on a real port, not an in-process test server: step 5's client
+# half has to open a socket to something it did not build, and a relay linked into
+# the thing testing it would prove the two halves of one binary agree.
+#
+# `WEALD_RELAY_MIN_ENC=mls`, which is the hosted posture and is now the harness's
+# too. It was `none` here for the whole of the relay track, and that one difference
+# hid a client that could not connect to any relay with a floor at all: every green
+# step was proved against the one configuration no customer runs
+# (`specs/backend/build/deploy-render.md`). `WEALD_STACK_MIN_ENC=none` still exists
+# because a self-hoster's Phase 2 is a real deployment shape
+# (`specs/backend/relay/migration.md`) and the client's refusal has to be provable
+# against a relay that accepts plaintext as well as against one that does not.
+relay_start() {
+  local bin
+  bin="$(relay_binary)" || true
+  if [ -z "${bin:-}" ]; then
+    cargo build --package wealdrelay --bin wealdrelay >/dev/null 2>&1 || true
+    bin="$(relay_binary)" || true
+  fi
+  if [ -z "${bin:-}" ]; then
+    note "wealdrelay" "no binary; cargo build --package wealdrelay failed"
+    return 1
+  fi
+  if relay_answers; then
+    note "wealdrelay" "already serving on 127.0.0.1:$WEALD_STACK_RELAY_PORT"
+    return 0
+  fi
+  mkdir -p "$STACK_STATE/blobs"
+  # `--relay-db` is a database of the harness Postgres, created if absent. One
+  # database for the harness relay and a fresh one per Rust integration test, so a
+  # long-lived demo workspace is not wiped by a suite run.
+  docker exec -i "$(dc ps -q postgres)" \
+    psql -U weald -d postgres -tAc \
+    "select 1 from pg_database where datname='weald_relay_stack'" 2>/dev/null \
+    | grep -q 1 || \
+    docker exec -i "$(dc ps -q postgres)" \
+      createdb -U weald weald_relay_stack >/dev/null 2>&1 || true
+
+  WEALD_RELAY_HOSTNAME=localhost \
+  WEALD_RELAY_DATABASE_URL="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack" \
+  WEALD_RELAY_STORAGE_URL="file://$STACK_STATE/blobs" \
+  WEALD_RELAY_REDIS_URL="redis://127.0.0.1:$WEALD_STACK_REDIS_PORT" \
+  WEALD_RELAY_LISTEN="127.0.0.1:$WEALD_STACK_RELAY_PORT" \
+  WEALD_RELAY_OBSERVABILITY_LISTEN="127.0.0.1:$RELAY_OBSERVABILITY_PORT" \
+  WEALD_RELAY_TLS=off \
+  WEALD_RELAY_RELEASE_CHECK=off \
+  WEALD_RELAY_MIN_ENC="${WEALD_STACK_MIN_ENC:-mls}" \
+  WEALD_RELAY_WRITE_MODE="${WEALD_STACK_WRITE_MODE:-full}" \
+  WEALD_RELAY_IMAGE_DIGEST="${WEALD_STACK_IMAGE_DIGEST:-}" \
+    nohup "$bin" > "$RELAY_LOG_FILE" 2>&1 &
+  echo $! > "$RELAY_PID_FILE"
+
+  local deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if relay_answers; then
+      note "wealdrelay" "serving on $(relay_ws_url)"
+      return 0
+    fi
+    if ! relay_pid >/dev/null; then
+      note "wealdrelay" "exited during startup; see $RELAY_LOG_FILE"
+      tail -5 "$RELAY_LOG_FILE" >&2 || true
+      return 1
+    fi
+    sleep 0.25
+  done
+  note "wealdrelay" "did not answer /healthz in 30s; see $RELAY_LOG_FILE"
+  return 1
+}
+
+# --- enrolment ---------------------------------------------------------------
+#
+# The relay mints one single-use genesis key on first run and prints the invite
+# link, the one-time code and the key's fingerprint to its own stdout
+# (`specs/backend/relay/server.md`). Redeeming that invite is how a workspace gets
+# its first member, and accepting the genesis access set is what destroys the key
+# and writes entry zero of the transparency log
+# (`specs/backend/relay/invites.md`).
+#
+# The harness drives that with a real client over a real socket, because the whole
+# point of the step is that nobody else can: the relay verifies an Argon2id hash of
+# a code it never learns, and the access set is signed by a device key that lives in
+# an instance.
+#
+# The code is not stored anywhere. It exists in the banner and in the joiner's head,
+# by design, so if this relay minted its key during an earlier run whose log is gone,
+# there is no way to redeem it and no way to mint a second one. That is the right
+# behaviour for a relay and an inconvenience for a harness, so `--reset` drops the
+# genesis row and its bootstrap invite and restarts the relay to mint a fresh one.
+# That is a harness action on a harness database and it is spelled out rather than
+# hidden inside `up`.
+ENROLLED_WORKSPACE="ws:localhost"
+
+relay_psql() {
+  docker exec -i "$(dc ps -q postgres)" psql -U weald -d weald_relay_stack -tAc "$1" 2>/dev/null
+}
+
+genesis_state() {
+  # `minted`, `redeemed`, or empty when this relay has never minted one.
+  relay_psql "select case when secret_key is null then 'redeemed' else 'minted' end \
+              from relay_genesis where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]'
+}
+
+cmd_enrol() {
+  local reset=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reset) reset=1; shift ;;
+      *) echo "weald-stack enrol: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || { echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2; exit 1; }
+
+  local state; state="$(genesis_state)"
+  if [ "$state" = "redeemed" ] && [ "$reset" -eq 0 ]; then
+    note "enrolment" "already done; the genesis key is destroyed, as it should be"
+    return 0
+  fi
+
+  # A banner in the current log is a code we can type. Without one, the key was
+  # minted by a run whose log is gone.
+  if ! grep -q "weald:   invite code" "$RELAY_LOG_FILE" 2>/dev/null || [ "$reset" -eq 1 ]; then
+    note "enrolment" "no code in this run's log; minting a fresh genesis key"
+    # The whole pre-genesis state, not just the key. A workspace that kept its
+    # access set from a previous enrolment would refuse the new genesis set as a
+    # second version zero, which is correct of it and useless here.
+    relay_psql "delete from relay_transparency_log where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_provisional_grant where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    # The entry, principal and quorum rows cascade from the set itself, which is
+    # what `on delete cascade` on `(workspace_id, version)` is there for.
+    relay_psql "delete from relay_access_probation where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_access_set where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_genesis where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_invite_reservation where token in \
+                (select token from relay_invite where bootstrap and workspace_id = '$ENROLLED_WORKSPACE')" >/dev/null
+    relay_psql "delete from relay_invite where bootstrap and workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_stop
+    relay_start || return 1
+  fi
+
+  local token code
+  token="$(sed -n 's|^weald:   invite link  https://[^/]*/join/||p' "$RELAY_LOG_FILE" | tail -1)"
+  code="$(sed -n 's/^weald:   invite code  //p' "$RELAY_LOG_FILE" | tail -1)"
+  if [ -z "$token" ] || [ -z "$code" ]; then
+    note "enrolment" "the relay printed no invite banner; see $RELAY_LOG_FILE"
+    return 1
+  fi
+
+  client_build
+  local bin; bin="$(client_binary)"
+  local dir="$CLIENTS_DIR/enrol"
+  mkdir -p "$dir"
+  local args=(--workspace "$dir" --workspace-id "$ENROLLED_WORKSPACE"
+              --handle enrol --machine enrol --selection relay --relay "$(relay_ws_url)")
+  "$bin" relay-client "${args[@]}" init >/dev/null
+
+  # The seat, over a socket, by a device that is nobody yet.
+  if ! "$bin" relay-client "${args[@]}" redeem --id "$token" --title "$code" >/dev/null; then
+    note "enrolment" "the relay refused the redemption; see $RELAY_LOG_FILE"
+    return 1
+  fi
+
+  # And the genesis access set, which is what consumes the seat, destroys the
+  # private half of the genesis key and writes entry zero of the transparency log.
+  local device
+  device="$("$bin" relay-client "${args[@]}" device | sed -n 's/^device=//p')"
+  if ! "$bin" relay-client "${args[@]}" --device "$device" access-publish >/dev/null 2>&1; then
+    note "enrolment" "the genesis access set was refused; see $RELAY_LOG_FILE"
+    return 1
+  fi
+
+  local entries fingerprint
+  entries="$(relay_psql "select count(*) from relay_transparency_log where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
+  fingerprint="$(relay_psql "select encode(fingerprint,'hex') from relay_genesis where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
+  note "enrolment" "$ENROLLED_WORKSPACE founded, genesis $(echo "$fingerprint" | cut -c1-12), log entries $entries"
+  [ "$(genesis_state)" = "redeemed" ] || {
+    note "enrolment" "the genesis key survived its own redemption"
+    return 1
+  }
+}
+
+relay_stop() {
+  local pid
+  if pid="$(relay_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    local deadline=$((SECONDS + 10))
+    while [ "$SECONDS" -lt "$deadline" ] && kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$RELAY_PID_FILE"
+}
+
+CLIENTS_DIR="${WEALD_CLIENTS_DIR:-$STACK_STATE/clients}"
+: "${WEALD_WORKSPACE_ID:=weald-demo}"
+
+# The app binary, which is also the client instance. See Sources/CLI/RelayClientCLI.swift.
+# `WEALD_DERIVED_DATA`, when set, is honoured for the same reason
+# `scripts/swift-test.sh` honours it: this repository is routinely built by more
+# than one session at once, and the app the harness executes lives in the same
+# DerivedData a concurrent `xcodebuild` is rewriting. A binary replaced while it
+# is running is killed by the kernel with SIGKILL, which surfaces here as
+# `Killed: 9` from a client that did nothing wrong. Pointing the harness at the
+# gate's own DerivedData removes the race rather than retrying through it.
+client_derived_data_args() {
+  [ -n "${WEALD_DERIVED_DATA:-}" ] && printf '%s\n%s\n' -derivedDataPath "$WEALD_DERIVED_DATA"
+}
+
+client_binary() {
+  local built
+  built="$(xcodebuild -project "$ROOT/Weald.xcodeproj" -scheme Weald -configuration Debug \
+    $(client_derived_data_args) \
+    -showBuildSettings 2>/dev/null | awk '/ BUILT_PRODUCTS_DIR = /{print $3; exit}')"
+  [ -n "$built" ] || return 1
+  local bin="$built/Weald.app/Contents/MacOS/Weald"
+  [ -x "$bin" ] || return 1
+  echo "$bin"
+}
+
+client_build() {
+  if client_binary >/dev/null; then return 0; fi
+  echo "building the client instance (xcodebuild)"
+  xcodebuild -project "$ROOT/Weald.xcodeproj" -scheme Weald -configuration Debug \
+    $(client_derived_data_args) build \
+    >"$STACK_STATE/client-build.log" 2>&1 || {
+      echo "weald-stack: the client did not build; see $STACK_STATE/client-build.log" >&2
+      tail -20 "$STACK_STATE/client-build.log" >&2
+      return 1
+    }
+}
+
+# `-i` deliberately absent. A `docker exec -i` inside a `while read` loop consumes
+# the loop's own stdin and the loop then runs once, which is how group registration
+# silently registered one group out of two.
+psql_relay() {
+  # `WEALD_STACK_RELAY_PSQL_URL` points this at the relay's own database wherever
+  # it is, which for step 13's hosted proof is a managed Postgres at a provider.
+  # The registration it performs is the same insert either way, and it is the
+  # thing a control plane will do once one exists (step 16).
+  if [ -n "${WEALD_STACK_RELAY_PSQL_URL:-}" ]; then
+    psql "$WEALD_STACK_RELAY_PSQL_URL" "$@"
+    return
+  fi
+  docker exec "$(dc ps -q postgres)" psql -U weald -d weald_relay_stack "$@"
+}
+
+# Register a workspace's groups with the relay.
+#
+# `accept.rs` answers `denied/group_unknown` for a group with no row, and it is
+# right to: a relay that created a group on first write would let anyone with a
+# socket allocate storage on somebody else's plan. Provisioning belongs to the
+# control plane, which is step 14 onward and has no HTTP surface yet, so locally it
+# belongs here. The ids come from the client itself (`relay-client groups`) rather
+# than from a bash reimplementation of GroupID.derive, because two implementations
+# of a hash is two implementations to disagree.
+clients_register_groups() {
+  local bin="$1" workspace_dir="$2"
+  local id scope
+  while read -r id scope; do
+    [ -n "$id" ] || continue
+    psql_relay -v ON_ERROR_STOP=1 -q -c \
+      "insert into relay_group (group_id, workspace_id) values (decode('$id','hex'), '$WEALD_WORKSPACE_ID') on conflict do nothing" \
+      >/dev/null
+    note "group" "$scope ${id:0:12}"
+  done < <("$bin" relay-client --workspace "$workspace_dir" \
+             --workspace-id "$WEALD_WORKSPACE_ID" groups)
+}
+
+# Supervised client instances: one directory and one process each.
+#
+# `local-harness.md` calls for separate processes with separate workspace
+# containers, and this is that. Each instance is `scripts/relay-client.sh`, which
+# compiles the app's own `Sources/Sync` types, so an instance speaks the wire the
+# shipping client speaks rather than a second implementation of it.
+REMOTE_REPO="${WEALD_REMOTE_REPO:-$STACK_STATE/remote.git}"
+
+# The git substrate, for real. A bare repository the instances push to and pull
+# from, because `GitTransport` deliberately does not run git itself: publishing in
+# the git substrate is writing the file, and the tree moves by whatever commit and
+# pull the team already does. Here the harness is the team.
+git_remote_init() {
+  [ -d "$REMOTE_REPO" ] && return 0
+  git init --bare --quiet --initial-branch=main "$REMOTE_REPO"
+}
+
+instance_git() { git -C "$1" -c user.name="$2" -c user.email="$2@weald.local" "${@:3}"; }
+
+instance_push() {
+  local dir="$1" who="$2"
+  instance_git "$dir" "$who" add -A >/dev/null 2>&1 || true
+  # Nothing to commit is the ordinary case for an instance that only received, and
+  # it is not a failure.
+  instance_git "$dir" "$who" commit -q -m "$who" >/dev/null 2>&1 || true
+  instance_git "$dir" "$who" push -q origin main 2>/dev/null || \
+    instance_git "$dir" "$who" push -q --set-upstream origin main
+}
+
+instance_pull() {
+  local dir="$1" who="$2"
+  instance_git "$dir" "$who" fetch -q origin main
+  # A union merge over the chat shards and the log, which is the merge the product
+  # relies on and therefore the merge the proof has to exercise.
+  instance_git "$dir" "$who" merge -q --no-edit origin/main >/dev/null 2>&1 || \
+    instance_git "$dir" "$who" merge -q --no-edit --allow-unrelated-histories origin/main
+}
+
+instance_create() {
+  local bin="$1" name="$2" selection="$3"
+  local dir="$CLIENTS_DIR/$name"
+  if [ ! -d "$dir/.git" ] && git ls-remote --exit-code --heads "$REMOTE_REPO" main >/dev/null 2>&1; then
+    # Every instance after the first is a clone, not a second unrelated history.
+    # Three trees that each invented their own root commit would merge only with
+    # --allow-unrelated-histories, and a proof that needed that flag would be
+    # proving something no real checkout does.
+    rm -rf "$dir"
+    git clone --quiet "$REMOTE_REPO" "$dir"
+  fi
+  mkdir -p "$dir"
+  if [ ! -d "$dir/.git" ]; then
+    git init --quiet --initial-branch=main "$dir"
+    git -C "$dir" remote add origin "$REMOTE_REPO"
+    {
+      # The private key never travels. `.weald-instance/` is this process's key
+      # store and its workspace id; the relay cursor is one relay's numbering of one
+      # group and is meaningless in another checkout.
+      echo ".weald-instance/"
+      echo ".weald/relay/"
+      # Per-instance and never shared: which transport this checkout is on is a
+      # property of this machine, and three instances of one workspace on three
+      # transports is the whole point of the scenario.
+      echo ".weald/project.json"
+    } > "$dir/.gitignore"
+    {
+      # The merge the substrate is built on. Chat shards and the envelope log are
+      # append-only, so a union merge of two sides is the union of two sets of
+      # records, which is exactly what convergence means here.
+      echo "*.jsonl merge=union"
+      echo "*.bin  merge=union"
+    } > "$dir/.gitattributes"
+    instance_git "$dir" "$name" add -A >/dev/null
+    instance_git "$dir" "$name" commit -q -m "$name workspace" >/dev/null
+    instance_git "$dir" "$name" push -q --set-upstream origin main
+  fi
+  local args=(--workspace "$dir" --workspace-id "$WEALD_WORKSPACE_ID"
+              --handle "$name" --machine "$name" --selection "$selection")
+  if [ "$selection" != "git" ]; then args+=(--relay "$(relay_ws_url)"); fi
+  "$bin" relay-client "${args[@]}" init >/dev/null
+  echo "$selection" > "$dir/.weald-instance/selection"
+  # The workspace's bootstrap secret, which is the harness's stand-in for the 32
+  # bytes an invitee gets in its invite's URL fragment
+  # (`specs/backend/relay/invites.md`). Every standing `GroupInfo` this workspace
+  # publishes is sealed under a key derived from it, so a client that does not have
+  # it cannot enter a group, and the relay never sees it: it is written to disk here
+  # and read by the client, and no code path sends it over a socket.
+  #
+  # One value for the workspace, generated once and copied. Copied rather than
+  # re-derived, because two clients that derived different secrets would each seal
+  # publications the other cannot open and both would sit waiting for a group that
+  # already exists.
+  cp "$CLIENTS_DIR/bootstrap-secret" "$dir/.weald-instance/bootstrap-secret"
+  # Exactly one founder, and it is the first instance. Every other client joins the
+  # groups it created by external commit. Two founders would create two groups under
+  # one id and nothing would ever converge, which is why this is a marker on disk
+  # rather than a race the clients resolve between themselves.
+  if [ "$name" = "c1" ]; then : > "$dir/.weald-instance/founder"; fi
+  note "client $name" "$selection, $dir"
+}
+
+# Publish the genesis access set for the instances, from the first one that has a
+# socket.
+#
+# Without this the whole demo path is dead on arrival. `WEALD_RELAY_ACCESS_SET=enforce`
+# is the setting every environment runs (`specs/backend/build/environments.md`), a
+# workspace with no published set admits its first device into `Bootstrapping`, and the
+# only frame that state accepts is `ACCESS`. So every instance would authenticate and
+# then be refused its first write, which reads as a broken relay rather than as the
+# workspace never having been bootstrapped.
+#
+# The publisher is an instance and not this script: the genesis set is signed by the
+# trust root at bootstrap (`specs/backend/relay/wire.md`), the trust root is a device
+# key, and the device keys live in the instances. A harness that signed one would have
+# been a second implementation of the client's own act.
+#
+# Every instance is named, including the git-only ones. A checkout on the git substrate
+# opens no socket and needs no entry today, but naming it costs nothing and is what the
+# roster would say: it is a device of this workspace, and the transport it happens to be
+# on this week is not a membership fact.
+clients_publish_access_set() {
+  local bin="$1"; shift
+  local names=("$@")
+  local publisher="" name selection
+  for name in "${names[@]}"; do
+    selection="$(cat "$CLIENTS_DIR/$name/.weald-instance/selection" 2>/dev/null || echo git)"
+    if [ "$selection" != "git" ] && [ -z "$publisher" ]; then publisher="$name"; fi
+  done
+  if [ -z "$publisher" ]; then
+    note "access set" "not published: no instance is on the relay"
+    return 0
+  fi
+
+  local args=(--workspace "$CLIENTS_DIR/$publisher" --workspace-id "$WEALD_WORKSPACE_ID"
+              --handle "$publisher" --machine "$publisher")
+  local device
+  for name in "${names[@]}"; do
+    device="$("$bin" relay-client --workspace "$CLIENTS_DIR/$name" --handle "$name" \
+      --machine "$name" device | sed -n 's/^device=//p')"
+    [ -n "$device" ] && args+=(--device "$device")
+  done
+
+  local out
+  if out="$("$bin" relay-client "${args[@]}" access-publish 2>&1)"; then
+    note "access set" "published by $publisher, $(echo "$out" | sed -n 's/^entries=//p') entries"
+  else
+    # Already published is the ordinary case on a second `clients` run against the
+    # same workspace id, and is not a failure: the set is a workspace fact and the
+    # instances are unchanged.
+    case "$out" in
+      *"already has an access set"*) note "access set" "already published" ;;
+      *) note "access set" "not published: $out"; return 1 ;;
+    esac
+  fi
+}
+
+# weald-stack clients N [--selections a,b,c] [--fresh]
+cmd_clients() {
+  local count="${1:-3}"
+  shift || true
+  local selections="" fresh=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --selections) selections="$2"; shift 2 ;;
+      --fresh) fresh=1; shift ;;
+      *) echo "weald-stack clients: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  case "$count" in
+    ''|*[!0-9]*) echo "weald-stack clients N: N must be a number" >&2; exit 64 ;;
+  esac
+  require_daemon
+  relay_answers || { echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2; exit 1; }
+  client_build
+  local bin; bin="$(client_binary)"
+
+  if [ "$fresh" -eq 1 ]; then
+    clients_stop
+    rm -rf "$CLIENTS_DIR" "$REMOTE_REPO"
+    # A fresh scenario is a fresh group namespace as well as a fresh disk. Reusing
+    # the ids would leave the previous run's envelopes in the relay and every count
+    # in the proof would be measuring two runs at once.
+    WEALD_WORKSPACE_ID="${WEALD_WORKSPACE_ID}-$(date +%s)"
+  fi
+  mkdir -p "$CLIENTS_DIR"
+  # One secret per workspace, minted before the first instance exists.
+  if [ ! -f "$CLIENTS_DIR/bootstrap-secret" ]; then
+    python3 -c 'import os; print(os.urandom(32).hex())' > "$CLIENTS_DIR/bootstrap-secret"
+  fi
+  git_remote_init
+
+  # Default roles are step 5's gate, verbatim: "three clients, one relay-only, one
+  # git-only, one on both". Beyond three the cycle repeats, which is what a soak
+  # wants and what nothing else asks for.
+  local default_selections=(relay git dual)
+  local names=() picks=()
+  if [ -n "$selections" ]; then
+    IFS=',' read -r -a picks <<< "$selections"
+  fi
+  local i
+  for (( i = 0; i < count; i++ )); do
+    local selection="${picks[$i]:-${default_selections[$(( i % 3 ))]}}"
+    local name
+    name="$(printf 'c%d' "$((i + 1))")"
+    names+=("$name")
+    instance_create "$bin" "$name" "$selection"
+  done
+
+  clients_register_groups "$bin" "$CLIENTS_DIR/${names[0]}"
+  # Groups first, then the set: the relay resolves the workspace a publication belongs
+  # to from the groups the connection names, so a publication before registration is
+  # answered `denied/group_unknown`.
+  clients_publish_access_set "$bin" "${names[@]}"
+  echo "$WEALD_WORKSPACE_ID" > "$CLIENTS_DIR/workspace-id"
+  echo
+  echo "workspace $WEALD_WORKSPACE_ID, relay $(relay_ws_url)"
+  echo "drive one with:"
+  echo "  scripts/weald-client c1 send 'hello'"
+}
+
+# --- the step 5 scenarios ----------------------------------------------------
+#
+# Four proofs from `specs/backend/build/phases-relay.md` step 5, each run against
+# real client processes, a real relay process, real Postgres and a real git remote.
+# Each writes an artifact, because a scenario that printed "ok" and kept nothing
+# proves whatever the reader remembers.
+
+SCENARIO_OUT="${WEALD_SCENARIO_OUT:-$ROOT/build-evidence/step-05}"
+
+wc_() { "$ROOT/scripts/weald-client" "$@"; }
+
+# One field out of a `key=value` block.
+field() { awk -F= -v k="$2" '$1 == k { print substr($0, length(k) + 2) }' <<< "$1"; }
+
+scenario_state() { wc_ "$1" state; }
+
+scenario_fail() { echo "SCENARIO FAILED: $*" >&2; exit 1; }
+
+# The three-client convergence proof, and the offline catch-up that shares its
+# shape. Split into named functions so the gate can run one without the others.
+scenario_converge() {
+  local out="$SCENARIO_OUT/converge.txt"
+  mkdir -p "$SCENARIO_OUT"
+  cmd_clients 3 --fresh >/dev/null
+  {
+    echo "# Three clients converge: relay-only, git-only, and both"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "remote    $REMOTE_REPO"
+    echo
+    echo "c1 relay-only, c2 git-only, c3 on both."
+    echo
+  } > "$out"
+
+  # Each client authors, and the substrate each one has moves it.
+  wc_ c1 send "from the relay-only client" >/dev/null
+  wc_ c1 --seconds 30 sync >> "$out"
+  wc_ c2 send "from the git-only client" >/dev/null
+  wc_ c2 push
+  wc_ c3 pull
+  wc_ c3 send "from the client on both" >/dev/null
+  wc_ c3 ticket --id T-1 --title "written by the dual client" --body "step 5" >/dev/null
+  # Twice. The first round carries this checkout's own records up and the relay's
+  # down; the second offers what the first round pulled out of git, which is the
+  # bridge a split team depends on.
+  wc_ c3 --seconds 30 sync >> "$out"
+  wc_ c3 --seconds 30 sync >> "$out"
+  wc_ c3 push
+  wc_ c1 --seconds 30 sync >> "$out"
+  wc_ c2 pull
+
+  local d1 d2 d3 s1 s2 s3
+  s1="$(scenario_state c1)"; s2="$(scenario_state c2)"; s3="$(scenario_state c3)"
+  d1="$(field "$s1" digest)"; d2="$(field "$s2" digest)"; d3="$(field "$s3" digest)"
+  {
+    echo
+    echo "## Final state, per client"
+    echo
+    printf '%s\n\n%s\n\n%s\n' "$s1" "$s2" "$s3"
+  } >> "$out"
+  [ "$d1" = "$d2" ] && [ "$d2" = "$d3" ] || {
+    echo "digests: c1=$d1 c2=$d2 c3=$d3" >> "$out"
+    scenario_fail "three clients did not converge; see $out"
+  }
+  [ "$(field "$s1" chat)" = "3" ] || scenario_fail "expected 3 chat records, got $(field "$s1" chat)"
+  [ "$(field "$s1" tickets)" = "1" ] || scenario_fail "the ticket did not reach the relay-only client"
+  echo "CONVERGED on $d1" | tee -a "$out"
+}
+
+# A client offline for a day catches up, in both directions.
+#
+# "Offline" is real here and not simulated by a flag: every `send` below is its own
+# process that never opens a socket, so the in-memory outbox those writes would have
+# used does not merely get dropped, it never exists. What has to carry them is the
+# log plus the first reconciliation round after the relaunch.
+scenario_catchup() {
+  local out="$SCENARIO_OUT/catchup.txt"
+  mkdir -p "$SCENARIO_OUT"
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+  {
+    echo "# A client offline for a day catches up"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo
+    echo "c1 writes 3 records a day back and never opens a socket."
+    echo "c2 writes 20 records and syncs each time, which is the day c1 missed."
+    echo
+  } > "$out"
+
+  local i
+  for i in 1 2 3; do
+    wc_ c1 --days-ago 1 send "offline write $i" >/dev/null
+  done
+  for i in $(seq 1 20); do
+    wc_ c2 send "live write $i" >/dev/null
+  done
+  wc_ c2 --seconds 30 sync >> "$out"
+
+  # One relaunch, one round.
+  local before after
+  before="$(date +%s)"
+  wc_ c1 --seconds 45 sync >> "$out"
+  after="$(date +%s)"
+  wc_ c2 --seconds 30 sync >> "$out"
+
+  local s1 s2
+  s1="$(scenario_state c1)"; s2="$(scenario_state c2)"
+  {
+    echo
+    echo "## Final state"
+    echo
+    printf '%s\n\n%s\n' "$s1" "$s2"
+    echo
+    echo "catch_up_seconds=$(( after - before ))"
+  } >> "$out"
+  [ "$(field "$s1" digest)" = "$(field "$s2" digest)" ] || \
+    scenario_fail "the offline client did not catch up; see $out"
+  [ "$(field "$s1" chat)" = "23" ] || \
+    scenario_fail "expected 23 records after catch-up, got $(field "$s1" chat)"
+  echo "CAUGHT UP in $(( after - before ))s on $(field "$s1" digest)" | tee -a "$out"
+}
+
+# The relay serves a forked history and the client detects it.
+scenario_fork() {
+  local out="$SCENARIO_OUT/fork.txt"
+  mkdir -p "$SCENARIO_OUT"
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+  {
+    echo "# The relay serves a forked history and the receiving client detects it"
+    echo
+    echo "c1 authors two records, then a third at a counter it has already used,"
+    echo "correctly signed and correctly addressed. The relay stores both, because"
+    echo "it holds no key and cannot see a chain. c2 receives both and audits."
+    echo
+  } > "$out"
+
+  wc_ c1 send "first" >/dev/null
+  wc_ c1 send "second" >/dev/null
+  wc_ c1 --seconds 30 sync >> "$out"
+  echo >> "$out"
+  wc_ c1 fork "a second record at a counter already used" >> "$out"
+  wc_ c1 --seconds 30 sync >> "$out"
+  wc_ c2 --seconds 30 sync >> "$out"
+
+  local audit alarms
+  audit="$(wc_ c2 audit)"
+  alarms="$(field "$audit" alarms)"
+  {
+    echo
+    echo "## The receiving client's audit"
+    echo
+    echo "$audit"
+  } >> "$out"
+  [ "${alarms:-0}" -ge 1 ] || scenario_fail "the fork was not detected; see $out"
+  # And the same fact reaches the indicator rather than staying in a test.
+  local synced
+  synced="$(wc_ c2 --seconds 20 sync)"
+  echo "$synced" >> "$out"
+  [ "$(field "$synced" alarms)" -ge 1 ] || \
+    scenario_fail "the fork was audited but the connection status did not report it"
+  echo "DETECTED $alarms alarm(s)" | tee -a "$out"
+}
+
+# A rollback to git-only strands nothing.
+scenario_rollback() {
+  local out="$SCENARIO_OUT/rollback.txt"
+  mkdir -p "$SCENARIO_OUT"
+  cmd_clients 2 --selections dual,relay --fresh >/dev/null
+  {
+    echo "# A rollback to git-only strands nothing"
+    echo
+    echo "c1 is on both transports and receives content that only ever arrived over"
+    echo "the relay. Its transport is then set back to git, which is the Phase 0 to 2"
+    echo "rollback in specs/backend/relay/migration.md: a flag, not a migration."
+    echo
+  } > "$out"
+
+  wc_ c1 send "written on both" >/dev/null
+  wc_ c1 ticket --id T-9 --title "written before the rollback" >/dev/null
+  wc_ c2 send "arrives only over the relay" >/dev/null
+  wc_ c2 --seconds 30 sync >> "$out"
+  wc_ c1 --seconds 30 sync >> "$out"
+
+  local before after
+  before="$(scenario_state c1)"
+  {
+    echo
+    echo "## Before the rollback, on both transports"
+    echo
+    echo "$before"
+  } >> "$out"
+  [ "$(field "$before" chat)" = "2" ] || \
+    scenario_fail "the dual client did not receive over the relay; see $out"
+
+  # The rollback itself: one key in one file.
+  python3 - "$CLIENTS_DIR/c1/.weald/project.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as handle:
+    config = json.load(handle)
+config.setdefault("relay", {})["transport"] = "git"
+with open(path, "w") as handle:
+    json.dump(config, handle, indent=2, sort_keys=True)
+PY
+  echo git > "$CLIENTS_DIR/c1/.weald-instance/selection"
+
+  after="$(scenario_state c1)"
+  {
+    echo
+    echo "## After the rollback, on git alone"
+    echo
+    echo "$after"
+    echo
+    echo "The transport it now resolves to:"
+    wc_ c1 sync
+  } >> "$out"
+  [ "$(field "$before" digest)" = "$(field "$after" digest)" ] || \
+    scenario_fail "the rollback changed what the workspace holds; see $out"
+  [ "$(field "$before" envelopes)" = "$(field "$after" envelopes)" ] || \
+    scenario_fail "the rollback stranded records; see $out"
+  echo "NOTHING STRANDED, still $(field "$after" digest)" | tee -a "$out"
+}
+
+# --- step 22: two workspaces bound on one machine ----------------------------
+#
+# `phases-app.md` step 22 asks for "a second workspace bound on one machine, on a
+# different transport from the first, both live at once, no key crossing between
+# them". Every word of that is load bearing and none of it is a filesystem test:
+#
+# - **Bound** means bound by the shipping binder and the shipping transport switch.
+#   Each workspace here is created by `relay-client bind`, which calls
+#   `WorkspaceBinder.create` and `RelayConfigurationWriter.select` and nothing else,
+#   so what is proven is the code the sidebar runs.
+# - **Different transports** means one workspace reaches its peer over a socket to
+#   the relay and the other over a git remote, at the same time, on this laptop.
+# - **Both live at once** is measured rather than asserted: each workspace's round
+#   runs as its own process, the two runs are launched together, and their start and
+#   end times have to overlap. A sequential proof would say nothing about two live
+#   workspaces, which is the state a person is actually in.
+# - **No key crossing** is the one that matters. Two workspaces are two group
+#   namespaces, two bootstrap secrets, two device key stores and two sets of
+#   records, and the failure this catches is any of them being shared: a group id in
+#   common, a record count that includes the other workspace's message, or the
+#   git-only workspace appearing in the relay's database at all.
+STEP22_OUT="${WEALD_STEP22_OUT:-$ROOT/build-evidence/step-22}"
+STEP10_OUT="${WEALD_STEP10_OUT:-$ROOT/build-evidence/step-10}"
+STEP24_OUT="${WEALD_STEP24_OUT:-$ROOT/build-evidence/step-24}"
+
+# --- step 10: checkpoint-anchored compaction, end to end -------------------
+#
+# `phases-relay.md` step 10 asks that "compaction on the fixture workspace
+# reclaims the expected bytes, with checkpoint manifest verification before
+# `drop_before`, and every remaining client still converges afterward", and that a
+# `drop_before` whose manifest fails verification refuses to run.
+#
+# Every part of that is real here. Two client processes on a real socket write
+# real history; one of them writes a snapshot and a signed checkpoint above it and
+# publishes both as ordinary envelopes; the second authorizer signs the retention
+# policy with its own key in its own process, because neither device can sign for
+# the other and that is the whole content of two-person approval; and the drop is
+# the relay's own statement against its own table. What survives is then read back
+# out of Postgres rather than asserted from the client's answer.
+# Proof 1's negative: a relay running a digest nothing published, and the client
+# saying so.
+#
+# `specs/backend/relay/verification.md`: a mismatch "is not a log line: it is a
+# banner naming the expected and reported digests, shown to every connected user
+# until acknowledged". So this deploys a digest no release feed will ever carry,
+# connects a real client over a real socket, and reads what the client was told
+# rather than what a test constructed.
+#
+# The two halves are deliberately separate. The relay reporting a digest is a
+# wire fact and is asserted from the client's own status line; the verdict that
+# follows from it is `ReleaseComparison`'s and is asserted in the Swift suite.
+# A scenario that asserted the verdict here would be asserting a pure function
+# over a socket.
+scenario_digest_mismatch() {
+  local out="$SCENARIO_OUT/digest-mismatch.txt"
+  mkdir -p "$SCENARIO_OUT"
+  local forged="sha256:$(printf 'd%.0s' $(seq 1 64))"
+
+  cmd_clients 1 --fresh >/dev/null
+  relay_stop
+  WEALD_STACK_IMAGE_DIGEST="$forged" relay_start || \
+    scenario_fail "the relay did not restart with a baked digest"
+
+  # `sync` and not `state`: the handshake facts are reported by the verb that
+  # performs a handshake, and `state` prints a content digest of the working
+  # tree under its own `digest` key.
+  local state
+  state="$(wc_ c1 sync --selection relay --seconds 6)"
+  local reported
+  reported="$(field "$state" builddigest)"
+
+  {
+    echo "# A relay running a digest nobody published"
+    echo
+    echo "Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) by scripts/weald-stack scenario digest-mismatch"
+    echo
+    echo "The relay was restarted with WEALD_RELAY_IMAGE_DIGEST set to a value no"
+    echo "release feed carries, which is what ordinary deployment drift looks like"
+    echo "from the client's side."
+    echo
+    echo "baked into the relay   $forged"
+    echo "reported to the client $reported"
+    echo "access set             $(field "$state" accessset)"
+    echo "encryption floor       $(field "$state" minenc)"
+    echo
+    echo "The client is shown the relay's own claim, verbatim, over the"
+    echo "authenticated socket. What follows from it is ReleaseComparison's:"
+    echo "a digest in sha256 form that matches no published release is the one"
+    echo "verdict that raises a banner for every connected user."
+  } > "$out"
+
+  [ "$reported" = "$forged" ] || \
+    scenario_fail "the client was told '$reported', not the deployed '$forged'"
+
+  # And the same relay, restarted without a baked digest, reports the honest
+  # self-hash rather than remembering the last thing it was told.
+  relay_stop
+  relay_start || scenario_fail "the relay did not restart without a baked digest"
+  local honest
+  honest="$(field "$(wc_ c1 sync --selection relay --seconds 6)" builddigest)"
+  case "$honest" in
+    exe-blake3:*) ;;
+    *) scenario_fail "a relay with no baked digest reported '$honest'" ;;
+  esac
+  echo "" >> "$out"
+  echo "restarted with nothing baked in, the same relay reports $honest" >> "$out"
+  echo "which is a true statement about the running binary and is labelled so it" >> "$out"
+  echo "can never be compared against a release and read as a mismatch." >> "$out"
+
+  echo "digest-mismatch: the client was told $forged, then $honest"
+}
+
+scenario_compaction() {
+  local out="$STEP10_OUT/compaction.txt"
+  mkdir -p "$STEP10_OUT"
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+  local ws; ws="$(cat "$CLIENTS_DIR/workspace-id")"
+  local group_sql="select encode(g.group_id,'hex') from relay_group g where g.workspace_id = '$ws'"
+
+  {
+    echo "# Checkpoint-anchored compaction, end to end"
+    echo
+    echo "workspace $ws"
+    echo "relay     $(relay_ws_url)"
+    echo
+  } > "$out"
+
+  local index
+  for index in 1 2 3 4 5; do
+    wc_ c1 send "compaction record $index" >/dev/null
+  done
+  wc_ c1 --seconds 30 sync >/dev/null
+  wc_ c2 --seconds 30 sync >/dev/null
+  # A third round, because the retention control chain is published in the pass
+  # that commits and the joiner's external commit is what moves the group to
+  # epoch one. Without it the chain is a genesis record and nothing else.
+  wc_ c1 --seconds 30 sync >/dev/null
+
+  local c1 c2
+  c1="$(wc_ c1 device | sed -n 's/^device=//p')"
+  c2="$(wc_ c2 device | sed -n 's/^device=//p')"
+  # A second authorizer, because a sole-authorizer workspace's destructive
+  # actions carry a seven-day floor nothing can shorten (`media.md`) and a
+  # same-day proof of it would be a proof of the wrong thing.
+  wc_ c1 authorizers --device "$c2" >> "$out"
+
+  {
+    echo
+    echo "## The checkpoint"
+    echo
+  } >> "$out"
+  wc_ c1 checkpoint >> "$out"
+  wc_ c1 --seconds 30 sync >/dev/null
+
+  # Measured after the checkpoint reaches the relay, because the checkpoint and
+  # its snapshot are two more envelopes and a baseline taken before them would
+  # make the drop look like it reclaimed two fewer than it did.
+  # What the other client's audit says before any of this. Captured because the
+  # invariant that matters is that compaction adds nothing to it: this harness's
+  # second client joins a `closed` group by external commit at epoch one and
+  # holds no content key for epoch zero, so it already reports one alarm per
+  # envelope it cannot open. That is the history-key gap `channels.md` closes for
+  # `open` groups and it has nothing to do with dropping anything. Reading the
+  # number without this baseline would make a pre-existing condition look like
+  # damage this scenario caused.
+  local alarms_before
+  alarms_before="$(field "$(wc_ c2 audit)" alarms)"
+
+  local before before_bytes
+  before="$(relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  before_bytes="$(relay_psql "select coalesce(sum(octet_length(ct)),0) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  {
+    echo
+    echo "## Before the drop"
+    echo
+    echo "envelopes $before"
+    echo "bytes     $before_bytes"
+  } >> "$out"
+
+  local not_before; not_before=$(( $(date +%s) - 60 ))
+  local approval
+  approval="$(wc_ c2 policy-approve --device "$c1" --device "$c2" --id 1 --seconds "$not_before"     | sed -n 's/^sig=//p')"
+  [ -n "$approval" ] || scenario_fail "the second authorizer did not sign the policy"
+
+  # The negative first, and on the same live workspace: a `drop_before` whose
+  # manifest names a snapshot the relay is not holding must refuse, and must
+  # leave every envelope where it was. Proven before the accepting run so a
+  # refusal cannot be mistaken for "there was nothing left to drop".
+  local refused
+  refused="$(wc_ c1 compact --id 1 --seconds "$not_before" --title "$c2:$approval"     --body missing-snapshot 2>&1 || true)"
+  {
+    echo
+    echo "## The negative: a manifest that fails verification"
+    echo
+    echo "$refused" | sed 's/^/  /'
+  } >> "$out"
+  case "$refused" in
+    *incomplete_manifest*) : ;;
+    *) scenario_fail "a drop naming a snapshot the relay does not hold was not refused: $refused" ;;
+  esac
+  local after_refusal
+  after_refusal="$(relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  [ "$after_refusal" = "$before" ] ||     scenario_fail "a refused drop changed the log: $before then $after_refusal"
+
+  {
+    echo
+    echo "## The drop"
+    echo
+  } >> "$out"
+  wc_ c1 compact --id 1 --seconds "$not_before" --title "$c2:$approval" >> "$out"
+
+  local after after_bytes anchors runs
+  after="$(relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  after_bytes="$(relay_psql "select coalesce(sum(octet_length(ct)),0) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  anchors="$(relay_psql "select count(*) from relay_checkpoint_anchor a join relay_group g on g.group_id = a.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  runs="$(relay_psql "select barrier_seq || ' ' || deleted_count || ' ' || deleted_bytes || ' ' || kept_count from relay_drop_run r join relay_group g on g.group_id = r.group_id where g.workspace_id = '$ws'")"
+
+  {
+    echo
+    echo "## After, read from the relay's own tables"
+    echo
+    echo "envelopes $after (was $before)"
+    echo "bytes     $after_bytes (was $before_bytes)"
+    echo "anchors   $anchors"
+    echo
+    echo "## The run log: barrier, deleted, bytes, kept"
+    echo
+    echo "$runs" | sed 's/^/  /'
+  } >> "$out"
+
+  [ "${after:-0}" -lt "${before:-0}" ] ||     scenario_fail "the compaction reclaimed nothing: $before then $after"
+  [ "${after_bytes:-0}" -lt "${before_bytes:-0}" ] ||     scenario_fail "the compaction reclaimed no bytes"
+  # What is left is exactly what a checkpoint anchors: the manifest and its
+  # snapshot. Anything else surviving would mean the barrier was too low, and
+  # anything fewer would mean an anchor was collected.
+  [ "${anchors:-0}" = "2" ] || scenario_fail "expected 2 anchors, got $anchors"
+  [ "${after:-0}" = "2" ] ||     scenario_fail "expected the checkpoint and its snapshot to survive, $after envelopes did"
+  [ -n "$runs" ] || scenario_fail "the compaction left no run-log row"
+
+  # And every remaining client still converges. The one that did not issue the
+  # drop reconciles against a relay whose log is now mostly gone, which is the
+  # case the whole checkpoint mechanism exists to make safe.
+  wc_ c2 --seconds 30 sync >> "$out"
+  local state; state="$(scenario_state c2)"
+  {
+    echo
+    echo "## The other client, after the drop"
+    echo
+    echo "$state"
+  } >> "$out"
+  [ "$(field "$state" chat)" = "5" ] ||     scenario_fail "the remaining client lost history it had already read; see $out"
+
+  # And compaction raised no alarm of its own. The count is the wrong thing to
+  # assert and asserting it was a mistake worth recording: this harness's joiner
+  # already reports one alarm per envelope it cannot open, because a `closed`
+  # group publishes no history key and a device that joined at epoch one holds no
+  # content key for epoch zero. Its count therefore rises whenever it receives
+  # anything, including the checkpoint and snapshot this scenario just published,
+  # and a count comparison would fail for a reason that has nothing to do with
+  # dropping history.
+  #
+  # What is worth asserting is the class. Every alarm has to be that same
+  # content-key gap, and none may be a fork or a gap in an author chain: an alarm
+  # that appeared because history was compacted would be the exact failure the
+  # checkpoint exists to prevent, which is compaction and tamper detection being
+  # mutually exclusive.
+  local audit_after alarms_after records_after
+  audit_after="$(wc_ c2 audit)"
+  alarms_after="$(field "$audit_after" alarms)"
+  records_after="$(field "$audit_after" records)"
+  {
+    echo
+    echo "## Alarms on the other client"
+    echo
+    echo "$audit_after"
+    echo
+    echo "before the drop: $alarms_before"
+    echo
+    echo "Every one is the epoch-zero content-key gap this harness's joiner"
+    echo "already has, one per envelope it holds and cannot open. None is a fork"
+    echo "or a chain gap, which is what compaction could have caused and did not."
+  } >> "$out"
+  [ "${alarms_after:-0}" = "${records_after:-0}" ] || \
+    scenario_fail "an alarm that is not the content-key gap: $alarms_after over $records_after records; see $out"
+  case "$audit_after" in
+    *"no content key"*) : ;;
+    *) scenario_fail "the remaining client raised an alarm compaction has to answer for; see $out" ;;
+  esac
+
+
+  echo "COMPACTED $before to $after envelopes, $before_bytes to $after_bytes bytes" | tee -a "$out"
+}
+
+# One bound workspace, with its own instances, remote, id and transport.
+#
+# Sets the three globals `cmd_clients` works from, so a second call is a second
+# workspace and not a second view of the first.
+two_workspaces_bind() {
+  local name="$1" selections="$2"
+  local home="$STACK_STATE/ws-$name"
+  CLIENTS_DIR="$home/clients"
+  REMOTE_REPO="$home/remote.git"
+  WEALD_WORKSPACE_ID="weald-$name"
+  mkdir -p "$home"
+  cmd_clients 2 --selections "$selections" --fresh >/dev/null
+}
+
+# Drive one instance of one bound workspace. The clients directory is passed in the
+# environment rather than guessed, which is what keeps two workspaces on one machine
+# from reading each other's instances.
+two_workspaces_client() {
+  local home="$1"; shift
+  WEALD_CLIENTS_DIR="$STACK_STATE/ws-$home/clients" "$ROOT/scripts/weald-client" "$@"
+}
+
+# The group ids a bound workspace uses, one per line.
+two_workspaces_groups() {
+  local home="$1"
+  two_workspaces_client "$home" c1 groups | awk '{print $1}' | sort
+}
+
+scenario_two_workspaces() {
+  local out="$STEP22_OUT/two-workspaces.txt"
+  mkdir -p "$STEP22_OUT"
+  local alpha_dir="$STACK_STATE/ws-alpha/clients"
+  local bravo_dir="$STACK_STATE/ws-bravo/clients"
+
+  two_workspaces_bind alpha relay,relay
+  two_workspaces_bind bravo git,git
+  local alpha_id bravo_id
+  alpha_id="$(cat "$alpha_dir/workspace-id")"
+  bravo_id="$(cat "$bravo_dir/workspace-id")"
+  [ "$alpha_id" != "$bravo_id" ] || scenario_fail "two workspaces were bound under one id"
+
+  {
+    echo "# Two workspaces bound on one machine, on two transports, at once"
+    echo
+    echo "alpha  $alpha_id  relay  $(relay_ws_url)"
+    echo "bravo  $bravo_id  git    $STACK_STATE/ws-bravo/remote.git"
+    echo
+  } > "$out"
+
+  # Each workspace authors into itself, and then each one is driven over its own
+  # transport, at the same time, as its own process.
+  two_workspaces_client alpha c1 send "alpha, over the relay" >/dev/null
+  two_workspaces_client bravo c1 send "bravo, over git" >/dev/null
+
+  local alpha_started bravo_started alpha_ended bravo_ended
+  alpha_started="$(now_ms)"; bravo_started="$(now_ms)"
+  (
+    two_workspaces_client alpha c1 --seconds 30 sync >/dev/null
+    two_workspaces_client alpha c2 --seconds 30 sync >/dev/null
+    now_ms > "$STACK_STATE/ws-alpha/ended"
+  ) &
+  local alpha_job=$!
+  (
+    two_workspaces_client bravo c1 push
+    two_workspaces_client bravo c2 pull
+    now_ms > "$STACK_STATE/ws-bravo/ended"
+  ) &
+  local bravo_job=$!
+  wait "$alpha_job" || scenario_fail "the relay workspace did not complete its round"
+  wait "$bravo_job" || scenario_fail "the git workspace did not complete its round"
+  alpha_ended="$(cat "$STACK_STATE/ws-alpha/ended")"
+  bravo_ended="$(cat "$STACK_STATE/ws-bravo/ended")"
+  # Overlap, in both directions: each round began before the other had finished.
+  [ "$alpha_started" -lt "$bravo_ended" ] && [ "$bravo_started" -lt "$alpha_ended" ] || \
+    scenario_fail "the two workspaces were not live at the same time"
+
+  local alpha_state bravo_state
+  alpha_state="$(WEALD_CLIENTS_DIR="$alpha_dir" "$ROOT/scripts/weald-client" c2 state)"
+  bravo_state="$(WEALD_CLIENTS_DIR="$bravo_dir" "$ROOT/scripts/weald-client" c2 state)"
+  {
+    echo "## Both live, measured"
+    echo
+    echo "alpha  ${alpha_started}ms to ${alpha_ended}ms, over the socket"
+    echo "bravo  ${bravo_started}ms to ${bravo_ended}ms, over the remote"
+    echo
+    echo "## What each workspace's second instance holds"
+    echo
+    printf '%s\n\n%s\n\n' "$alpha_state" "$bravo_state"
+  } >> "$out"
+
+  # Each peer received its own workspace's message and only its own. One record
+  # apiece is the whole no-crossing claim stated as a number: a second record in
+  # either workspace is the other workspace's message, whatever route it took.
+  [ "$(field "$alpha_state" chat)" = "1" ] || \
+    scenario_fail "the relay workspace holds $(field "$alpha_state" chat) records, not its own one"
+  [ "$(field "$bravo_state" chat)" = "1" ] || \
+    scenario_fail "the git workspace holds $(field "$bravo_state" chat) records, not its own one"
+  [ "$(field "$alpha_state" digest)" != "$(field "$bravo_state" digest)" ] || \
+    scenario_fail "two workspaces converged on one state, which is one workspace"
+
+  # No key crossing, item by item.
+  local shared_groups
+  shared_groups="$(comm -12 <(two_workspaces_groups alpha) <(two_workspaces_groups bravo) | wc -l | tr -d ' ')"
+  [ "$shared_groups" = "0" ] || scenario_fail "$shared_groups group ids are shared between workspaces"
+  ! cmp -s "$alpha_dir/bootstrap-secret" "$bravo_dir/bootstrap-secret" || \
+    scenario_fail "both workspaces were sealed under one bootstrap secret"
+  local instance
+  for instance in c1 c2; do
+    ! cmp -s "$alpha_dir/$instance/.weald-instance/device.key" \
+             "$bravo_dir/$instance/.weald-instance/device.key" 2>/dev/null || \
+      scenario_fail "$instance holds one device key in both workspaces"
+  done
+
+  # And the transport each one is bound to, read back from the file the switch owns.
+  local alpha_transport bravo_transport
+  alpha_transport="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("relay",{}).get("transport",""))' "$alpha_dir/c1/.weald/project.json")"
+  bravo_transport="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("relay",{}).get("transport",""))' "$bravo_dir/c1/.weald/project.json")"
+  [ "$alpha_transport" = "relay" ] || scenario_fail "the relay workspace is bound to $alpha_transport"
+  [ "$bravo_transport" = "git" ] || scenario_fail "the git workspace is bound to $bravo_transport"
+
+  # The relay's own answer. The git workspace never opened a socket, so the relay
+  # holds no envelope and no key package under its id: a workspace on git leaves
+  # nothing of itself on a relay, and nothing of the other workspace is filed under
+  # it either.
+  #
+  # Its groups do have rows, and that is provisioning rather than traffic: the
+  # harness registers a workspace's groups the way the control plane will
+  # (`clients_register_groups`), for every workspace regardless of transport. What
+  # the rows have to be is disjoint, which is asserted above by group id, and empty,
+  # which is asserted below by envelope count.
+  local alpha_envelopes bravo_envelopes bravo_groups bravo_packages
+  alpha_envelopes="$(relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$alpha_id'" | tr -d '[:space:]')"
+  bravo_envelopes="$(relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id where g.workspace_id = '$bravo_id'" | tr -d '[:space:]')"
+  bravo_groups="$(relay_psql "select count(*) from relay_group where workspace_id = '$bravo_id'" | tr -d '[:space:]')"
+  bravo_packages="$(relay_psql "select count(*) from relay_key_package where workspace_id = '$bravo_id'" | tr -d '[:space:]')"
+  {
+    echo "## The relay's database, per workspace"
+    echo
+    echo "alpha envelopes  $alpha_envelopes"
+    echo "bravo envelopes  $bravo_envelopes"
+    echo "bravo groups     $bravo_groups (provisioned, never written to)"
+    echo "bravo key packages $bravo_packages"
+    echo
+    echo "alpha groups"
+    two_workspaces_groups alpha | sed 's/^/  /'
+    echo "bravo groups"
+    two_workspaces_groups bravo | sed 's/^/  /'
+    echo
+    echo "alpha project.json"
+    sed 's/^/  /' "$alpha_dir/c1/.weald/project.json"
+    echo
+    echo "bravo project.json"
+    sed 's/^/  /' "$bravo_dir/c1/.weald/project.json"
+  } >> "$out"
+  [ "${alpha_envelopes:-0}" -ge 1 ] || scenario_fail "the relay workspace published nothing over the socket"
+  [ "${bravo_envelopes:-0}" = "0" ] || scenario_fail "the git workspace reached the relay: $bravo_envelopes envelopes"
+  [ "${bravo_packages:-0}" = "0" ] || scenario_fail "the git workspace left $bravo_packages key packages with the relay"
+
+  echo "TWO WORKSPACES LIVE, no crossing: alpha $alpha_id on the relay, bravo $bravo_id on git" \
+    | tee -a "$out"
+}
+
+# --- step 24: two workspaces, two devices, four combinations -----------------
+#
+# Step 22 proved two workspaces can be live at once. This proves the case a person
+# actually has: one person, two Macs, and more than one customer. Two workspaces
+# times two devices is four `<device, workspace>` pairs, and the gate in
+# phases-app.md asks for all four converging. Convergence has to be *inside* each
+# workspace and nowhere across, which is why the digests are compared in both
+# directions: equal within a workspace, different between them.
+#
+# The second half is the lapsed subscription. `WEALD_RELAY_WRITE_MODE=read_only` is
+# the relay's own vendor-neutral maintenance mode, which is exactly what a suspended
+# instance runs in (`specs/backend/cloud/billing.md`, day 14: reads and export
+# continue, writes are refused). The relay is restarted into it here rather than
+# faked, because the claim being proved is what a real refusal does to a real client:
+# the record settles in the working tree, the other device still receives it, and
+# nothing about the app becomes unlicensed.
+two_devices_state() {
+  local home="$1" instance="$2"
+  WEALD_CLIENTS_DIR="$STACK_STATE/ws-$home/clients" "$ROOT/scripts/weald-client" "$instance" state
+}
+
+two_devices_relay_envelopes() {
+  relay_psql "select count(*) from relay_envelope e join relay_group g on g.group_id = e.group_id \
+              where g.workspace_id = '$1'" | tr -d '[:space:]'
+}
+
+scenario_two_devices() {
+  local out="$STEP24_OUT/two-workspaces-two-devices.txt"
+  mkdir -p "$STEP24_OUT"
+
+  # A previous run that failed inside the suspended half left the relay in
+  # read_only, and then every convergence assertion below fails for the wrong
+  # reason. Start from full write mode whatever the last run did.
+  case "$(curl -s "http://127.0.0.1:$RELAY_OBSERVABILITY_PORT/readyz")" in
+    *'"write_mode":"read_only"'*)
+      relay_stop
+      relay_start || scenario_fail "the relay did not restart in full write mode"
+      ;;
+  esac
+
+  two_workspaces_bind alpha relay,relay
+  two_workspaces_bind delta dual,dual
+  local alpha_id delta_id
+  alpha_id="$(cat "$STACK_STATE/ws-alpha/clients/workspace-id")"
+  delta_id="$(cat "$STACK_STATE/ws-delta/clients/workspace-id")"
+  [ "$alpha_id" != "$delta_id" ] || scenario_fail "two workspaces were bound under one id"
+
+  # The four combinations, each device writing into its own workspace and each round
+  # alternating, the way `scenario_catchup` alternates: one instance founds the
+  # groups on its first round and the other joins on its next, so a device is never
+  # asked to found a group a sibling process is founding at the same moment. The
+  # third round is what carries the second device's own records back to the first.
+  local home instance alpha_round delta_round
+  for home in alpha delta; do
+    two_workspaces_client "$home" c1 send "c1 in $home" >/dev/null
+    two_workspaces_client "$home" c1 --seconds 30 sync >/dev/null
+    two_workspaces_client "$home" c2 send "c2 in $home" >/dev/null
+    two_workspaces_client "$home" c2 --seconds 30 sync >/dev/null
+    two_workspaces_client "$home" c1 --seconds 30 sync >/dev/null
+    # The last round is kept, not discarded. Its `alarms` field is the answer to
+    # "did this workspace's own log verify before anything was suspended", and a
+    # later alarm count means nothing without it.
+    if [ "$home" = alpha ]; then
+      alpha_round="$(two_workspaces_client "$home" c2 --seconds 30 sync 2>/dev/null)"
+    else
+      delta_round="$(two_workspaces_client "$home" c2 --seconds 30 sync 2>/dev/null)"
+    fi
+  done
+
+  # The dual workspace moves on both tiers, which is the point of binding it dual:
+  # its git half is what solo mode falls back to below.
+  for instance in c1 c2; do
+    two_workspaces_client delta "$instance" push
+  done
+  for instance in c1 c2; do
+    two_workspaces_client delta "$instance" pull
+  done
+
+  local a1 a2 d1 d2
+  a1="$(two_devices_state alpha c1)"; a2="$(two_devices_state alpha c2)"
+  d1="$(two_devices_state delta c1)"; d2="$(two_devices_state delta c2)"
+  {
+    echo "# Two workspaces, two devices for one person, four combinations"
+    echo
+    echo "alpha  $alpha_id  relay"
+    echo "delta  $delta_id  dual"
+    echo
+    printf 'alpha c1  %s\nalpha c2  %s\ndelta c1  %s\ndelta c2  %s\n\n' "$a1" "$a2" "$d1" "$d2"
+    echo "## The last round of each, before anything was suspended"
+    echo
+    printf 'alpha  %s\n\ndelta  %s\n\n' "$alpha_round" "$delta_round"
+    echo "Both rounds carry alarms, and they predate everything below, which is why"
+    echo "they are printed here rather than left to be discovered under the suspended"
+    echo "relay. \`audit\` names them: \"no content key for group ... at epoch 0\". A"
+    echo "second device joins at epoch 1 and holds no key for the epoch its sibling"
+    echo "wrote in, so it receives the record and cannot read it. That is the history"
+    echo "key path (\`specs/backend/relay/groups.md\`), which belongs to step 8 and the"
+    echo "verification surfaces in step 12, not to this step: what step 24 asserts is"
+    echo "that the four combinations converge on one state per workspace and on no"
+    echo "state across them, and the digests above are that assertion. Recorded as an"
+    echo "open item rather than absorbed."
+    echo
+  } > "$out"
+
+  # Convergence inside each workspace: both devices hold both messages and agree.
+  local combination
+  for combination in "alpha c1 $a1" "alpha c2 $a2" "delta c1 $d1" "delta c2 $d2"; do
+    set -- $combination
+    local state; state="$(two_devices_state "$1" "$2")"
+    [ "$(field "$state" chat)" = "2" ] || \
+      scenario_fail "$1 $2 holds $(field "$state" chat) records, not the two its workspace wrote"
+  done
+  [ "$(field "$a1" digest)" = "$(field "$a2" digest)" ] || \
+    scenario_fail "the two devices in alpha did not converge"
+  [ "$(field "$d1" digest)" = "$(field "$d2" digest)" ] || \
+    scenario_fail "the two devices in delta did not converge"
+  # And no convergence across them, which is the same assertion read the other way.
+  [ "$(field "$a1" digest)" != "$(field "$d1" digest)" ] || \
+    scenario_fail "two workspaces converged on one state, which is one workspace"
+
+  # A device is <device, workspace>: the same instance name in two workspaces is two
+  # unrelated keys, so two customers cannot tell they share a contractor.
+  for instance in c1 c2; do
+    ! cmp -s "$STACK_STATE/ws-alpha/clients/$instance/.weald-instance/device.key" \
+             "$STACK_STATE/ws-delta/clients/$instance/.weald-instance/device.key" 2>/dev/null || \
+      scenario_fail "$instance holds one device key in both workspaces"
+  done
+  local shared_groups
+  shared_groups="$(comm -12 <(two_workspaces_groups alpha) <(two_workspaces_groups delta) | wc -l | tr -d ' ')"
+  [ "$shared_groups" = "0" ] || scenario_fail "$shared_groups group ids are shared between workspaces"
+
+  # --- the lapsed subscription ---------------------------------------------
+  local before after
+  before="$(two_devices_relay_envelopes "$delta_id")"
+  relay_stop
+  WEALD_STACK_WRITE_MODE=read_only relay_start || scenario_fail "the relay did not restart read-only"
+  # The relay's own statement about itself, machine readable, from the endpoint an
+  # operator reads. Asserted rather than assumed, because everything below is only
+  # interesting if the relay really is in the mode a suspended instance runs in.
+  local readyz
+  readyz="$(curl -s "http://127.0.0.1:$RELAY_OBSERVABILITY_PORT/readyz")"
+  case "$readyz" in
+    *'"write_mode":"read_only"'*'"write_mode_reason":"service_read_only"'*) ;;
+    *) scenario_fail "the relay did not report read_only/service_read_only: $readyz" ;;
+  esac
+
+  two_workspaces_client delta c1 send "written while the relay was suspended" >/dev/null
+  local suspended_round
+  suspended_round="$(two_workspaces_client delta c1 --seconds 15 sync 2>/dev/null || true)"
+  [ "$(field "$suspended_round" readonly)" = "yes" ] || \
+    scenario_fail "the client did not notice the relay was read-only: $suspended_round"
+  [ "$(field "$suspended_round" connected)" = "yes" ] || \
+    scenario_fail "a suspended relay dropped the client instead of serving reads"
+  after="$(two_devices_relay_envelopes "$delta_id")"
+  [ "$after" = "$before" ] || \
+    scenario_fail "a read-only relay accepted $((after - before)) envelopes"
+
+  # Solo mode, stated as the two facts that matter: the record is not lost, and the
+  # other device still gets it. Over the working tree, with the relay refusing.
+  local suspended; suspended="$(two_devices_state delta c1)"
+  [ "$(field "$suspended" chat)" = "3" ] || \
+    scenario_fail "the suspended workspace lost the line it wrote: $(field "$suspended" chat)"
+  two_workspaces_client delta c1 push
+  two_workspaces_client delta c2 pull
+  local peer; peer="$(two_devices_state delta c2)"
+  [ "$(field "$peer" chat)" = "3" ] || \
+    scenario_fail "the second device did not receive over the working tree: $(field "$peer" chat)"
+
+  relay_stop
+  relay_start || scenario_fail "the relay did not come back in full write mode"
+  two_workspaces_client delta c1 --seconds 30 sync >/dev/null
+  local restored; restored="$(two_devices_relay_envelopes "$delta_id")"
+  [ "$restored" -gt "$before" ] || \
+    scenario_fail "the workspace did not resume writing once the relay was writable"
+
+  {
+    echo "## The lapsed subscription, against a relay in read_only"
+    echo
+    echo "relay envelopes before   $before"
+    echo "relay envelopes while suspended  $after (refused, service_read_only)"
+    echo "the client's own round while suspended  $suspended_round"
+    echo "relay envelopes after restore    $restored"
+    echo
+    echo "delta c1 while suspended  $suspended"
+    echo "delta c2 after a working-tree round  $peer"
+    echo
+    echo "The client kept the record, the second device received it over the working"
+    echo "tree, and nothing about the app became unlicensed."
+  } >> "$out"
+
+  echo "FOUR COMBINATIONS CONVERGED, and a suspended relay degraded to solo mode" \
+    | tee -a "$out"
+}
+
+# A workspace id the Swift suite can use, with its groups already registered.
+#
+# The suite cannot provision a group itself: provisioning is a database write the
+# control plane owns and a test that reached into Postgres would be a test that had
+# to know the relay's schema. So the harness mints an id, registers its groups, and
+# writes the pair where the suite can find it. A run with no harness finds no file
+# and skips, which the gate then catches, because `xcresult-require.py` demands the
+# named test *passed* and a skip is not a pass.
+cmd_register() {
+  local fresh=0 id="${WEALD_WORKSPACE_ID}-suite"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fresh) fresh=1; shift ;;
+      --id) id="$2"; shift 2 ;;
+      *) echo "weald-stack register: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || { echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2; exit 1; }
+  client_build
+  local bin; bin="$(client_binary)"
+  [ "$fresh" -eq 1 ] && id="${id}-$(date +%s)"
+
+  mkdir -p "$STACK_STATE"
+  local scratch
+  scratch="$(mktemp -d -t weald-register.XXXXXX)"
+  "$bin" relay-client --workspace "$scratch" --workspace-id "$id" init >/dev/null
+  WEALD_WORKSPACE_ID="$id" clients_register_groups "$bin" "$scratch"
+  rm -rf "$scratch"
+
+  {
+    echo "WEALD_RELAY_URL=$(relay_ws_url)"
+    echo "WEALD_SUITE_WORKSPACE=$id"
+  } > "$STACK_STATE/suite.env"
+  echo
+  echo "wrote $STACK_STATE/suite.env"
+  cat "$STACK_STATE/suite.env"
+}
+
+# The demo: a workspace the real Mac app opens, with teammates already in it.
+#
+# Everything above proves the transport against processes. This proves it against
+# the product, which is a different claim and the one a person can see: the app's
+# own chat panel, showing messages that arrived over a socket from somebody else,
+# beside an indicator that says which transport carried them and that they are not
+# encrypted yet.
+#
+# The workspace is a real directory under the scan root and is registered with the
+# app the way the Import button registers one, so nothing here is a special path the
+# shipped build would not take.
+DEMO_DIR="${WEALD_DEMO_DIR:-$HOME/dev/weald-relay-demo}"
+DEMO_BUNDLE_ID="com.dicyanin.weald.app"
+
+cmd_demo() {
+  local peers=2 seed=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --peers) peers="$2"; shift 2 ;;
+      --no-seed) seed=0; shift ;;
+      --dir) DEMO_DIR="$2"; shift 2 ;;
+      *) echo "weald-stack demo: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || cmd_up --budget 180
+  client_build
+  local bin; bin="$(client_binary)"
+
+  local workspace_id="weald-demo"
+  mkdir -p "$DEMO_DIR"
+  [ -d "$DEMO_DIR/.git" ] || git init --quiet --initial-branch=main "$DEMO_DIR"
+  if [ ! -f "$DEMO_DIR/.gitignore" ]; then
+    printf '.weald-instance/\n.weald/relay/\n' > "$DEMO_DIR/.gitignore"
+  fi
+  # The app's own workspace, on both transports. Dual rather than relay-only so the
+  # demo shows the migration's actual shape and so the tree stays readable.
+  "$bin" relay-client --workspace "$DEMO_DIR" --workspace-id "$workspace_id" \
+    --handle "$(whoami)" --selection dual --relay "$(relay_ws_url)" init >/dev/null
+  WEALD_WORKSPACE_ID="$workspace_id" clients_register_groups "$bin" "$DEMO_DIR"
+
+  # Registered with the app exactly as the Import button registers one.
+  python3 - "$DEMO_DIR" "$DEMO_BUNDLE_ID" <<'PY'
+import subprocess, sys
+path, bundle = sys.argv[1], sys.argv[2]
+key = "weald.importedProjectPaths"
+try:
+    current = subprocess.run(
+        ["defaults", "read", bundle, key],
+        capture_output=True, text=True, check=True,
+    ).stdout
+except subprocess.CalledProcessError:
+    current = ""
+if path in current:
+    print("already imported %s" % path)
+else:
+    subprocess.run(["defaults", "write", bundle, key, "-array-add", path], check=True)
+    print("imported %s" % path)
+PY
+
+  # The teammates. Separate processes with separate device keys, which is what makes
+  # what the app receives genuinely somebody else's.
+  local i
+  for (( i = 1; i <= peers; i++ )); do
+    local name="peer$i"
+    local dir="$CLIENTS_DIR/$name"
+    mkdir -p "$dir"
+    "$bin" relay-client --workspace "$dir" --workspace-id "$workspace_id" \
+      --handle "$name" --machine "$name" --selection relay \
+      --relay "$(relay_ws_url)" init >/dev/null
+    mkdir -p "$dir/.weald-instance"
+    echo relay > "$dir/.weald-instance/selection"
+    note "peer" "$name, $dir"
+  done
+  echo "$workspace_id" > "$CLIENTS_DIR/workspace-id"
+
+  if [ "$seed" -eq 1 ]; then
+    for (( i = 1; i <= peers; i++ )); do
+      local name="peer$i"
+      "$ROOT/scripts/weald-client" "$name" send "hello from $name, over the relay" >/dev/null
+      "$ROOT/scripts/weald-client" "$name" ticket --id "DEMO-$i" \
+        --title "written by $name on another machine" \
+        --body "This ticket reached your board over the relay, not over git." >/dev/null
+      "$ROOT/scripts/weald-client" "$name" --seconds 30 sync >/dev/null
+    done
+  fi
+
+  echo
+  echo "demo workspace  $DEMO_DIR"
+  echo "relay           $(relay_ws_url)"
+  echo "peers           $peers, in $CLIENTS_DIR"
+  echo
+  echo "Open Weald. The workspace appears in the sidebar, its chat holds the peers'"
+  echo "messages and its board holds their tickets. Settings shows the transport and"
+  echo "says content is not encrypted yet."
+  echo
+  echo "Send more from a teammate with:"
+  echo "  scripts/weald-client peer1 send 'and another' && scripts/weald-client peer1 sync"
+}
+
+cmd_scenario() {
+  local name="${1:-}"
+  shift || true
+  require_daemon
+  relay_answers || { echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2; exit 1; }
+  case "$name" in
+    converge) scenario_converge ;;
+    catchup) scenario_catchup ;;
+    fork) scenario_fork ;;
+    rollback) scenario_rollback ;;
+    two-workspaces) scenario_two_workspaces ;;
+    two-devices) scenario_two_devices ;;
+    compaction) scenario_compaction ;;
+    digest-mismatch) scenario_digest_mismatch ;;
+    all)
+      scenario_converge
+      scenario_catchup
+      scenario_fork
+      scenario_rollback
+      scenario_two_workspaces
+      scenario_two_devices
+      scenario_compaction
+      ;;
+    *)
+      echo "weald-stack scenario NAME, one of: converge, catchup, fork, rollback, two-workspaces, two-devices, compaction, all" >&2
+      exit 64
+      ;;
+  esac
+}
+
+clients_stop() {
+  [ -d "$CLIENTS_DIR" ] || return 0
+  local pidfile pid
+  for pidfile in "$CLIENTS_DIR"/*/instance.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  done
+}
+
+clients_status() {
+  [ -d "$CLIENTS_DIR" ] || return 0
+  local dir name pid state
+  for dir in "$CLIENTS_DIR"/*/; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+    pid="$(cat "$dir/instance.pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      state="running, pid $pid"
+    else
+      state="stopped"
+    fi
+    note "client $name" "$(cat "$dir/.weald-instance/selection" 2>/dev/null || echo git), $state"
+  done
+}
+
+wait_healthy() {
+  local deadline=$((SECONDS + 120)) unhealthy
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    unhealthy=""
+    for svc in "${INFRA_SERVICES[@]}"; do
+      local cid state
+      cid="$(dc ps -q "$svc" 2>/dev/null || true)"
+      if [ -z "$cid" ]; then unhealthy="$unhealthy $svc(absent)"; continue; fi
+      state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo unknown)"
+      case "$state" in
+        healthy|running) ;;
+        *) unhealthy="$unhealthy $svc($state)" ;;
+      esac
+    done
+    [ -z "$unhealthy" ] && return 0
+    sleep 0.25
+  done
+  echo "weald-stack: not healthy after 120s:$unhealthy" >&2
+  return 1
+}
+
+cmd_up() {
+  local relay_only=0 budget=90
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --relay) relay_only=1; shift ;;
+      --budget) budget="$2"; shift 2 ;;
+      *) echo "weald-stack up: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  mkdir -p "$STACK_STATE"
+
+  local start elapsed
+  start="$(now_ms)"
+  echo "weald-stack up"
+
+  # Real infrastructure. No credentials: every value in the compose file is a
+  # local-only literal, which is what lets an auditor run this on arrival.
+  dc up -d --wait --wait-timeout 120 "${INFRA_SERVICES[@]}" >/dev/null
+  wait_healthy
+  for svc in "${INFRA_SERVICES[@]}"; do note "$svc" "healthy"; done
+
+  # The relay. Built from source, TLS off, loopback only.
+  relay_start || true
+
+  # Enrol the relay's own workspace if it has never been enrolled. A relay with a
+  # genesis key nobody has redeemed is a relay nobody can join, and every artifact
+  # that reads the transparency log would read an empty table. Skipped in one line
+  # once it is done, because the key is destroyed at redemption and there is no
+  # second one.
+  if [ "$(genesis_state)" != "redeemed" ]; then
+    cmd_enrol >/dev/null 2>&1 || note "enrolment" "not done; scripts/weald-stack enrol --reset"
+  fi
+
+  if [ "$relay_only" -eq 0 ]; then
+    if [ -f "$ROOT/backend/weald-cloud/next.config.ts" ]; then
+      note "weald-cloud" "next dev on 127.0.0.1:$WEALD_STACK_CLOUD_PORT"
+    elif [ -f "$ROOT/backend/weald-cloud/src/boot/control-plane.ts" ]; then
+      # Steps 14, 15 and 17 are green and there is a boot path, so the control
+      # plane can be stood up and driven. What it does not have is an HTTP
+      # surface, which is step 18: saying "no server yet" would understate it
+      # and saying "serving" would overstate it.
+      note "weald-cloud" "boots and drives via scripts/weald-dev. No HTTP surface (step 18)."
+    else
+      note "weald-cloud" "no boot path yet (step 14). Package builds and its coverage runs."
+    fi
+    if [ -f "$ROOT/Sources/Tools/RelayClient/main.swift" ]; then
+      note "clients" "weald-stack clients N stands up N supervised instances"
+    elif [ -d "$ROOT/Sources/Sync" ]; then
+      note "clients" "seam present (step 1). Relay-backed instances arrive in step 5."
+    else
+      note "clients" "no transport seam yet (step 1)."
+    fi
+  fi
+
+  elapsed=$(( ($(now_ms) - start) ))
+  local seconds
+  seconds="$(python3 -c "print(f'{$elapsed/1000:.1f}')")"
+  echo
+  echo "up in ${seconds}s (budget ${budget}s)"
+  {
+    echo "stack_up_seconds=$seconds"
+    echo "budget_seconds=$budget"
+    echo "measured=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "services=${INFRA_SERVICES[*]}"
+  } > "$STACK_STATE/last-up.txt"
+
+  if python3 -c "import sys; sys.exit(0 if $elapsed/1000 <= $budget else 1)"; then
+    echo "WITHIN BUDGET"
+  else
+    echo "OVER BUDGET: cold start is a gate in step 0 and it degrades the moment nobody measures it." >&2
+    exit 1
+  fi
+}
+
+# The fixture workspace, generated deterministically from a seed. Tiered: the
+# full shape in local-harness.md needs envelopes, epochs and encrypted media,
+# which arrive in steps 2, 7 and 9, so the generator produces the tier the tree
+# can produce and the tier is recorded beside the hash. A number measured on one
+# tier is not comparable to a number measured on another, and the loop refuses to
+# compare them.
+cmd_fixture() {
+  local tier=human seed=20260729 scale=1.0 out="$ROOT/.weald-fixture"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tier) tier="$2"; shift 2 ;;
+      --seed) seed="$2"; shift 2 ;;
+      --scale) scale="$2"; shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      *) echo "weald-stack fixture: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  python3 "$ROOT/scripts/weald-fixture.py" --out "$out/$tier" --tier "$tier" \
+    --seed "$seed" --scale "$scale" --force
+  echo
+  echo "Record it with:"
+  echo "  scripts/backend-build.sh --fixture <hash> $seed"
+}
+
+cmd_status() {
+  require_daemon
+  echo "weald-stack status"
+  dc ps --format 'table {{.Service}}\t{{.Status}}\t{{.Publishers}}' 2>/dev/null || true
+  echo
+  note "postgres" "postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack"
+  note "minio" "http://127.0.0.1:$WEALD_STACK_MINIO_PORT (console $WEALD_STACK_MINIO_CONSOLE_PORT)"
+  note "redis" "redis://127.0.0.1:$WEALD_STACK_REDIS_PORT"
+  note "mailpit" "smtp 127.0.0.1:$WEALD_STACK_SMTP_PORT, ui http://127.0.0.1:$WEALD_STACK_MAILPIT_UI_PORT"
+  if relay_answers; then
+    note "wealdrelay" "$(relay_ws_url) (pid $(relay_pid 2>/dev/null || echo unknown))"
+  else
+    note "wealdrelay" "not serving. scripts/weald-stack up"
+  fi
+  clients_status
+  if [ -f "$STACK_STATE/last-up.txt" ]; then
+    echo
+    cat "$STACK_STATE/last-up.txt"
+  fi
+}
+
+cmd_down() {
+  require_daemon
+  local volumes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --volumes) volumes=1; shift ;;
+      *) echo "weald-stack down: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  # The relay first. It holds connections to Postgres, and tearing the database
+  # out from under a live process turns an orderly shutdown into a log full of
+  # connection errors that mean nothing.
+  relay_stop
+  clients_stop
+  if [ "$volumes" -eq 1 ]; then
+    dc down --volumes --remove-orphans
+    rm -rf "$STACK_STATE/blobs" "$STACK_STATE/clients"
+  else
+    dc down --remove-orphans
+  fi
+}
+
+# weald-stack kill client --at POINT
+#
+# A real process death at a named point in the write transaction, and a second
+# process that comes back to look at what the first one left. The suite's crash
+# matrix injects a throw and asserts in one process, which is the only way one
+# process can do both; this is the other half of the same proof, where the writer
+# actually dies by SIGKILL and never runs another line.
+#
+# `relay` is accepted as a target name and refused until step 3: there is no relay
+# process to kill yet, and reporting that is more useful than killing something
+# else and calling it the relay.
+cmd_kill() {
+  local target="${1:-client}"
+  shift || true
+  local point=""
+  local workspace=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --at) point="$2"; shift 2 ;;
+      --workspace) workspace="$2"; shift 2 ;;
+      *) echo "weald-stack kill: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  case "$target" in
+    client) ;;
+    relay) not_yet "killing the relay process" "3, with the relay binary" ;;
+    *) echo "weald-stack kill: unknown target: $target (client, relay)" >&2; exit 64 ;;
+  esac
+  local points="beforeReserve afterReserve duringAppend afterAppend"
+  if [ -z "$point" ]; then
+    echo "weald-stack kill client --at POINT, one of: $points" >&2
+    exit 64
+  fi
+  local cleanup=0
+  if [ -z "$workspace" ]; then
+    workspace="$(mktemp -d -t weald-kill.XXXXXX)"
+    cleanup=1
+  fi
+
+  echo "kill client --at $point"
+  echo "workspace $workspace"
+  echo
+  # The writer. Expected to die by signal, so its exit status is checked for
+  # exactly that: an orderly exit here would mean the kill did not happen and the
+  # proof would be of nothing.
+  set +e
+  scripts/fixture-log.sh --workspace "$workspace" --crash-write --at "$point" --hard
+  local status=$?
+  set -e
+  if [ "$status" -lt 128 ]; then
+    echo "the writer exited $status rather than dying by signal" >&2
+    [ "$cleanup" -eq 1 ] && rm -rf "$workspace"
+    exit 1
+  fi
+  echo "writer died by signal $((status - 128)), as intended"
+  echo
+
+  # A different process, over the same disk.
+  echo "recovery, in a new process:"
+  if ! scripts/fixture-log.sh --workspace "$workspace" --recover; then
+    echo "recovery failed after a kill at $point" >&2
+    [ "$cleanup" -eq 1 ] && rm -rf "$workspace"
+    exit 1
+  fi
+  [ "$cleanup" -eq 1 ] && rm -rf "$workspace"
+}
+
+# Register group ids into a workspace, and nothing else.
+#
+#   scripts/weald-stack provision --id WS --group HEX [--group HEX ...]
+#
+# `register` exists for the one suite workspace and builds the client to derive its
+# group ids. This is the same insert without either: a caller that already knows its
+# ids, which is any live test holding `GroupID.derive`, needs a workspace it can
+# bootstrap on its own rather than a shared one.
+#
+# It deliberately does not publish an access set. A workspace with no set admits its
+# first device into `Bootstrapping`, and publishing the genesis set from there is the
+# client behaviour `specs/backend/relay/wire.md` describes and step 6's suite has to
+# exercise. A harness that published it would have taken that path away from the test
+# and proved it about bash instead.
+cmd_provision() {
+  local id="" groups=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --group) groups+=("$2"); shift 2 ;;
+      *) echo "weald-stack provision: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  [ -n "$id" ] || { echo "weald-stack provision: --id is required" >&2; exit 64; }
+  [ "${#groups[@]}" -gt 0 ] || { echo "weald-stack provision: at least one --group" >&2; exit 64; }
+  require_daemon
+  local g
+  for g in "${groups[@]}"; do
+    case "$g" in
+      *[!0-9a-f]* | "") echo "weald-stack provision: --group takes hex: $g" >&2; exit 64 ;;
+    esac
+    [ "${#g}" -eq 64 ] || { echo "weald-stack provision: a group id is 32 bytes: $g" >&2; exit 64; }
+    psql_relay -v ON_ERROR_STOP=1 -q -c \
+      "insert into relay_group (group_id, workspace_id) values (decode('$g','hex'), '$id') on conflict do nothing" \
+      >/dev/null
+  done
+  echo "provisioned $id with ${#groups[@]} group(s)"
+}
+
+# --- prove-blind -------------------------------------------------------------
+#
+# The automated blindness demo from `specs/backend/build/local-harness.md`, and
+# the Blindness part of step 8's gate.
+#
+# Two real client processes exchange messages and tickets carrying tokens this
+# script planted. Then the relay's own Postgres is dumped out of its own
+# container and searched for those tokens in every encoding the database could
+# be holding them in, the recovery wraps are read and checked for a value
+# recurring across two groups, and the evidence lands under build-evidence/step-08.
+#
+# Nothing here is mocked across the trust boundary. The dump is of the database
+# the running relay writes to, after that relay carried this run's traffic. The
+# analysis is `scripts/prove-blind.py`, which begins every run by proving its own
+# detectors can go red, because a blindness proof that cannot fail is worth
+# nothing.
+PROVE_BLIND_EVIDENCE="${WEALD_PROVE_BLIND_EVIDENCE:-$ROOT/build-evidence/step-08/prove-blind}"
+PROVE_BLIND_WORK="$STACK_STATE/prove-blind"
+
+cmd_prove_blind() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --evidence) PROVE_BLIND_EVIDENCE="$2"; shift 2 ;;
+      *) echo "weald-stack prove-blind: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || { echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2; exit 1; }
+
+  local run_id; run_id="$(date +%Y%m%d-%H%M%S)"
+  # The sentinels. Distinct, uppercase and alphanumeric so that a hex or base64
+  # form of one cannot be confused with a hex or base64 form of another, and so
+  # the same token can be handed to grep as a fixed string.
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  local s_c1_msg="PBSENT${nonce}CHATONE"
+  local s_c2_msg="PBSENT${nonce}CHATTWO"
+  local s_ticket_title="PBSENT${nonce}TITLE"
+  local s_ticket_body="PBSENT${nonce}BODY"
+
+  echo "prove-blind $run_id"
+  echo
+  echo "driving real traffic through two client processes"
+  # --fresh, so the envelope count below is this run's traffic and not also the
+  # previous run's. A count that measured two runs at once could not distinguish
+  # "the messages arrived" from "the messages arrived last time".
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  wc_ c1 send "$s_c1_msg" >/dev/null
+  wc_ c1 ticket --id "PB-$nonce" --title "$s_ticket_title" --body "$s_ticket_body" >/dev/null
+  wc_ c1 --seconds 30 sync >/dev/null
+  wc_ c2 send "$s_c2_msg" >/dev/null
+  wc_ c2 --seconds 30 sync >/dev/null
+  # A second round each way, because a sentinel that only ever sat in its
+  # author's own checkout would prove nothing about what the relay carried.
+  wc_ c1 --seconds 30 sync >/dev/null
+  wc_ c2 --seconds 30 sync >/dev/null
+
+  local workspace_id; workspace_id="$(cat "$CLIENTS_DIR/workspace-id")"
+  note "workspace" "$workspace_id"
+
+  local bin; bin="$(client_binary)"
+  mkdir -p "$PROVE_BLIND_WORK"
+  local manifest="$PROVE_BLIND_WORK/manifest.json"
+  {
+    printf '{\n'
+    printf '  "run_id": "%s",\n' "$run_id"
+    printf '  "workspace_id": "%s",\n' "$workspace_id"
+    printf '  "expected_envelopes": 3,\n'
+    printf '  "client_dirs": {"c1": "%s", "c2": "%s"},\n' "$CLIENTS_DIR/c1" "$CLIENTS_DIR/c2"
+    printf '  "sentinels": [\n'
+    printf '    {"name": "c1-chat", "value": "%s"},\n' "$s_c1_msg"
+    printf '    {"name": "c2-chat", "value": "%s"},\n' "$s_c2_msg"
+    printf '    {"name": "ticket-title", "value": "%s"},\n' "$s_ticket_title"
+    printf '    {"name": "ticket-body", "value": "%s"}\n' "$s_ticket_body"
+    printf '  ],\n'
+    printf '  "groups": [\n'
+    local first=1 id scope
+    while read -r id scope; do
+      [ -n "$id" ] || continue
+      [ "$first" -eq 1 ] || printf ',\n'
+      first=0
+      printf '    {"id": "%s", "scope": "%s"}' "$id" "$scope"
+    done < <("$bin" relay-client --workspace "$CLIENTS_DIR/c1" \
+               --workspace-id "$workspace_id" groups)
+    printf '\n  ]\n}\n'
+  } > "$manifest"
+
+  echo
+  python3 "$ROOT/scripts/prove-blind.py" \
+    --container "$(dc ps -q postgres)" \
+    --db weald_relay_stack \
+    --manifest "$manifest" \
+    --evidence "$PROVE_BLIND_EVIDENCE" \
+    --work "$PROVE_BLIND_WORK"
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    up) cmd_up "$@" ;;
+    status) cmd_status "$@" ;;
+    down) cmd_down "$@" ;;
+    clients) cmd_clients "$@" ;;
+    scenario) cmd_scenario "$@" ;;
+    register) cmd_register "$@" ;;
+    provision) cmd_provision "$@" ;;
+    demo) cmd_demo "$@" ;;
+    kill) cmd_kill "$@" ;;
+    dump) not_yet "the envelope dump" "3, with the relay's schema" ;;
+    fixture) cmd_fixture "$@" ;;
+    enrol) cmd_enrol "$@" ;;
+    prove-blind) cmd_prove_blind "$@" ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) echo "weald-stack: unknown command: $cmd" >&2; exit 64 ;;
+  esac
+}
+
+main "$@"

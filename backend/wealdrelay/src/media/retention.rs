@@ -182,9 +182,9 @@ struct Control {
 /// re-signs its own genesis record computes a different digest, so the epoch-1
 /// record it publishes names a predecessor the relay has never held and the chain
 /// can never advance past epoch zero. The fix is that a client publishes the
-/// record it published before, byte for byte, persisting the signed bytes rather
-/// than re-signing them, which makes a retransmission identical and leaves this
-/// check free to catch the thing it is for.
+/// record it published before, byte for byte
+/// (`Sources/Sync/RetentionKeyStore.swift`), which makes a retransmission
+/// identical and leaves this check free to catch the thing it is for.
 pub fn is_the_same_control(
     existing_verifier: &[u8],
     existing_prev: Option<&[u8]>,

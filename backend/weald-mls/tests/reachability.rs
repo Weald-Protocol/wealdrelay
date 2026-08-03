@@ -8,14 +8,15 @@
 //! not break a single thing a person would notice. It breaks the day somebody loses their
 //! laptop, and by then the evidence is a year old.
 //!
-//! What is asserted here:
+//! What is asserted here, in the words of `specs/backend/build/phases-relay.md` step 7:
 //!
-//! - After any interleaving of commits, a recovery key locates and opens a wrap for every
-//!   group its owner belongs to, using only the tag directory.
-//! - A principal self-joining an `open` group obtains the same history an invitee obtains.
-//! - A new invitee first external-commits into the mandatory workspace-root scope, then
-//!   self-joins its `parent` channels. Omission of the root from a non-bootstrap invite
-//!   and any attempt to self-join the root are rejected before MLS state changes.
+//! - "after any interleaving of commits, a recovery key locates and opens a wrap for
+//!   every group its owner belongs to using only the tag directory"
+//! - "a principal self-joining an `open` group obtains the same history an invitee
+//!   obtains"
+//! - "A new invitee first external-commits into the mandatory workspace-root scope, then
+//!   self-joins its `parent` channels; omission of the root from a non-bootstrap invite
+//!   and any attempt to self-join the root are rejected before MLS state changes."
 //!
 //! "Using only the tag directory" is the part that carries the weight, so the recovering
 //! side of every case here is written as a fresh device that holds a recovery phrase and
@@ -287,8 +288,8 @@ fn the_relay_never_sees_a_stable_recovery_identifier_across_groups() {
 
     // Every tag in the whole table is distinct. Ada appears in three groups and Bo in
     // three, and if any value recurred the relay would have a join key. This is the same
-    // assertion `scripts/weald-stack prove-blind` makes against the real wrap table in a
-    // running deployment, made here against the mechanism that produces it.
+    // assertion `weald-stack prove-blind` makes against the real wrap table in step 8,
+    // made here against the mechanism that produces it.
     let mut all: Vec<[u8; 32]> = tags_by_group.iter().flatten().copied().collect();
     let count = all.len();
     all.sort_unstable();
@@ -367,10 +368,10 @@ fn a_self_joiner_to_an_open_group_obtains_the_same_history_an_invitee_obtains() 
 
 #[test]
 fn the_root_scope_is_mandatory_on_the_way_in_and_closed_to_a_self_join() {
-    // The rule: a new invitee first external-commits into the mandatory workspace-root
-    // scope, then self-joins its `parent` channels. Omission of the root from a
-    // non-bootstrap invite, and any attempt to self-join the root, are rejected before
-    // MLS state changes.
+    // `phases-relay.md` step 7: "A new invitee first external-commits into the mandatory
+    // workspace-root scope, then self-joins its `parent` channels; omission of the root
+    // from a non-bootstrap invite and any attempt to self-join the root are rejected
+    // before MLS state changes."
     //
     // The ordering rule is the product's, so what this crate owns is the second half:
     // whether a refusal happens before any MLS state moves. That is the part a caller

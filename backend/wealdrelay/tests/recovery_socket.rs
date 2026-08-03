@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! `WRAP` over a real socket: what the relay accepts, refuses, and learns.
 //!
-//! The proof that recovery wraps reach the relay by a path that works when the
+//! Step 8's proof that recovery wraps reach the relay by a path that works when the
 //! encryption claim is true. The pure rules are in `src/recovery`, the transaction
 //! is `tests/recovery_store.rs`; what only a relay can prove is here.
 //!
@@ -231,8 +231,7 @@ async fn what_the_relay_holds_after_two_groups_have_published_is_slots_and_ciphe
     assert_ne!(tags[0], tags[1], "the same value indexed both groups");
 
     // The cross-group join, run as a query rather than asserted in prose. This is
-    // the same measurement `scripts/weald-stack prove-blind` makes over the whole
-    // database.
+    // the same measurement `scripts/prove-blind.py` makes over the whole database.
     let shared: i64 = sqlx::query_scalar(
         "select count(*) from (select tag from relay_recovery_wrap \
          group by tag having count(distinct group_id) > 1) as shared",
@@ -363,9 +362,8 @@ async fn a_relay_that_cannot_write_the_wrap_tells_the_client_to_retry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_no_workspace_claim_may_not_reach_a_group_at_all() {
     // `WEALD_RELAY_ACCESS_SET=off` is the one ci diagnostic mode where a device is
-    // admitted without a workspace being established. It exists only so that
-    // `/readyz` can report the difference, and is never set outside local and ci
-    // runs, which reach no vendor at all. A session in that state
+    // admitted without a workspace being established, and `environments.md` allows
+    // it so that `/readyz` can report the difference. A session in that state
     // carries no workspace, so no group can be shown to belong to it, and every
     // group-addressed frame is refused rather than admitted by default. Without
     // this test that arm is unreachable code nobody has run.

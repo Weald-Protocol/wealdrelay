@@ -1,5 +1,14 @@
 # Relay: media transfer
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 How an encrypted blob gets to object storage, back out again, and eventually
 deleted. `specs/backend/relay/groups.md` specifies the cryptography. This
 specifies the transfer, the quota, and the garbage collection, none of which
@@ -61,7 +70,7 @@ does not work.
 Presigned URLs are per request and never cached server-side, so a leaked URL
 grants 15 minutes of access to one ciphertext the holder still cannot decrypt.
 
-**Bandwidth.** Downloads are not metered (`specs/backend/hosted-service.md`), but
+**Bandwidth.** Downloads are not metered (`specs/backend/cloud/billing.md`), but
 they are rate limited per device to prevent a compromised access-set entry from
 being used to drain a bucket at our expense: 50 blob requests per minute, 5 GB
 per device per day, both raisable per instance.
@@ -176,8 +185,7 @@ one.
    advancing. Ed25519 is deterministic in RFC 8032 and is not in every
    implementation of it (CryptoKit randomises `Curve25519.Signing`), so a client
    **stores the signed record it published** and retransmits those bytes rather
-   than signing again, which means the retention key store has to keep the
-   signed bytes and not only the key. The relay
+   than signing again. See `Sources/Sync/RetentionKeyStore.swift`. The relay
    stores it as evidence, refuses every retention-driven deletion for that group
    until the conflict clears, and reports the group as frozen on `/readyz` and in
    the client's encryption panel. Every member's client raises a
@@ -237,12 +245,12 @@ could break another's attachment.
 
 Blob sizes, upload and download timing, and which group's retention set names a
 hash. This is the same metadata class already disclosed in
-`specs/backend/hosted-service.md` and it must be listed there explicitly rather
+`specs/backend/cloud/overview.md` and it must be listed there explicitly rather
 than folded into "envelope sizes", because a retention set makes the association
 between a group and a blob visible to us in a way individual envelopes do not.
 
-An operator's own disclosure has to name it. Saying so costs nothing and being
-caught omitting it would cost a great deal.
+Naming that in `/security` costs us nothing and being caught omitting it would
+cost a great deal.
 
 ## Client behaviour
 

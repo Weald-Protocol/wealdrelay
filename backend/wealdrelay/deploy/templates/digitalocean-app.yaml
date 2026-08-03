@@ -9,10 +9,6 @@
 # binding that mints them. Create a Spaces access key and set the two SECRET
 # values before applying, or set WEALD_RELAY_STORAGE_URL to a file:// path on an
 # attached volume instead.
-#
-# Status: the image below is published from the first signed release onwards and
-# not before. Until then, build it yourself with scripts/relay-reproduce.sh and
-# push it somewhere App Platform can pull from.
 
 name: weald-relay
 region: nyc
@@ -24,13 +20,10 @@ services:
     http_port: 8443
     image:
       registry_type: GHCR
-      registry: weald-protocol
+      registry: hunterh37
       repository: weald-relay
-      # RELEASE PIN. The one line in this file to update per release. It is a
-      # release tag and never `latest`: the release workflow publishes no moving
-      # tag, so `latest` would 404. Swap `tag:` for `digest: sha256:...` once you
-      # have verified the digest from the release notes.
-      tag: wealdrelay-v0.1.0
+      # Pinned to a digest at release time.
+      tag: latest
     health_check:
       http_path: /healthz
       initial_delay_seconds: 10
@@ -51,12 +44,6 @@ services:
       - key: AWS_REGION
         scope: RUN_TIME
         value: nyc3
-      # Both of the next two values must be replaced before this spec is
-      # applied. They are not placeholders App Platform will fill in and they
-      # are not optional: applied as written, the relay comes up and then fails
-      # every blob write against Spaces with a 403. Create a Spaces access key
-      # in the DigitalOcean console and paste the pair in, or drop both keys and
-      # point WEALD_RELAY_STORAGE_URL at a file:// path on an attached volume.
       - key: AWS_ACCESS_KEY_ID
         scope: RUN_TIME
         type: SECRET

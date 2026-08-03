@@ -12,15 +12,14 @@
 //!   still a correlation handle, and an info-level log carrying one lets whoever
 //!   reads logs build a picture of which groups are busy.
 //!
-//! On top of that, everything logged passes through a scrubbing layer that drops
-//! anything resembling a token. That is what ``scrub`` is, and it is deliberately
-//! a text-level pass rather than a field allowlist. A field
+//! On top of that, `specs/backend/cloud/control-plane.md` asks for "a scrubbing
+//! layer that drops anything resembling a token". That is what ``scrub`` is, and
+//! it is deliberately a text-level pass rather than a field allowlist. A field
 //! allowlist protects the fields somebody remembered; a text pass also catches the
 //! token that arrived inside an error message from a library nobody audited, which
 //! is where credentials actually leak.
 //!
-//! The rule is proven the negative way: a token planted in a log line must not
-//! survive this layer.
+//! The step 3 negative proof is that a planted token does not survive this.
 
 use std::fmt;
 

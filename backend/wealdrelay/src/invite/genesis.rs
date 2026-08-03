@@ -44,8 +44,8 @@
 //! invites.md calls that publication "the first valid `ACCESS` frame at `version`
 //! 1". The genesis publication is version **0** everywhere else in the system:
 //! `specs/backend/relay/wire.md` writes `prev_hash` as "zero at genesis" and
-//! `access::judge` has always required `version == 0` with an all-zero
-//! `prev_hash`, and that is shipped. "Version 1" reads as "the first version"
+//! `access::judge` has required `version == 0` with an all-zero `prev_hash` since
+//! step 6, which is green and shipped. "Version 1" reads as "the first version"
 //! rather than as a second publication, so the rule implemented here is "the first
 //! accepted set", and invites.md is corrected rather than the four things that
 //! already agree.

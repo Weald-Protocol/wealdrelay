@@ -6,7 +6,8 @@
 //! update and concurrent application messages, asserting that every remaining member
 //! converges to the same document state, and that every removed member fails to decrypt
 //! everything after the removing epoch. Ten thousand cases in CI, a longer soak nightly."
-//! This file is the thing that either passes or blocks a release.
+//! `specs/backend/build/phases-relay.md` step 7 repeats it as a gate item, so this file is
+//! the thing that either passes or blocks the step.
 //!
 //! What is modelled here is a relay and a set of devices, not a set of devices talking
 //! directly. That distinction is the whole reason the suite is interesting. The relay in
@@ -45,8 +46,9 @@
 //! Case count comes from `WEALD_MLS_CASES` and defaults to a number a developer will
 //! tolerate on every `cargo test`. The gate script sets it to 10000. A failing case is
 //! written by proptest itself to `proptest-regressions/churn.txt`, which is a checked-in
-//! file on purpose: a failing seed is pinned forever, and pinning it means committing
-//! that file rather than reading a seed out of a CI log that will be rotated away.
+//! file on purpose: `phases-relay.md` says failing seeds are pinned forever, and pinning
+//! them means committing that file rather than reading a seed out of a CI log that will
+//! be rotated away.
 //!
 //! Real OpenMLS against real SQLite, like everything else in this crate. There is no test
 //! double anywhere here, by the spec's own rule.
@@ -89,7 +91,7 @@ fn cases() -> u32 {
 /// for `lib.rs` or `main.rs` beside the test and, for an integration test in `tests/`,
 /// gives up and drops the file next to the source as `tests/churn.proptest-regressions`.
 /// A path under `proptest-regressions/` is the one people expect to see in a diff, and
-/// a failing seed is pinned forever, which means checked in.
+/// `phases-relay.md` asks for failing seeds pinned forever, which means checked in.
 /// The path is relative to the package root, which is where cargo runs a test binary.
 fn config() -> ProptestConfig {
     ProptestConfig {

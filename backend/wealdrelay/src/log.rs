@@ -34,7 +34,7 @@
 //! suggests, but it is a heap visit and the difference is not nothing at a hundred
 //! thousand rows. `include (hash)` on the seq index would make the original claim
 //! true; whether that is the right change, or whether the whole-group reload should
-//! go, is open, and wants a measurement on a reference machine before either.
+//! go, is WEALD-210, which wants a measurement on the reference machine first.
 //!
 //! The cost that made this worth filing is not one read. It is that the read happens
 //! on **every** reconciliation round, three to five times per reconnecting client,
@@ -48,7 +48,7 @@ use crate::negentropy::Item;
 /// The most items one reconciliation round will load for a group.
 ///
 /// A million, which at 40 bytes a row is 40 MB and covers a corpus far past
-/// anything a real workspace is expected to hold. A group past it
+/// anything `specs/backend/build/local-harness.md` describes. A group past it
 /// reconciles over its newest million and the older tail is reached by
 /// `SUB` with an explicit cursor, which is the case compaction
 /// (`specs/backend/relay/lifecycle.md`) is supposed to prevent from ever arising.

@@ -3,8 +3,8 @@
 //! Two gibibytes of fixture media, through MinIO, over a connection that drops
 //! halfway.
 //!
-//! Tier 5, and the integration proof that 2 GB of fixture media round trips.
-//! `specs/backend/relay/media.md` is explicit about why this test
+//! Tier 5, and the integration half of step 9's gate: "2 GB of fixture media
+//! round trips". `specs/backend/relay/media.md` is explicit about why this test
 //! is the shape it is: "A 2 GiB video over a hotel connection has to survive a
 //! reconnect or the feature does not work." So the client here does not merely
 //! upload a large object; it loses its socket mid-transfer, reconnects, resumes
@@ -476,9 +476,9 @@ async fn two_gibibytes_round_trip_through_a_reconnect_and_finalize_exactly_once(
         "the ciphertext that came back is the ciphertext that went up"
     );
 
-    // Written down rather than only asserted. The timings belong beside the
-    // verdict, because a round trip that finished suspiciously fast is a round
-    // trip that did not happen.
+    // Written down rather than only asserted: `testing.md` asks for the timings
+    // beside the verdict, because a round trip that finished suspiciously fast is
+    // a round trip that did not happen.
     record_timing(
         TOTAL,
         part_count(),
@@ -513,7 +513,7 @@ async fn upload_part(socket: &mut Client, session_id: &[u8], number: u32) {
     assert_eq!(status, 200, "part {number} was refused by the bucket");
 }
 
-/// This run's share of the media artifact, written where it is collected from.
+/// The step 9 artifact's share of this run, written where the gate collects it.
 fn record_timing(
     total: u64,
     parts: u32,

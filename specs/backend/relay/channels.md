@@ -1,5 +1,14 @@
 # Relay: groups people actually get put in
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 `specs/backend/relay/groups.md` specifies MLS group cryptography. It does not say
 which groups exist, who is in them, or how somebody gets added to a group created
 after they joined the workspace. That gap is the whole "send your first message"
@@ -112,8 +121,8 @@ trust root creates:
 | `chan:ws/general` | `parent`, `open`, default | The everybody channel. Where a new joiner's first message lands. |
 | `chan:ws/activity` | `parent`, `open`, default | Agent and CI output, ticket transitions, git status. Muted by default. |
 
-Binding the local project to the workspace, which is part of onboarding rather
-than of the protocol (`specs/backend/hosted-service.md`), creates no groups. The
+Binding the local project to the workspace
+(`specs/backend/cloud/onboarding-flows.md` step 7) creates no groups. The
 workspace root already is the project group, so binding writes the `workspace`
 field into `.weald` and flips the transport, and the default channels above are
 the project's channels.
@@ -268,11 +277,11 @@ create them, so creation is idempotent on the deterministic group ids and is
 retried on every launch until it completes. The client treats a workspace
 missing a default channel as incomplete setup, finishes it silently, and only
 then reports the workspace ready. The completion check in
-`specs/backend/hosted-service.md`, a visible `#general` and an enabled
+`specs/backend/cloud/onboarding-flows.md`, a visible `#general` and an enabled
 Send button, is what gates "ready" and it is a check the client can satisfy by
 acting rather than by giving up.
 
-Teardown per `specs/backend/hosted-service.md` remains correct for the case
+Teardown per `specs/backend/cloud/provisioning.md` remains correct for the case
 it was written for: a provision where no trust root was ever admitted, meaning
 the genesis key is intact and nothing has been consumed.
 

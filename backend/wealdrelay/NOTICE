@@ -11,9 +11,8 @@ License in the LICENSE file alongside this notice, or at
 
 The relay is the blind store-and-forward server described in
 specs/backend/relay/. It has no dependency on any commercial-layer vendor: no
-identity provider, no payment processor, no control plane client, no account
-concept, no license check and no callback. Running it requires the binary, a
-Postgres database and a disk.
+Clerk, no Stripe, no control plane client, no account concept, no license check
+and no callback. Running it requires the binary, a Postgres database and a disk.
 
 The Weald macOS client is a separate work and is NOT covered by this license.
-See LICENSE at the repository root, and the licence note in README.md, for the boundary.
+See LICENSE.md at the repository root for the boundary.

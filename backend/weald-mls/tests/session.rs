@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! The group, end to end, through the session layer.
 //!
-//! The first obligation in `specs/backend/relay/mls-binding.md`: the twelve-function
+//! `specs/backend/relay/mls-binding.md` step 7's first obligation: the twelve-function
 //! seam does what the product needs, which is a group two people can talk in, a third
 //! person who can join, and a fourth who is removed and can no longer read.
 //!

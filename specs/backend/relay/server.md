@@ -1,5 +1,14 @@
 # Relay: the self-host package
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 What the customer actually downloads and runs. This is the answer to "what is
 the final deliverable".
 
@@ -16,10 +25,7 @@ have to think about it again.
 
 - No runtime dependencies. No Node, no Python, no JVM.
 - Targets: `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`,
-  `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`. The release pipeline
-  builds and publishes the first three, each natively and each with its SHA-256.
-  Windows is specified and not built yet; when it is, it joins the same matrix
-  rather than shipping from anybody's laptop.
+  `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
 - Configuration by environment variables, with an optional `relay.toml`.
 - Roughly 20 MB, single process, no sidecars.
 
@@ -56,17 +62,13 @@ provenance attestation via SLSA level 3.
 `README.md`. Includes Postgres, MinIO, Redis and Caddy for automatic TLS.
 
 ```
-sh install.sh
-cd weald-relay && $EDITOR .env
+curl -fsSL https://get.weald.team/relay | sh
+cd weald-relay && cp .env.example .env && $EDITOR .env
 docker compose up -d
 ```
 
-Three commands to a TLS-terminated relay on a fresh VPS, where `install.sh` is
-the script attached to the release and also carried inside the compose bundle.
-It writes a `.env` with generated passwords, so the edit is one line, the
-hostname. Everything else has a working default.
-`backend/wealdrelay/deploy/README.md` is the runbook and is the authority on how
-to obtain the bundle.
+Three commands to a TLS-terminated relay on a fresh VPS. The `.env` edit is one
+line, the hostname. Everything else has a working default.
 
 **3. One-click templates.** Maintained deploy buttons and templates for
 Railway, Fly.io, Render, DigitalOcean App Platform, and a Hetzner or generic-VPS
@@ -74,14 +76,13 @@ cloud-init script. Each wires the provider's own managed Postgres and object
 storage rather than running our containers for them, because a customer on
 Railway wants Railway's Postgres backed up by Railway.
 
-**4. Homebrew and a raw binary.** `brew install weald-protocol/tap/wealdrelay` for local
+**4. Homebrew and a raw binary.** `brew install weald/tap/wealdrelay` for local
 development and for a team that genuinely wants to run this on a Mac mini in a
 cupboard, which at this posture is a legitimate deployment.
 
 A Helm chart and Terraform modules are deliberately not in this list. Nobody at
-a team of 3 to 30 is standing up Kubernetes for a 20 MB binary. Neither is ruled
-out later: the relay is one stateless process, so both are packaging rather than
-protocol.
+a team of 3 to 30 is standing up Kubernetes for a 20 MB binary, and both are
+cheap to add later if a specific deal asks.
 
 ## Configuration surface
 
@@ -129,7 +130,7 @@ inside the blind half of the system (`specs/backend/relay/invites.md`).
 `read_only` rejects new durable writes while leaving reconciliation and export
 available, and is exposed to authenticated clients with a non-content reason
 code. It does not contact or name a billing system. Hosted lifecycle use,
-atomic deployment and customer UX are specified in `specs/backend/hosted-service.md`.
+atomic deployment and customer UX are specified in `cloud/service-lifecycle.md`.
 
 **`WEALD_RELAY_BOOTSTRAP_HANDOFF_PUBKEY`.** Optional, short-lived X25519 public
 key. On empty-workspace first run the relay seals the link half of its bootstrap
@@ -139,7 +140,46 @@ does not consume it and reveals no plaintext without the corresponding private
 key; redemption remains the one-time operation. It never stores the plaintext
 link. This generic primitive has no cloud vendor dependency; its hosted use and
 two-channel threat model are specified in
-`specs/backend/hosted-service.md`.
+`cloud/provisioning.md`.
+
+The format and the path are pinned here rather than left to the implementation,
+because two independent programs have to agree on them byte for byte and a
+disagreement is only discovered when a customer's one bootstrap invite is spent
+on it. The control plane's half is
+`backend/weald-cloud/src/provisioning/handoff.ts`; the relay's half is **not
+built yet**, and this is what it must do.
+
+    blob = ephemeral_public_key (32) || AES-256-GCM(key, nonce, plaintext) || tag (16)
+    key   = HKDF-SHA256(ikm  = X25519(ephemeral_private, handoff_public),
+                        salt = "weald-bootstrap-handoff-v1",
+                        info = handoff_public_key,
+                        len  = 32)
+    nonce = 12 zero bytes
+    path  = /handoff/<base64url(SHA-256(handoff_public_key))>
+
+Four things about that, each of which is a decision rather than an accident. The
+nonce is fixed and safe **here and only here**, because the key is derived from a
+fresh ephemeral keypair per sealing and so encrypts exactly one message; a random
+nonce would be equally safe and one more field for a second implementation to get
+wrong. `info` binds the ciphertext to the key it was sealed to, so a blob lifted
+from one instance and served for another fails to open rather than decrypting.
+The path is derived from the key rather than from the workspace, because a path
+containing a hostname would be a guessable url for a ciphertext. And the blob is
+served on the **private observability listener** beside `/readyz`, never on the
+public one, with the genesis fingerprint alongside it:
+
+    GET /handoff/<derived>  ->  200 {"blob": "...", "genesis_fingerprint": "..."}
+                                404 before anything has been sealed
+
+The fingerprint travels with the blob because `cloud/api.md` returns the two
+together and the client checks which genesis key signed the invite it is about to
+redeem. Two separate reads would be two chances for a relay to answer about two
+different keys.
+
+`specs/backend/contracts/wire/vectors/bootstrap-handoff.json` holds the
+conformance vectors: three sealed blobs with their keys and plaintexts, including
+an empty one and a long one. Both implementations are checked against those
+bytes rather than against each other.
 
 An earlier draft listed `WEALD_RELAY_OPEN_ENROLLMENT` with no semantics defined
 anywhere. It is deleted rather than specified. Enrollment is invites, one path,
@@ -150,8 +190,7 @@ configuration surface.
 Stripe, no control plane client, no account concept, no license check, no
 callback, and no configuration key naming any of them. The complete required
 configuration is the three variables above. A pull request adding a fourth that
-points at Weald's hosted service (`specs/backend/hosted-service.md`) is a trust
-boundary change, because
+points at something in `specs/backend/cloud/` is a trust boundary change, because
 it would mean the hosted binary differs from the audited binary and a self-hoster
 runs something we do not.
 
@@ -161,7 +200,7 @@ serves only `/healthz` and gives no state beyond liveness; detailed readiness an
 metrics bind to `WEALD_RELAY_OBSERVABILITY_LISTEN`, loopback by default. Hosted
 deployments expose that listener only over provider-private networking. This
 keeps the same digest usable by self-hosters without publishing storage, usage,
-or security-state metadata to the internet (`specs/backend/hosted-service.md`).
+or security-state metadata to the internet (`specs/backend/cloud/control-plane.md`).
 
 There is no admin password, no operator account and no web admin panel, because
 there is nothing an operator could usefully administer. Workspace administration
@@ -208,7 +247,7 @@ per group id, which is useful to a self-hoster debugging their own instance and
 is never enabled on the hosted tier. With it off the endpoint exposes instance
 totals only, so per-group counts are not merely something our control plane
 declines to retain, they are something it is not offered
-(`specs/backend/hosted-service.md`). Full behaviour in
+(`specs/backend/cloud/billing.md`). Full behaviour in
 `specs/backend/relay/operations.md`.
 
 **Health.** Public `/healthz` is liveness only. Private `/readyz` is readiness,
@@ -265,12 +304,12 @@ against theirs, repoint the client. No export format, no data liberation
 feature, no negotiation, because there is nothing we hold that they do not.
 
 Pricing sits on storage and retention rather than seats
-(`specs/backend/hosted-service.md`).
+(`specs/backend/cloud/billing.md`).
 
 ## Upgrades for self-hosters
 
 Hosted instances are upgraded on a schedule the customer picks
-(`specs/backend/hosted-service.md`). Self-hosters had no equivalent signal,
+(`specs/backend/cloud/provisioning.md`). Self-hosters had no equivalent signal,
 which mattered because clients pin against the public `/releases` feed and would
 warn about a digest mismatch the operator had no way to notice.
 
@@ -287,17 +326,13 @@ source tag is an alarm, and a digest that is genuinely older than the latest
 release is a chore. Rendering the second as the first is how a security banner
 gets trained into background noise.
 
-## Not yet decided
+## Open items
 
-Gaps in this specification that an implementer should know about, and one that
-has since closed.
-
-- Browser client key custody is unspecified. A browser cannot hold a device key
-  the way a native app can. The candidates are a WASM client with an
-  IndexedDB-held key plus a passkey unlock, or treating the browser as a view
-  onto a paired desktop. Nothing here defines which, and the choice bounds the
-  `reach` score in `specs/backend/relay/overview.md`.
+- Browser client key custody. A browser cannot hold a device key the way the
+  Mac app can. Options are a WASM client with an IndexedDB-held key plus a
+  passkey unlock, or treating the browser as a view onto a paired desktop. This
+  gates the `reach` score in `specs/backend/relay/overview.md` and is not yet decided.
 - A Tailscale or WireGuard-only deployment mode for teams that want no public
-  ingress was open and is now closed: it is a supported path, specified in
+  ingress. Now specified as a supported path in
   `specs/backend/relay/deployment.md`, and the only path where
   `WEALD_RELAY_ACCESS_SET=off` is a reasonable setting.

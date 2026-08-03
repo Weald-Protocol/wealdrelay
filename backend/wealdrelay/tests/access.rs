@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! The access set's rules, as rules: no database, no socket, no relay.
 //!
-//! The unit half of access-set enforcement, tracing to
+//! Step 6 from `specs/backend/build/phases-relay.md`, tracing to
 //! `specs/backend/relay/wire.md`. Everything `access::judge` decides is decided from
 //! four arguments and returns a verdict, so every branch of every rule is reachable
 //! from a table of inputs. The half that needs Postgres is in `tests/access_store.rs`

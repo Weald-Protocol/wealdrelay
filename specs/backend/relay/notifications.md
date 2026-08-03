@@ -1,5 +1,14 @@
 # Relay: notifications
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 `specs/backend/relay/overview.md` commits to push carrying a group id and a wake
 hint, never a preview. That commitment implies a push service, a device token
 registry and a new metadata surface, none of which appeared in the subprocessor
@@ -11,7 +20,7 @@ The client is macOS only, so v1 is local notifications plus a background
 connection, and there is no third-party push service at all.
 
 That is worth stating as a decision rather than an accident, because it means
-the subprocessor list in `specs/backend/hosted-service.md` does not grow, and
+the subprocessor list in `specs/backend/cloud/compliance.md` does not grow, and
 no external party learns when a workspace is active.
 
 ## v1: local, no push service
@@ -53,11 +62,10 @@ decrypts with keys from a shared Keychain access group, and rewrites the
 notification with real content. If it cannot, the fallback text is the app name
 and nothing else. It is never a preview generated anywhere but on device.
 
-**Disclosure.** An operator who turns this on has added a subprocessor and must
-say so. Apple Push Notification service belongs in the operator's subprocessor
-list from the day push is enabled, with the data described as opaque wake hints
-and rotating group aliases, no content. Adding a subprocessor quietly would be
-worse than the feature is worth.
+**Disclosure.** Apple Push Notification service joins the subprocessor table the
+day this ships, with the data column reading "opaque wake hints and rotating
+group aliases, no content". `/security` gets the same sentence. Adding a
+subprocessor quietly would be worse than the feature is worth.
 
 **Opt-out.** A workspace admin can disable push entirely for the workspace, and
 an individual can disable it for themselves. Both are one toggle, and the

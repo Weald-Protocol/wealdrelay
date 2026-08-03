@@ -76,10 +76,44 @@ therefore a regression alarm rather than a capacity signal.
 
 ## B. Control plane problem types
 
-Not in this repository. The hosted service's HTTP API returns RFC 9457 Problem
-Details, and its registry of `type` values belongs to that service rather than
-to the relay protocol: no conformant client or relay ever produces or consumes
-one. See `specs/backend/hosted-service.md` for the boundary.
+RFC 9457 Problem Details. Every `type` is
+`https://docs.weald.team/errors/<code>` and resolves to a real docs page.
+`spec-check.sh` fails on a type declared in `../api/openapi.yaml` that is
+missing here, and on a code here that no operation declares.
 
-Section A above is the complete error surface of the relay wire protocol, and
-every code in it has a conformance vector in `../wire/vectors/`.
+| Code | HTTP | Meaning | Retry guidance |
+| --- | --- | --- | --- |
+| `idempotency_key_reused` | 409 | Same key, different canonical request body. | Never. Use a new key. |
+| `idempotency_key_required` | 400 | Mutation sent without `Idempotency-Key`. | After adding one. |
+| `bootstrap_handoff_already_used` | 409 | The one-and-only handoff has been claimed. There is no reissue. | Never. The remedy is `POST /instances/:id/reprovision`. |
+| `bootstrap_instance_enrolled` | 409 | The relay reports a non-zero admitted principal count. | Never. |
+| `step_up_required` | 401 | No Clerk reauthentication within 15 minutes. | After step-up. |
+| `step_up_expired` | 401 | Step-up older than 15 minutes at the time of the action. | After step-up. |
+| `insufficient_role` | 403 | Caller is not an owner for an owner-only action. | Never for this actor. |
+| `account_scope_violation` | 403 | Loaded resource does not belong to the session's `org_id`. Logged as a security event. | Never. |
+| `csrf_token_invalid` | 403 | Browser mutation without a valid same-site CSRF token. | After reload. |
+| `instance_not_found` | 404 | Unknown, or outside the caller's account. Deliberately indistinguishable. | Never. |
+| `operation_not_found` | 404 | Unknown operation, or outside the caller's account. | Never. |
+| `pending_intent_expired` | 409 | Checkout intent older than 24 hours. | Start a new checkout. |
+| `pending_intent_conflict` | 409 | Account already has an unsettled intent for this region and tier. | After the first settles or expires. |
+| `subscription_not_settled` | 409 | Checkout completed but settlement is not `paid` or `no_payment_required`. | Reconciled from Stripe. Poll the operation. |
+| `region_immutable` | 409 | Region change attempted after creation. | Never. Requires backup, restore and a hostname change. |
+| `instance_not_in_valid_state` | 409 | Action illegal for the instance's lifecycle state. | After the state changes. See `../state-machines/instance-lifecycle.md`. |
+| `legal_hold_active` | 409 | Destruction, backup-key erasure or purge blocked by a hold. | After release. |
+| `legal_hold_release_forbidden` | 403 | A legal-process hold cannot be released by the customer. | Never for this actor. |
+| `domain_reserved_elsewhere` | 409 | Hostname is live, in grace, or detached within 30 days for another account. | After 30 days. |
+| `domain_verification_failed` | 409 | TXT challenge absent or not exact. Re-checked immediately before attach. | After DNS propagates. |
+| `domain_invalid` | 400 | Public suffix, IP literal, wildcard or a Weald-owned domain. | Never. |
+| `domain_detach_failed` | 502 | Provider binding could not be confirmed gone. Blocks destruction and pages operations. Never silently skipped. | Automatic. |
+| `export_window_closed` | 409 | Past the deadline in `service-lifecycle.md`. A backup is not an undeclared extension of the export window. | Never. |
+| `reprovision_window_closed` | 409 | More than 7 days since creation. | Never. |
+| `reprovision_confirmation_required` | 400 | Relay reports an admitted principal and the owner did not type the hostname. | After confirming. |
+| `account_has_live_instances` | 409 | `DELETE /account` before every instance is destroyed. Deleting the login before cancelling the subscription strands a paying customer behind a door they cannot open. | After teardown. |
+| `rate_limited` | 429 | 100/min general, 5/min on bootstrap, restore and destroy. | `Retry-After`. |
+| `provider_unavailable` | 502 | Render or R2 failed. The operation retries. | Automatic. Poll the operation. |
+| `internal_error` | 500 | Unclassified. Carries a request id and nothing else. | Automatic. |
+
+No Problem Details response ever echoes a secret, a provider handle, a raw
+webhook payload, bootstrap material, or any workspace data. `instance_not_found`
+and `operation_not_found` are returned for both "does not exist" and "not
+yours", because a distinguishable 403 is an account enumeration oracle.

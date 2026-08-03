@@ -52,9 +52,8 @@ fn admin_url() -> String {
 
 /// Two ports nothing else is using, learned by binding and releasing. There is a
 /// race between releasing and the child binding, and it is accepted deliberately:
-/// the alternative is a fixed port, which the harness forbids (see
-/// `specs/backend/relay/test-harness.md`) because it makes two suites on one
-/// machine collide.
+/// the alternative is a fixed port, which `specs/backend/build/testing.md` forbids
+/// because it makes two suites on one machine collide.
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     let port = listener.local_addr().unwrap().port();

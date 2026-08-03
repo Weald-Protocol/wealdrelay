@@ -1780,8 +1780,8 @@ fn an_empty_recovery_seed_is_refused_by_both_functions_that_take_one() {
 /// a second closure written only for the test.
 ///
 /// The injector stays out of the shipped library. This changes nothing about that: it is
-/// still behind `test-hooks`, and the release build still asserts the symbol is absent
-/// from the packaged artifact.
+/// still behind `test-hooks`, and the XCFramework step of the gate still asserts the symbol
+/// is absent.
 #[test]
 fn the_panic_injector_reports_ok_when_its_body_returns_which_is_the_guard_s_other_half() {
     // A negative payload is the documented "return without panicking" input.

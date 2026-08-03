@@ -8,17 +8,14 @@
     "which specs/backend/relay/server.md permits for a single-node install.",
     "Railway terminates TLS on the generated domain, so WEALD_RELAY_TLS is off",
     "and there is no port 80 to open on this path.",
-    "WEALD_RELAY_ACCESS_SET is enforce and is never weakened by a template.",
-    "There is no startCommand. Railway runs one through a shell, and the image",
-    "is distroless, which has no shell by construction. The Dockerfile's",
-    "ENTRYPOINT already starts the relay with no arguments, which is the whole",
-    "of what a start command would have said."
+    "WEALD_RELAY_ACCESS_SET is enforce and is never weakened by a template."
   ],
   "build": {
     "builder": "DOCKERFILE",
     "dockerfilePath": "backend/wealdrelay/Dockerfile"
   },
   "deploy": {
+    "startCommand": "wealdrelay",
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",

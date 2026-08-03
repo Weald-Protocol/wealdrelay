@@ -18,4 +18,4 @@ This crate links OpenMLS and its dependencies, which carry their own licenses.
 Their terms are unchanged by this notice.
 
 The Weald macOS client is a separate work and is NOT covered by this license.
-See LICENSE at the repository root, and the licence note in README.md, for the boundary.
+See LICENSE.md at the repository root for the boundary.

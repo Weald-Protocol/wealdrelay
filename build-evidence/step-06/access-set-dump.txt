@@ -1,0 +1,32 @@
+step 6, the access set as the relay holds it
+every row of every access table for one workspace, after a genesis publication
+and one provisional grant
+
+--- relay_workspace
+{"workspace_id":"ws-access","salt":"\\x2b7ed8cb8e18777b1032ad0cf54c3da558d55d5adc81e9d3b29771014d0316b2","created_at":"2026-08-03T19:51:05.257344+00:00"}
+{"workspace_id":"ws:localhost","salt":"\\x8ac95b37d724a50c7bd5e8787a52a3bf6a3b86734f4592666178ee20bc1acd26","created_at":"2026-08-03T19:51:04.86715+00:00"}
+
+--- relay_access_set
+{"workspace_id":"ws-access","version":0,"digest":"\\x1ba3bd3ef1374b9411b092dadad39412fa5fbc75e6ec68d6089b6ba6ec8558f4","prev_hash":"\\x0000000000000000000000000000000000000000000000000000000000000000","issued_at":1,"signer":"\\x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c","signed_as":"authorizer","body":"\\x8b582077777777777777777777777777777777777777777777777777777777777777770058200000000000000000000000000000000000000000000000000000000000000000018358202d980c5430b731691ded073677b86aa04aa129231602461fbf2da434f23e529958203378d42a7dcfe78e7e2f1e5794d813889552798bf081f8c243424f9aab5e5fe95820ba6e309e2835d50cbb16c5fc55b89c804f57e8c48791a1cdb20eb918364ce11a8158208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c8158203f0dda81e6abbcc5f17c359df8517177769d2dfff3d4ce942e7ce9a82dfb0db2f68058208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c58404aefe88f2fde9f7a8ee3900433a01d5f98cacb0e509fe35da23abfe906fa014df6e03e9b2a72ac6580337dd00f36c3e6c76212440cc75351ea631d4074912306","accepted_at":"2026-08-03T19:51:05.274525+00:00"}
+
+--- relay_access_entry
+{"workspace_id":"ws-access","version":0,"entry_hash":"\\x2d980c5430b731691ded073677b86aa04aa129231602461fbf2da434f23e5299"}
+{"workspace_id":"ws-access","version":0,"entry_hash":"\\x3378d42a7dcfe78e7e2f1e5794d813889552798bf081f8c243424f9aab5e5fe9"}
+{"workspace_id":"ws-access","version":0,"entry_hash":"\\xba6e309e2835d50cbb16c5fc55b89c804f57e8c48791a1cdb20eb918364ce11a"}
+
+--- relay_access_principal
+{"workspace_id":"ws-access","version":0,"role":"authorizer","pubkey":"\\x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"}
+{"workspace_id":"ws-access","version":0,"role":"recovery","pubkey":"\\x3f0dda81e6abbcc5f17c359df8517177769d2dfff3d4ce942e7ce9a82dfb0db2"}
+
+--- relay_access_quorum
+(no rows)
+
+--- relay_access_probation
+(no rows)
+
+--- relay_recovery_rotation
+(no rows)
+
+--- relay_provisional_grant
+{"workspace_id":"ws-access","device_hash":"\\xf7d06474c5a35f19f7c2cb185ac01f5cb1f38a0e076c7c8a7a343d3a2a875f2b","expires_at":"2069-12-07T00:00:00+00:00","seen_version":null,"voided_at":null,"voided_reason":null,"created_at":"2026-08-03T19:51:05.294309+00:00"}
+

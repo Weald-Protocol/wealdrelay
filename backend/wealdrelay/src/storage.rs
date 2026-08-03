@@ -2,8 +2,9 @@
 // Copyright 2026 Dicyanin Labs
 //! Object storage, filesystem and S3, behind one contract.
 //!
-//! The rule this module exists to satisfy: where a fake exists, a shared contract
-//! suite exists beside it, and where one does not, the fake is not permitted. The
+//! `specs/backend/build/environments.md` states the rule this module exists to
+//! satisfy: "Where a fake exists in this programme, a shared contract suite
+//! exists beside it. Where one does not, the fake is not permitted." The
 //! filesystem backend is not a hand-written approximation of S3; it is a
 //! `BlobStore` implementation held to the same assertions, and any behaviour it
 //! has that the real one does not is a bug in it and fails the contract run.
@@ -19,8 +20,8 @@
 //!
 //! ## Never a partial write
 //!
-//! A storage backend outage has to produce a typed error and never a partial
-//! write. For the filesystem backend that is concrete:
+//! Step 3's negative proof is that a storage backend outage produces a typed
+//! error and never a partial write. For the filesystem backend that is concrete:
 //! bytes go to a temporary file in the same directory and are renamed into place,
 //! so a reader either sees the whole object or no object. A backend that streamed
 //! into the final path would leave a truncated blob that `exists` would then
@@ -80,8 +81,8 @@ impl BlobKey {
 
 /// Why a storage operation failed.
 ///
-/// Typed, because a backend outage has to surface as an error the caller can act
-/// on rather than a panic or a partial write, and because the caller
+/// Typed, because step 3's negative proof requires that a backend outage produces
+/// a typed error rather than a panic or a partial write, and because the caller
 /// has to map these onto the error classes in
 /// `specs/backend/contracts/registries/error-codes.md`: an outage is `retry`,
 /// a full disk is `quota`, and a malformed key is `reject`.
@@ -117,8 +118,8 @@ pub struct BlobInfo {
 /// `tests/storage_contract.rs` runs the same assertions against both.
 ///
 /// Deliberately narrow. Presigned URLs, multipart sessions and quota reservations
-/// are `media.md` concerns and arrive with the media path; adding them here
-/// before that would be adding a surface no test could exercise end to end.
+/// are `media.md` concerns that arrive with step 9; adding them now would be
+/// adding a surface no test could exercise end to end.
 /// Every method returns an explicit `impl Future + Send` rather than being an
 /// `async fn`, and the trait is not object safe.
 ///
@@ -128,9 +129,8 @@ pub struct BlobInfo {
 /// `llvm-cov report` segfault under branch instrumentation: a fifteen line trait
 /// and one impl reproduce it with nothing else in the crate. The choice was
 /// between a proc macro and the ability to measure the relay against the coverage
-/// floor at all, so the macro went. There is no third option: this crate carries
-/// a 100 percent coverage floor and no coverage-exclusion attribute is permitted,
-/// so the trait could not simply be exempted.
+/// floor at all, so the macro went. `Sources/../build-coverage-exclusions.md` has
+/// the full note.
 ///
 /// The explicit `+ Send` matters and is not decoration: without it the returned
 /// futures are not `Send`, and nothing holding a store could be spawned onto the
@@ -218,7 +218,7 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
 }
 
 /// The filesystem backend. The whole of a single-node install's storage, and the
-/// default when no object store is configured.
+/// default in `local` (`specs/backend/build/environments.md`).
 #[derive(Debug, Clone)]
 pub struct FilesystemStore {
     root: PathBuf,

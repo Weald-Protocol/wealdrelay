@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! The media lifecycle artifact, produced by a real run rather than described.
+//! The step 9 artifact, produced by a real run rather than described.
 //!
-//! What has to be shown is the GC run log and the storage accounting against the
-//! quota. A run log is only evidence if something actually ran, so this file drives
-//! the whole media lifecycle against the harness Postgres and the harness MinIO and
-//! leaves the rows behind to be read out with `psql`.
+//! `specs/backend/build/phases-relay.md` asks step 9 for "the GC run log and the
+//! storage accounting against the quota". A run log is only evidence if something
+//! actually ran, so this file drives the whole media lifecycle against the
+//! harness Postgres and the harness MinIO and leaves the rows behind for
+//! `scripts/backend-gate.sh 9` to read out with `psql`.
 //!
 //! The database is named rather than scratch, and is deliberately **not** dropped
-//! at the end: the artifact is read out of the running stack's own Postgres, the
-//! same way the transparency-log artifact is, and a database that disappeared with
-//! the test would leave nothing to read. It is recreated from empty on every run,
-//! so it never accumulates.
+//! at the end: the gate's artifact part reads it out of the running stack's own
+//! Postgres the way step 8's transparency-log artifact does, and a database that
+//! disappeared with the test would leave the gate with nothing to read. It is
+//! recreated from empty on every run, so it never accumulates.
 //!
 //! What the run contains, and why each part is in it:
 //!
@@ -44,7 +45,7 @@ use support::{
     signed_policy, verifier_key, Running,
 };
 
-/// Fixed, so whoever reads the artifact out afterwards knows where to look.
+/// Fixed, so `scripts/backend-gate.sh 9` knows where to look.
 const DATABASE: &str = "weald_step09_evidence";
 const BUCKET: &str = "weald-step09-evidence";
 const WS: &str = "ws-step09";

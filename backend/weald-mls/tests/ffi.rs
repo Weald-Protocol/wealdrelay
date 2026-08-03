@@ -9,15 +9,15 @@
 //! length read before a null check, a handle borrowed after it was freed. None of those
 //! are reachable from a test that holds a `&mut Session`.
 //!
-//! What is proven here:
+//! What is proven here, from `specs/backend/build/phases-relay.md` step 7:
 //!
-//! - The negative: a panic deliberately raised inside the boundary returns a typed error
-//!   and does not unwind into Swift.
+//! - "Negative: a panic deliberately raised inside the boundary returns a typed error and
+//!   does not unwind into Swift."
 //! - The ownership rule in `specs/backend/relay/mls-binding.md`: "Buffers in, owned
 //!   buffers out, freed by an explicit call."
 //! - "Handles are opaque and thread-confined", enforced rather than documented.
-//! - The four recovery-wrap functions, which are the only ones that can return an epoch
-//!   secret and therefore the ones whose refusals matter most.
+//! - The four recovery-wrap functions the seam grew in this step, which are the only ones
+//!   that can return an epoch secret and therefore the ones whose refusals matter most.
 //!
 //! Every case here is real OpenMLS against a real SQLite database, and every pointer is a
 //! real pointer. There is no test double in this crate, in any environment.
@@ -290,8 +290,8 @@ fn a_panic_raised_inside_the_boundary_becomes_a_status_and_does_not_unwind_into_
     // tested path", so the guard is tested directly rather than only relied upon.
     //
     // `weald_mls_panic_for_test` exists only under `cfg(test)` and the test profile. It is
-    // not in the shipped library, which the release build checks by asserting the symbol
-    // is absent from the packaged artifact.
+    // not in the shipped library, which is checked by the symbol assertion in the
+    // XCFramework step of this gate.
     // Safety: the function takes nothing and returns a status.
     let code = unsafe { weald_mls_panic_for_test(0) };
     assert_eq!(status(code), Status::Panicked);

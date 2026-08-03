@@ -94,8 +94,8 @@ fn reopen_omitted(
     }
     // A set rather than a nested scan. The pair of `any` calls this replaces was
     // O(spans x omitted x items) over a vector that is the whole group, which is the
-    // same whole-group cost `log::items` records as an open question, paid a second
-    // time in memory. One pass per span against a hash lookup says the same thing.
+    // same whole-group cost `log::items` is filed for (WEALD-210) paid a second time
+    // in memory. One pass per span against a hash lookup says the same thing.
     let omitted: std::collections::HashSet<negentropy::Id> = omitted.iter().copied().collect();
     for (lower, upper, _) in incoming.spans() {
         if items
@@ -227,9 +227,9 @@ pub async fn subscribe(
         sender,
         vec![Frame::SubAck {
             group: group.clone(),
-            // `max` with the client's cursor, unchanged since `SUB` existed: a
-            // client that names a cursor beyond the head is told its own number
-            // rather than being invited to walk backwards.
+            // `max` with the client's cursor, unchanged from step 4: a client that
+            // names a cursor beyond the head is told its own number rather than
+            // being invited to walk backwards.
             head_seq: head.max(from_seq),
         }],
     ) {

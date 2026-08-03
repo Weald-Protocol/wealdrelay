@@ -3,9 +3,10 @@
 //! The envelope, and every check the relay makes on it, with no database.
 //!
 //! `specs/backend/relay/wire.md` fixes the eight fields, their order, and the
-//! function that addresses them. No coverage exclusion is ever permitted under
-//! `backend/wealdrelay/src/envelope/**`, so every refusal below is reached by real
-//! bytes rather than asserted about in a comment.
+//! function that addresses them. `backend/build-coverage-exclusions.md` names
+//! `backend/wealdrelay/src/envelope/**` as a path where no coverage exclusion is
+//! ever permitted, so every refusal below is reached by real bytes rather than
+//! asserted about in a comment.
 //!
 //! Nothing here touches Postgres. Everything the envelope refuses is a property
 //! of the bytes alone, which is exactly what lets `accept` run these checks

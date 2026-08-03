@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-06
-- Source: `specs/backend/relay/multi-workspace.md`
+- Source: `specs/backend/README.md`, `specs/backend/relay/multi-workspace.md`
 
 ## Context
 
@@ -25,12 +25,11 @@ subscriptions.
 - One relay instance per workspace. Not multi-tenant.
 - Tenant isolation is enforced by the absence of keys rather than by our query
   scoping. A cross-tenant bug leaks ciphertext to someone who cannot read it.
-- The floor for running one workspace is a container plus a dedicated Postgres.
-  Anyone operating this for others, including us, carries that cost per
-  workspace rather than amortising it across tenants.
+- The smallest paid tier must cover a container plus a dedicated Postgres, which
+  is why there is no free hosted tier.
 - An agency or multi-project company is the normal shape rather than an edge
-  case, so an operator should expect one account to hold several instances and
-  should label them by project rather than by hostname.
+  case, so the dashboard lists instances by project name and checkout expects
+  repeat purchases from the same account.
 
 ## Rejected
 

@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! Range-based set reconciliation: the codec, the two roles, and convergence.
 //!
-//! The unit and property tiers for reconciliation. The flagship is
+//! Tier 1 and tier 2 for step 5's first gate part. The flagship is
 //! ``any_partition_converges``: envelopes are partitioned at random between the two
 //! sides, arrival order is randomised, and the exchange is driven to completion. It
 //! asserts three things, and the second and third are the ones that make it a proof
@@ -632,7 +632,7 @@ proptest! {
     #![proptest_config(config())]
 
     /// Any partition of envelopes across the two transports converges to one set,
-    /// with arrival order randomised. The property gate for reconciliation.
+    /// with arrival order randomised. Step 5's property gate.
     ///
     /// The partition is the point: an envelope may be on the relay only, on the
     /// client only, or on both, which is exactly what dual transport produces when

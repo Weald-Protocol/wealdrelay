@@ -83,8 +83,8 @@ impl AcceptError {
 
 /// Accept one envelope into one group.
 ///
-/// `now_ms` is injected rather than read from the clock. Nothing under test may
-/// read a wall clock, and the relay's own observed time
+/// `now_ms` is injected rather than read from the clock. `testing.md` forbids a
+/// wall-clock read inside anything under test, and the relay's own observed time
 /// is the authority for every expiry it owns, so the caller that owns the clock
 /// passes it in.
 pub async fn accept(

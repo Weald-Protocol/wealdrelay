@@ -300,10 +300,10 @@ impl Database {
             })
     }
 
-    /// Every table the schema defines, in name order. A schema dump is recorded
-    /// as evidence that the migrations landed, and this produces it from the
-    /// running database rather than from the migration files, so the dump records
-    /// what was actually applied.
+    /// Every table the schema defines, in name order. The step 3 artifact is a
+    /// schema dump, and this is what produces it from the running database rather
+    /// than from the migration files, so the artifact records what was actually
+    /// applied.
     pub async fn tables(&self) -> Result<Vec<String>, DbError> {
         let rows = sqlx::query(
             "select table_name from information_schema.tables \

@@ -1,5 +1,14 @@
 # Relay: client-side search and cold start
 
+> **Production credentials only.** `specs/backend/build/production-only.md` is a
+> standing rule and it outranks this file. Production vendors only: the Clerk
+> production instance, Stripe live mode, the production Render environment and
+> Postgres, the production R2 bucket, the published relay digest. No dev tier,
+> no test mode, no staging tier, and no agent creates one. `local` and `ci` are
+> not an exception because they reach no vendor at all. A gate that cannot reach
+> production configuration fails; it never degrades to a mock, a stub, a fake, a
+> skip or a newly created dev or staging resource.
+
 Search moves entirely to the client, because the relay cannot index what it
 cannot read. `specs/backend/relay/migration.md` names cold-start decrypt-and-index
 as a High risk with no design behind it. This is the design.
@@ -22,8 +31,8 @@ One local index per workspace, built at decrypt time rather than query time.
 - Not indexed and not stored: anything from a group the device does not hold
   keys for, which is nothing, because it cannot decrypt it in the first place.
 
-Query latency target is the same as whatever local board search the client
-already offers, and it is benchmarked against that before Phase 3
+Query latency target is the same as the current board search in
+`specs/board-search.md`, and it is benchmarked against that before Phase 3
 ships. Search getting slower is the most likely way users notice the migration
 and dislike it.
 
@@ -114,7 +123,7 @@ bound to the device", and the obvious reading is a SQLite file with page-level
 encryption underneath it. This project has no SQLCipher and is not going to take
 one, and the alternative is a hand-written encrypting VFS: a page cipher on the
 path of every read, with its own crash-consistency story to prove. So the
-database is opened as `:memory:`, and the client persists
+database is opened as `:memory:`, and `Sources/Sync/SearchStore.swift` persists
 it as `sqlite3_serialize` output sealed with AES-GCM, plus a journal of sealed
 batches appended between snapshots so a minute of indexing is durable without
 rewriting the whole image.
@@ -154,5 +163,5 @@ path.
 
 **Only the last typed term is a prefix.** `relay ref` matches "reference"; `rel
 reference` does not match "relay reference". This is what a search box does, and
-it matches the behaviour of the client's existing local board search, so a
-person moving onto this index is not surprised by it.
+it is what `Sources/Core/BoardSearch.swift` does today, so a person moving onto
+this index is not surprised by it.

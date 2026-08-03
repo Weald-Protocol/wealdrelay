@@ -20,8 +20,8 @@
 //!   and not an identity.
 //! - The same person's wraps in two different groups carry unrelated tags, so the
 //!   set of slots per group cannot be joined into a membership graph. That is the
-//!   property `scripts/weald-stack prove-blind` measures directly, by reading every
-//!   wrap in the database and refusing any value that recurs across two groups.
+//!   property `scripts/prove-blind.py` measures directly, by reading every wrap in
+//!   the database and refusing any value that recurs across two groups.
 //!
 //! What the relay does learn is a count per group, which `groups.md` states plainly
 //! is already implied by the size of a commit.

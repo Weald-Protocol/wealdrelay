@@ -1,82 +1,91 @@
-# The local test harness. Postgres, MinIO and Redis, on ports nothing else uses.
+# The local harness, per specs/backend/build/local-harness.md.
 #
-# This is not a deployment. `backend/wealdrelay/deploy/compose/docker-compose.yml`
-# is the file for running a relay; this one exists so the integration tiers have
-# the real dependencies they refuse to skip without. Brought up by
-# `scripts/weald-stack up`.
+# Everything here is real. Postgres, object storage, Redis and TLS-less sockets
+# are the same components the customer runs; only the infrastructure provider,
+# payments and mail delivery are faked, and those three are faked outside this
+# file (FakeProvisioner, Stripe test mode, and Mailpit, which speaks real SMTP
+# to a local inbox).
 #
-# Three deliberate differences from the deploy bundle:
-#
-#   1. The ports are high and odd (54032, 54090, 54079) so that a developer's own
-#      Postgres on 5432 is never touched, and so a test that meant to reach the
-#      harness cannot reach a real database by accident.
-#   2. The credentials are fixed, weak and public. Every test in the repository
-#      hard-codes them, on purpose: a contract run that silently pointed at some
-#      other endpoint would prove nothing. Nothing here is exposed off loopback
-#      and nothing here holds anything but fixture data.
-#   3. Storage is a tmpfs-free named volume that `weald-stack down` removes. A
-#      suite that depends on state from the previous run is a suite that passes
-#      once.
-#
-# Images are pinned by digest, as everywhere else in this repository, and are the
-# same digests the deploy bundle pins so that a developer and a customer are
-# running the same Postgres.
+# Base images are pinned by digest, never by tag, per
+# specs/backend/build/environments.md. A digest change is a deliberate commit.
 
 name: weald-stack
 
 services:
   postgres:
-    image: postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
-    # The suites create and drop a database per test against this one, so the
-    # server needs headroom for more connections than a default install allows.
-    command: ["postgres", "-c", "max_connections=200", "-c", "fsync=off"]
+    image: postgres@sha256:74e110c41804365e3915fcc09d5e7a1eff50161aaa94d5da0e58e0cd75ae509c
     environment:
       POSTGRES_USER: weald
       POSTGRES_PASSWORD: weald
+      # One database per relay instance is created by the relay's migrations;
+      # this is the bootstrap database the harness connects to.
       POSTGRES_DB: weald_relay
+      # Fast and unsafe on purpose: this volume is disposable, and fsync on a
+      # laptop is most of the cold-start budget the 90 second gate has to fit in.
+      POSTGRES_INITDB_ARGS: "--nosync"
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
     ports:
-      # Loopback only. A harness reachable from the network is a harness someone
-      # else's test run can drop a database in.
-      - "127.0.0.1:${WEALD_STACK_PG_PORT:-54032}:5432"
+      - "${WEALD_STACK_PG_PORT:-54032}:5432"
     volumes:
-      - postgres:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U weald -d weald_relay"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
+      interval: 1s
+      timeout: 3s
+      retries: 40
+      start_period: 2s
 
   minio:
-    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: server /data --console-address :9001
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: weald
       MINIO_ROOT_PASSWORD: weald-local-only
+      MINIO_UPDATE: "off"
     ports:
-      - "127.0.0.1:${WEALD_STACK_MINIO_PORT:-54090}:9000"
-      - "127.0.0.1:${WEALD_STACK_MINIO_CONSOLE_PORT:-54091}:9001"
+      - "${WEALD_STACK_MINIO_PORT:-54090}:9000"
+      - "${WEALD_STACK_MINIO_CONSOLE_PORT:-54091}:9001"
     volumes:
-      - minio:/data
+      - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 40
+      start_period: 2s
 
-  # Only the multi-process fan-out suite needs this. A single-process relay never
-  # opens it, which is why the relay treats it as optional configuration rather
-  # than as a dependency.
   redis:
-    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    image: redis@sha256:595cc6f2bb3af6e03347b90deb6123c6aa2c81dea05ce08128de8a174b6ac67b
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
-      - "127.0.0.1:${WEALD_STACK_REDIS_PORT:-54079}:6379"
+      - "${WEALD_STACK_REDIS_PORT:-54079}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
+      interval: 1s
+      timeout: 3s
+      retries: 40
+
+  mailpit:
+    image: axllent/mailpit@sha256:7f33095f80e901f6ad08028f06ca284aa58fe84942be5496008d041d3b9f4d4d
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "${WEALD_STACK_SMTP_PORT:-54025}:1025"
+      - "${WEALD_STACK_MAILPIT_UI_PORT:-54080}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 1s
+      timeout: 3s
+      retries: 40
 
 volumes:
-  postgres:
-  minio:
+  postgres-data:
+  minio-data:

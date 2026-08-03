@@ -2,10 +2,11 @@
 // Copyright 2026 Dicyanin Labs
 //! The access set: the one piece of derived membership data the relay holds.
 //!
-//! This module carries a 100 percent coverage floor and no coverage-exclusion
-//! attribute is permitted anywhere in it. That is because this module decides who
-//! may open a socket, and every branch that decides it has to be a branch a test
-//! has actually taken.
+//! `backend/build-coverage-exclusions.md` names `backend/wealdrelay/src/access/**`
+//! as a path where no coverage exclusion is ever permitted, and
+//! `scripts/backend-coverage.sh --exclusion-grep` fails on one. That is because
+//! this module decides who may open a socket, and every branch that decides it has
+//! to be a branch a test has actually taken.
 //!
 //! ## What it is for
 //!
@@ -35,7 +36,7 @@
 //! Definite-length arrays with positional fields, which is what every other
 //! structure on this wire uses (`envelope::Envelope`, `frame::Frame`, and their
 //! Swift counterparts). `specs/backend/contracts/wire/wire.cddl` writes `AccessSet`
-//! as an integer-keyed map; the implementation has always used arrays and the
+//! as an integer-keyed map; the implementation has used arrays since step 2 and the
 //! CDDL is corrected rather than the four structures that already ship. The
 //! correction is recorded in `specs/backend/contracts/wire/vectors/README.md`.
 
@@ -337,7 +338,7 @@ pub fn entry_hash(pubkey: &[u8], salt: &[u8]) -> Vec<u8> {
 /// genesis.
 ///
 /// Here rather than in `ws` so the client's decoder has one definition to mirror, the
-/// way `AccessSet::encode` and the client's Swift decoder mirror each other. The
+/// way `AccessSet::encode` and `Sources/Sync/AccessSet.swift` mirror each other. The
 /// head is a nested array rather than two fields so that its absence is one null: a
 /// version of zero is a real version and must not read as "no set".
 pub fn encode_state(state: &store::State) -> Vec<u8> {
