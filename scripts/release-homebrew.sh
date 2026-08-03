@@ -21,7 +21,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORMULA="$ROOT/backend/wealdrelay/deploy/homebrew/wealdrelay.rb"
-REPO="${WEALD_RELAY_REPO:-hunterh37/WealdRelay}"
+REPO="${WEALD_RELAY_REPO:-Weald-Protocol/wealdrelay}"
 
 TAG="${1:-}"
 OUT=""
@@ -80,7 +80,7 @@ rendered="$work/wealdrelay.rb"
 sed \
   -e "s|^  version \".*\"$|  version \"${VERSION}\"|" \
   -e "s|/releases/download/wealdrelay-v[^/]*/|/releases/download/${TAG}/|g" \
-  -e "s|hunterh37/WealdRelay|${REPO}|g" \
+  -e "s|Weald-Protocol/wealdrelay|${REPO}|g" \
   "$FORMULA" > "$rendered"
 
 # One checksum per url, in file order, matched to the target named in the url

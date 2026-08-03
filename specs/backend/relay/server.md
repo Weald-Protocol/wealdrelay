@@ -48,7 +48,7 @@ privacy property and the operational simplicity are the same property.
 
 Shipped for every install path a customer might already be standing in.
 
-**1. Container image.** `ghcr.io/hunterh37/weald-relay:<version>`, multi-arch amd64 and
+**1. Container image.** `ghcr.io/weald-protocol/weald-relay:<version>`, multi-arch amd64 and
 arm64, distroless base, non-root, no shell. Signed with cosign, SBOM attached,
 provenance attestation via SLSA level 3.
 
@@ -74,7 +74,7 @@ cloud-init script. Each wires the provider's own managed Postgres and object
 storage rather than running our containers for them, because a customer on
 Railway wants Railway's Postgres backed up by Railway.
 
-**4. Homebrew and a raw binary.** `brew install hunterh37/tap/wealdrelay` for local
+**4. Homebrew and a raw binary.** `brew install weald-protocol/tap/wealdrelay` for local
 development and for a team that genuinely wants to run this on a Mac mini in a
 cupboard, which at this posture is a legitimate deployment.
 

@@ -129,8 +129,8 @@ LABEL org.opencontainers.image.title="wealdrelay" \
       org.opencontainers.image.description="The Weald blind relay. Stores and forwards envelopes it cannot read." \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Dicyanin Labs" \
-      org.opencontainers.image.source="https://github.com/hunterh37/WealdRelay" \
-      org.opencontainers.image.documentation="https://github.com/hunterh37/WealdRelay/blob/main/backend/wealdrelay/deploy/README.md" \
+      org.opencontainers.image.source="https://github.com/Weald-Protocol/wealdrelay" \
+      org.opencontainers.image.documentation="https://github.com/Weald-Protocol/wealdrelay/blob/main/backend/wealdrelay/deploy/README.md" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${VERSION}"
 

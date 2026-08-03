@@ -11,8 +11,8 @@ Do not send a security issue as a pull request. `SECURITY.md`.
 ## Getting it running
 
 ```sh
-git clone https://github.com/hunterh37/WealdRelay.git
-cd WealdRelay
+git clone https://github.com/Weald-Protocol/wealdrelay.git
+cd wealdrelay
 scripts/weald-stack up          # Postgres, MinIO and Redis, on loopback
 cargo test --workspace --locked
 scripts/weald-stack down

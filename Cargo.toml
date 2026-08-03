@@ -8,7 +8,7 @@ edition = "2021"
 # binding are the two crates that ship under it. The macOS client is not in this
 # workspace and stays proprietary: see LICENSE and the licence note in README.md.
 license = "Apache-2.0"
-repository = "https://github.com/hunterh37/WealdRelay"
+repository = "https://github.com/Weald-Protocol/wealdrelay"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

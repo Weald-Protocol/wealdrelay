@@ -14,7 +14,7 @@
 
 [Unit]
 Description=Weald blind relay
-Documentation=https://github.com/hunterh37/WealdRelay/blob/main/specs/backend/relay/server.md
+Documentation=https://github.com/Weald-Protocol/wealdrelay/blob/main/specs/backend/relay/server.md
 After=network-online.target
 Wants=network-online.target
 

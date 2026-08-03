@@ -22,7 +22,7 @@ new workspace.
 
 The smallest useful configuration of this entire system is one person running a
 relay on their own laptop for sub-second sync between their own devices, with no
-server anywhere. That is `brew install hunterh37/tap/wealdrelay`, and it is a
+server anywhere. That is `brew install weald-protocol/tap/wealdrelay`, and it is a
 real deployment rather than a curiosity.
 
 ## Path 0: build it yourself
@@ -47,8 +47,8 @@ There is no `get.weald.team`, no install one-liner piped from a domain, and no
 `latest` tag. Nothing in this directory asks you to trust one.
 
 ```sh
-git clone https://github.com/hunterh37/WealdRelay.git
-cd WealdRelay
+git clone https://github.com/Weald-Protocol/wealdrelay.git
+cd wealdrelay
 cargo build --release --locked -p wealdrelay
 ./target/release/wealdrelay --version
 ```
@@ -144,7 +144,7 @@ that for you:
 ```sh
 tag=wealdrelay-v0.1.0
 target=x86_64-unknown-linux-musl        # or aarch64-unknown-linux-musl
-base=https://github.com/hunterh37/WealdRelay/releases/download/$tag
+base=https://github.com/Weald-Protocol/wealdrelay/releases/download/$tag
 curl -fLO "$base/wealdrelay-$target.tar.gz"
 curl -fLO "$base/wealdrelay-$target.tar.gz.sha256"
 sha256sum --check "wealdrelay-$target.tar.gz.sha256"
@@ -199,7 +199,7 @@ the others produces a broken install:
 
 ## The image reference, and what to update at release time
 
-Every published image is `ghcr.io/hunterh37/weald-relay`, tagged
+Every published image is `ghcr.io/weald-protocol/weald-relay`, tagged
 `wealdrelay-vX.Y.Z` and pinned by digest in the release notes. The release
 workflow publishes no moving tag, deliberately: `latest` would let a customer's
 relay change under them without a deploy they asked for, which is the thing the

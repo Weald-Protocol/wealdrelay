@@ -38,7 +38,7 @@ write_files:
       # RELEASE PIN. The one line in this file to update per release.
       RELAY_VERSION="wealdrelay-v0.1.0"
 
-      REPO="hunterh37/WealdRelay"
+      REPO="Weald-Protocol/wealdrelay"
 
       # An unedited template must not reach ACME. Issuing a certificate for
       # relay.example.com is somebody else's problem being made into a request,

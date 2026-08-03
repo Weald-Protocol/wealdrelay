@@ -24,7 +24,7 @@ services:
     http_port: 8443
     image:
       registry_type: GHCR
-      registry: hunterh37
+      registry: weald-protocol
       repository: weald-relay
       # RELEASE PIN. The one line in this file to update per release. It is a
       # release tag and never `latest`: the release workflow publishes no moving

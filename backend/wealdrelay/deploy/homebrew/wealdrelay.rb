@@ -1,7 +1,7 @@
-# The formula published to the hunterh37/homebrew-tap repository at release
+# The formula published to the Weald-Protocol/homebrew-tap repository at release
 # time.
 #
-#   brew install hunterh37/tap/wealdrelay
+#   brew install weald-protocol/tap/wealdrelay
 #
 # specs/backend/relay/server.md distribution channel 4: for local development,
 # and for a team that genuinely wants to run this on a Mac mini in a cupboard,
@@ -23,13 +23,13 @@
 # how the tap and the release stop agreeing.
 class Wealdrelay < Formula
   desc "Weald blind relay. Stores and forwards envelopes it cannot read"
-  homepage "https://github.com/hunterh37/WealdRelay"
+  homepage "https://github.com/Weald-Protocol/wealdrelay"
   version "0.0.0"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/hunterh37/WealdRelay/releases/download/wealdrelay-v0.0.0/wealdrelay-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/Weald-Protocol/wealdrelay/releases/download/wealdrelay-v0.0.0/wealdrelay-aarch64-apple-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
@@ -44,11 +44,11 @@ class Wealdrelay < Formula
 
   on_linux do
     on_arm do
-      url "https://github.com/hunterh37/WealdRelay/releases/download/wealdrelay-v0.0.0/wealdrelay-aarch64-unknown-linux-musl.tar.gz"
+      url "https://github.com/Weald-Protocol/wealdrelay/releases/download/wealdrelay-v0.0.0/wealdrelay-aarch64-unknown-linux-musl.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
     on_intel do
-      url "https://github.com/hunterh37/WealdRelay/releases/download/wealdrelay-v0.0.0/wealdrelay-x86_64-unknown-linux-musl.tar.gz"
+      url "https://github.com/Weald-Protocol/wealdrelay/releases/download/wealdrelay-v0.0.0/wealdrelay-x86_64-unknown-linux-musl.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end

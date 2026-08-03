@@ -17,7 +17,7 @@ first published, signed, digest-pinned release.
 ## Route A: install.sh
 
 `install.sh` is attached to every release. Download it from the release page for
-the tag you want, https://github.com/hunterh37/WealdRelay/releases, then:
+the tag you want, https://github.com/Weald-Protocol/wealdrelay/releases, then:
 
 ```
 sh install.sh
@@ -42,8 +42,8 @@ start until you fill them in again.
 No release needed, and nothing is downloaded that you have not read.
 
 ```
-git clone https://github.com/hunterh37/WealdRelay.git
-cd WealdRelay/backend/wealdrelay/deploy/compose
+git clone https://github.com/Weald-Protocol/wealdrelay.git
+cd wealdrelay/backend/wealdrelay/deploy/compose
 cp .env.example .env
 $EDITOR .env
 docker compose up -d

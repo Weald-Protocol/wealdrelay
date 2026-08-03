@@ -19,7 +19,7 @@
 # POSIX sh on purpose. This runs on whatever a fresh VPS happens to have.
 set -eu
 
-REPO="${WEALD_RELAY_REPO:-hunterh37/WealdRelay}"
+REPO="${WEALD_RELAY_REPO:-Weald-Protocol/wealdrelay}"
 VERSION="${WEALD_RELAY_VERSION:-latest}"
 DIR="${WEALD_RELAY_DIR:-weald-relay}"
 

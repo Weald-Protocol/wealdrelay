@@ -10,8 +10,8 @@ policy, it is what the binary in this repository does, and the whole point of
 publishing it is that you can check.
 
 ```sh
-git clone https://github.com/hunterh37/WealdRelay.git
-cd WealdRelay
+git clone https://github.com/Weald-Protocol/wealdrelay.git
+cd wealdrelay
 cargo build --release --locked -p wealdrelay
 ./target/release/wealdrelay --version
 ```

@@ -24,11 +24,11 @@ primary_region = "iad"
   # Replace with the digest you verified before deploying. The release workflow
   # publishes no moving tag, so `:latest` would never resolve:
   #
-  #   image = "ghcr.io/hunterh37/weald-relay@sha256:..."
+  #   image = "ghcr.io/weald-protocol/weald-relay@sha256:..."
   #
   # RELEASE PIN. The one line in this file to update per release, and
   # deploy/README.md lists the others.
-  image = "ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0"
+  image = "ghcr.io/weald-protocol/weald-relay:wealdrelay-v0.1.0"
 
 [env]
   WEALD_RELAY_LISTEN = "0.0.0.0:8443"

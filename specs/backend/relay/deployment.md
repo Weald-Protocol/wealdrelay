@@ -82,7 +82,7 @@ Consequences, all of which the docs must state together:
 ## The local case
 
 A team running the relay on a Mac mini in a cupboard is a legitimate deployment
-at this posture, served by `brew install hunterh37/tap/wealdrelay`. The client can
+at this posture, served by `brew install weald-protocol/tap/wealdrelay`. The client can
 also run a relay locally for a solo user who wants sub-second sync across their
 own devices with no server anywhere, which is the smallest useful configuration
 of this entire system and is worth having in the docs as the first example

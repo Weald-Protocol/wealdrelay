@@ -98,14 +98,14 @@ services:
     # which reads as a broken registry rather than as the deliberate absence of
     # a moving tag. Set WEALD_RELAY_IMAGE to the digest you verified:
     #
-    #   WEALD_RELAY_IMAGE=ghcr.io/hunterh37/weald-relay@sha256:...
+    #   WEALD_RELAY_IMAGE=ghcr.io/weald-protocol/weald-relay@sha256:...
     #
     # Until the first release is published this reference does not resolve. That
     # is the honest state of the world and not a configuration error.
     #
     # RELEASE PIN. This is the one line in this file to update per release, and
     # deploy/README.md lists the others.
-    image: ${WEALD_RELAY_IMAGE:-ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0}
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/weald-relay:wealdrelay-v0.1.0}
     restart: unless-stopped
     depends_on:
       postgres:
