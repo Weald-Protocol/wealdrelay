@@ -284,6 +284,18 @@ pub enum FrameTag {
     /// (`specs/backend/relay/lifecycle.md`). It shares the retention chain with
     /// media and shares nothing else.
     Drop = 19,
+    /// One invite administration request, or the relay's answer to one.
+    ///
+    /// Separate from ``FrameTag::Join`` and deliberately so. `JOIN` is the one frame
+    /// a client may send before it has authenticated, because a device redeeming an
+    /// invite has no membership yet. Issuing, listing and revoking are the opposite:
+    /// authenticated, privileged, and refused outright on a session that has not
+    /// completed `AUTH`. Folding them into `JOIN` would have put a privileged
+    /// operation on the one path that by construction has no session behind it, which
+    /// is a gate nobody would ever be sure was closed.
+    ///
+    /// `specs/backend/relay/invites.md`, "Admin controls".
+    Invite = 20,
 }
 
 impl FrameTag {
@@ -308,6 +320,7 @@ impl FrameTag {
             17 => Self::Handshake,
             18 => Self::Join,
             19 => Self::Drop,
+            20 => Self::Invite,
             _ => return None,
         })
     }
@@ -332,6 +345,7 @@ impl FrameTag {
         Self::Handshake,
         Self::Join,
         Self::Drop,
+        Self::Invite,
     ];
 }
 
@@ -508,6 +522,12 @@ pub enum Frame {
     Join {
         body: Vec<u8>,
     },
+    /// One invite administration request or answer, encoded as
+    /// `invite::admin::Request` on the way in and `invite::admin::Response` on the way
+    /// back.
+    Invite {
+        body: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -522,6 +542,7 @@ impl Frame {
             Self::Wrap { .. } => FrameTag::Wrap,
             Self::Handshake { .. } => FrameTag::Handshake,
             Self::Join { .. } => FrameTag::Join,
+            Self::Invite { .. } => FrameTag::Invite,
             Self::Sub { .. } => FrameTag::Sub,
             Self::SubAck { .. } => FrameTag::SubAck,
             Self::Recon { .. } => FrameTag::Recon,
@@ -559,7 +580,10 @@ impl Frame {
             Self::Send { envelope } => envelope.len(),
             Self::Handshake { message, .. } => message.len(),
             Self::Recon { payload, .. } => payload.len(),
-            Self::Access { body } | Self::Wrap { body } | Self::Join { body } => body.len(),
+            Self::Access { body }
+            | Self::Wrap { body }
+            | Self::Join { body }
+            | Self::Invite { body } => body.len(),
             Self::Blob { payload } => payload.len(),
             Self::Connect { groups, .. } => groups.iter().map(Vec::len).sum(),
             // Everything else is headers and integers, covered by the allowance.
@@ -615,6 +639,7 @@ impl Frame {
                 message,
             } => cbor::array(&[cbor::bytes(group), cbor::uint(*seq), cbor::bytes(message)]),
             Self::Join { body } => cbor::array(&[cbor::bytes(body)]),
+            Self::Invite { body } => cbor::array(&[cbor::bytes(body)]),
             Self::Sub { group, from_seq } => {
                 cbor::array(&[cbor::bytes(group), cbor::uint(*from_seq)])
             }
@@ -723,6 +748,12 @@ impl Frame {
             FrameTag::Join => {
                 reader.array(1)?;
                 Self::Join {
+                    body: reader.bytes()?,
+                }
+            }
+            FrameTag::Invite => {
+                reader.array(1)?;
+                Self::Invite {
                     body: reader.bytes()?,
                 }
             }

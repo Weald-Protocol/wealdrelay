@@ -2,10 +2,10 @@
 // Copyright 2026 Dicyanin Labs
 //! Configuration parsing, including every invalid combination.
 //!
-//! The unit gate for configuration is every invalid combination, at the coverage
-//! floor. "Every invalid combination" is read literally here: every key that has a
-//! closed set of values is offered a value outside it, every key that is a number
-//! is offered something that is not,
+//! Step 3's unit gate is "config parsing, including every invalid combination, at
+//! the floor" (`specs/backend/build/phases-relay.md`). "Every invalid combination"
+//! is read literally here: every key that has a closed set of values is offered a
+//! value outside it, every key that is a number is offered something that is not,
 //! and both required-but-missing and set-but-empty are separate cases because they
 //! are separate operator mistakes.
 
@@ -64,9 +64,9 @@ fn the_three_required_keys_are_a_complete_configuration() {
 
 #[test]
 fn access_set_defaults_to_enforce_and_the_release_check_defaults_to_on() {
-    // `enforce` by default is load-bearing. It is `enforce` everywhere, including
-    // local development, so nobody builds against the permissive path and
-    // discovers the difference somewhere it costs something.
+    // `enforce` by default is load-bearing: `environments.md` puts it at `enforce`
+    // in every environment including local, so nobody develops against the
+    // permissive path and discovers the difference in staging.
     let config = Config::resolve(&Values::from_pairs(minimal())).unwrap();
     assert_eq!(config.access_set, AccessSetMode::Enforce);
     assert!(config.release_check);
@@ -92,8 +92,8 @@ fn the_encryption_floor_defaults_to_none_so_a_self_hosted_rollout_is_possible() 
 
 #[test]
 fn every_required_key_is_named_when_it_is_missing() {
-    // The negative proof, at the unit level: an operator whose relay will not
-    // start must be told which variable to fix.
+    // The negative proof for step 3, at the unit level: an operator whose relay
+    // will not start must be told which variable to fix.
     for required in [keys::HOSTNAME, keys::DATABASE_URL, keys::STORAGE_URL] {
         let mut pairs = minimal();
         pairs.retain(|(key, _)| *key != required);
@@ -468,7 +468,7 @@ fn a_relay_toml_naming_something_that_is_not_a_relay_key_is_refused() {
     for (body, expected_key) in [
         ("WEALD_RELAY_HOSTNMAE = \"typo\"\n", "WEALD_RELAY_HOSTNMAE"),
         ("[relay]\nhostnmae = \"typo\"\n", "WEALD_RELAY_HOSTNMAE"),
-        ("SOME_VENDOR_KEY = \"nope\"\n", "SOME_VENDOR_KEY"),
+        ("STRIPE_KEY = \"nope\"\n", "STRIPE_KEY"),
     ] {
         let file = dir.path().join(format!("relay-{expected_key}.toml"));
         std::fs::write(&file, body).unwrap();
@@ -601,26 +601,22 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     let mut deduped = sorted.clone();
     deduped.dedup();
     assert_eq!(sorted, deduped, "keys::ALL has a duplicate");
-    // 17, the last of which is WEALD_RELAY_PROFILE, the key that lets the binary
-    // be told which deployment it is and refuse what that deployment forbids
-    // (`backend/wealdrelay/src/profile.rs`). A count asserted by hand, so adding a
-    // key is a deliberate act rather than a diff nobody reads.
-    assert_eq!(keys::ALL.len(), 17);
+    // 17 since relay step 13 added WEALD_RELAY_PROFILE, the key that lets the
+    // binary be told which deployment it is and refuse what that deployment
+    // forbids (backend/wealdrelay/src/profile.rs). 18 since
+    // WEALD_RELAY_OPERATOR_TOKEN, the bearer the control plane presents on the
+    // operator routes: provider-private networking is a network boundary and not
+    // an authentication one, so the routes that report the admitted count are
+    // mounted only where there is a credential to check them against.
+    assert_eq!(keys::ALL.len(), 18);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
 }
 
 #[test]
 fn no_configuration_key_names_a_commercial_layer_vendor() {
-    // A boundary assertion, not residue: none of these names has ever appeared in
-    // the relay's configuration surface, and the test exists so that none ever
-    // does. The relay is the audited, self-hostable binary. The commercial layer
-    // above it (identity, payments, hosting, licensing, accounts) lives in a
-    // separate service and is deliberately invisible from here, so a key that
-    // named one of those vendors would mean the hosted binary had diverged from
-    // the one anybody can build and read. The list is a sample of what such a key
-    // would most likely be called, checked as a substring so a near miss like
-    // `WEALD_RELAY_BILLING_URL` is caught too. Asserted rather than left to review.
-    // See `specs/backend/relay/server.md`.
+    // `server.md`: a pull request adding a key that points at something in
+    // specs/backend/cloud/ is a trust boundary change, because it would mean the
+    // hosted binary differs from the audited binary. Asserted rather than reviewed.
     for forbidden in [
         "CLERK", "STRIPE", "RENDER", "CLOUD", "CONTROL", "LICENSE", "BILLING", "ACCOUNT",
     ] {
@@ -871,5 +867,36 @@ fn an_optional_key_set_to_nothing_is_refused_wherever_it_appears() {
         ConfigError::Empty {
             key: keys::BOOTSTRAP_HANDOFF_PUBKEY
         }
+    );
+}
+
+/// The operator token never appears in `check-config` output.
+///
+/// It is a shared secret, not a public key, and `check-config` output is the
+/// first thing anybody pastes into a support ticket. The neighbouring handoff
+/// value is a public key and is still reported as `[set]` rather than printed,
+/// so the rule here is the one the file already follows: a configured secret is
+/// reported as configured and never as itself.
+#[test]
+fn the_operator_token_is_reported_as_set_and_never_printed() {
+    let secret = "operator-token-value-0123456789";
+    let resolved = Config::resolve(&Values::from_pairs([
+        (keys::HOSTNAME, "relay.acme.com"),
+        (keys::DATABASE_URL, "postgres://weald@localhost/weald_relay"),
+        (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+        (keys::OPERATOR_TOKEN, secret),
+    ]))
+    .expect("the configuration resolves");
+    assert_eq!(resolved.operator_token.as_deref(), Some(secret));
+
+    let empty: [(&str, &str); 0] = [];
+    let printed = wealdrelay::describe_config(&resolved, &Values::from_pairs(empty));
+    assert!(
+        !printed.contains(secret),
+        "check-config printed the operator token: {printed}"
+    );
+    assert!(
+        printed.contains(keys::OPERATOR_TOKEN),
+        "check-config did not mention the operator token at all: {printed}"
     );
 }

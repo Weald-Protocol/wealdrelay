@@ -85,6 +85,7 @@ fn every_variant() -> Vec<Frame> {
             message: vec![3; 512],
         },
         Frame::Join { body: vec![5; 96] },
+        Frame::Invite { body: vec![6; 64] },
         Frame::Handshake {
             group: wide(9),
             seq: u64::MAX,
@@ -264,8 +265,7 @@ fn every_error_code_has_the_class_the_registry_gives_it() {
     // `scripts/spec-check.sh` walks it rather than the source, so a code the relay
     // can emit and the registry does not list is a code invisible to the check
     // that exists to catch exactly that. `group_ingress_limited` was in that state
-    // until per-group ingress limits landed a row for it, which is why the
-    // assertion is on emptiness
+    // until step 4 added its row, which is why the assertion is on emptiness
     // rather than on a list of known gaps: a known gap is a gap somebody has
     // stopped noticing.
     assert!(

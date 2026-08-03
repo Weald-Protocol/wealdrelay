@@ -34,6 +34,7 @@ const DROP_PAYLOAD: &[u8] = &[10];
 const WRAP_BODY: &[u8] = &[9];
 const HANDSHAKE_MESSAGE: &[u8] = &[10, 11];
 const JOIN_BODY: &[u8] = &[12];
+const INVITE_BODY: &[u8] = &[13];
 const FROM_SEQ: u64 = 5;
 
 /// Every state, so a table-driven test walks them rather than remembering them.
@@ -174,6 +175,9 @@ fn sample(tag: FrameTag) -> Frame {
         FrameTag::Join => Frame::Join {
             body: JOIN_BODY.to_vec(),
         },
+        FrameTag::Invite => Frame::Invite {
+            body: INVITE_BODY.to_vec(),
+        },
         FrameTag::Handshake => Frame::Handshake {
             group: group(4),
             seq: 0,
@@ -242,6 +246,12 @@ fn expected(tag: FrameTag, state: State) -> Expected {
             FrameTag::Join,
         ) => Expected::Deferred(Work::Redeem {
             body: JOIN_BODY.to_vec(),
+        }),
+        // `Ready` only, deliberately narrower than `Join` above: issuing, listing and
+        // revoking are the privileged half of the invite surface, and a bootstrapping
+        // session has no access set to be an authorizer of.
+        (State::Ready, FrameTag::Invite) => Expected::Deferred(Work::AdministerInvite {
+            body: INVITE_BODY.to_vec(),
         }),
         (State::Ready, FrameTag::Handshake) => Expected::Deferred(Work::PublishHandshake {
             group: group(4),
@@ -501,24 +511,30 @@ fn every_frame_in_every_state_follows_the_documented_rule() {
     // the four live states, and `ACCESS` again in `Bootstrapping`. That last one is
     // the whole of the bootstrap hole, and counting it here is what stops it
     // widening: a second frame permitted in that state moves this number and fails.
-    // The count went from twelve to eighteen when recovery and invites landed:
-    // `WRAP` and `HANDSHAKE` became the sixth and seventh content frames in
-    // `Ready`, and `JOIN` is accepted in all four live states because a device
-    // redeeming an invite has no membership to authenticate with yet. Compaction
-    // makes it nineteen: `DROP`, the instruction that carries it, is the eighth
-    // content frame and is `Ready` only, because it names a group and a group is
-    // checked against an authenticated workspace.
+    // The count went from twelve to eighteen in step 8: `WRAP` and `HANDSHAKE`
+    // became the sixth and seventh content frames in `Ready`, and `JOIN` is
+    // accepted in all four live states because a device redeeming an invite has no
+    // membership to authenticate with yet. Step 10 makes it nineteen: `DROP`, the
+    // compaction instruction, is the eighth content frame and is `Ready` only,
+    // because it names a group and a group is checked against an authenticated
+    // workspace.
     //
-    // The bootstrap hole is what this number is really guarding, and it is now two
-    // frames wide rather than one: `ACCESS`, which publishes the genesis set, and
+    // The invite module makes it twenty: `INVITE`, the admin half of the invite
+    // surface, is the ninth content frame and is `Ready` only. Narrower than `JOIN`
+    // on purpose (`specs/invite-module.md`): issuing, listing and revoking are
+    // privileged, and a bootstrapping session has no access set to be an authorizer
+    // of, so there is no state where admitting it could answer anything but no.
+    //
+    // The bootstrap hole is what this number is really guarding, and it is still two
+    // frames wide rather than three: `ACCESS`, which publishes the genesis set, and
     // `JOIN`, which reserves the seat that set is published by. Both are steps of
     // the same enrolment and neither reads anything. A third would move this number
     // and fail here, which is the point.
     assert_eq!(
-        permitted, 19,
-        "CONNECT, AUTH, the eight content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
+        permitted, 20,
+        "CONNECT, AUTH, the nine content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
     );
-    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 19);
+    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 20);
 }
 
 #[test]
@@ -1044,7 +1060,7 @@ fn any_frame() -> impl Strategy<Value = Frame> {
 }
 
 /// Case count comes from the environment so ci can run reduced counts on push
-/// and full counts on a pull request.
+/// and full counts on a pull request, per `specs/backend/build/testing.md`.
 fn proptest_config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
@@ -1106,7 +1122,7 @@ fn auth_ack(key_packages_remaining: u32, write_mode: u8) -> Frame {
     }
 }
 
-// MARK: The running digest (verification.md proof 1)
+// MARK: The running digest (step 12, verification.md proof 1)
 
 #[test]
 fn a_baked_image_digest_is_reported_verbatim_and_is_comparable() {

@@ -91,9 +91,9 @@ pub struct Readiness {
     pub version: String,
     pub database: DependencyState,
     pub storage: DependencyState,
-    /// `enforce` or `off`. Always present, and a relay running `off` says so here,
-    /// because a customer should not have to read their operator's environment
-    /// file to learn which posture they are talking to.
+    /// The field step 3's artifact must contain. `enforce` or `off`, and a relay
+    /// running `off` says so here because a customer should not have to read their
+    /// operator's environment file to learn it.
     pub access_set: &'static str,
     /// `none` or `mls`. Under `none` the client surfaces an explicit "this relay
     /// accepts unencrypted envelopes" state, so the setting has to be reported
@@ -125,10 +125,10 @@ pub struct RelayState {
     pub database: Option<Database>,
     pub storage: Option<Arc<Store>>,
     pub build: crate::BuildInfo,
-    /// The clock, injected. Nothing under test may read a wall clock, and every
-    /// expiry the relay owns is evaluated against its own observed time, so there
-    /// is exactly one place that reads it and everything else is a function of
-    /// what it returned.
+    /// The clock, injected. `specs/backend/build/testing.md` forbids a wall-clock
+    /// read inside anything under test, and every expiry the relay owns is
+    /// evaluated against its own observed time, so there is exactly one place that
+    /// reads it and everything else is a function of what it returned.
     pub clock: Clock,
     /// Set by the release-check timer. Read here, never written here: this module
     /// makes no outbound request.
@@ -138,8 +138,8 @@ pub struct RelayState {
     /// handles only: see `crate::hub` for why nothing else may go in it.
     pub hub: crate::hub::Hub,
     /// Signs the local presigned-URL tokens `media::http` issues when storage is
-    /// the filesystem backend, which is for local development only, where there is
-    /// no real object storage to presign a request
+    /// the filesystem backend. `environments.md` runs the filesystem backend only
+    /// in `local`, where there is no real object storage to presign a request
     /// against, so the relay stands in for one over its own public listener; this
     /// is the process secret that makes those tokens unforgeable. Unused, and
     /// never read, when storage is S3-compatible.
@@ -230,8 +230,8 @@ impl RelayState {
         }
     }
 
-    /// Groups with a contested retention control chain. Empty until the relay has
-    /// a mechanism that can freeze one; the field exists now because `/readyz`
+    /// Groups with a contested retention control chain. Empty until step 10 gives
+    /// something the power to freeze one; the field exists now because `/readyz`
     /// is specified to report it and a poller that learned the field later would
     /// have to learn a new document shape.
     async fn frozen_groups(&self) -> Vec<String> {
@@ -311,10 +311,6 @@ pub fn public_router(state: Arc<RelayState>) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, "ok\n")
-}
-
 /// The invite landing page, at the path the first-run banner prints.
 ///
 /// Routed on the public listener because the whole point of the printed link is
@@ -332,6 +328,10 @@ async fn join_page() -> impl IntoResponse {
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         crate::invite::delivery::landing_page(),
     )
+}
+
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
 }
 
 /// The socket the client actually talks on.
@@ -357,11 +357,97 @@ async fn relay_socket(
 }
 
 /// The private listener. Detailed readiness, bound to loopback by default.
+///
+/// `/admitted` is mounted only where `WEALD_RELAY_OPERATOR_TOKEN` is set, which
+/// is the hosted shape. Two reasons it is conditional rather than always there
+/// and always checked:
+///
+/// - A route that exists but refuses everything is a route a self-hoster has to
+///   reason about. There is no control plane in that deployment and nothing that
+///   would ever call this, so the honest answer to a request for it is 404.
+/// - Mounting only where the credential to authenticate it exists is the pattern
+///   the control plane already uses for its own webhook routes, and it is what
+///   stops an unauthenticated operator surface appearing by omission. A misread
+///   variable name means the route is absent and the provisioner fails loudly,
+///   rather than present and open.
+///
+/// The listener itself is loopback by default and the hosted tier exposes it over
+/// provider-private networking. That is a network boundary, and the token is here
+/// because a network boundary is not an authentication boundary: every other
+/// service in a provider environment can reach this port.
 pub fn private_router(state: Arc<RelayState>) -> Router {
-    Router::new()
+    let operator = state.config.operator_token.is_some();
+    let router = Router::new()
         .route("/readyz", get(readyz))
-        .route("/healthz", get(healthz))
-        .with_state(state)
+        .route("/healthz", get(healthz));
+    let router = if operator {
+        router.route("/admitted", get(admitted))
+    } else {
+        router
+    };
+    router.with_state(state)
+}
+
+/// What `/admitted` answers. One field, and the field is a number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Admitted {
+    pub admitted: i64,
+}
+
+/// Whether this request carried the operator bearer.
+///
+/// Compared in constant time. The token is a fixed string presented on every
+/// poll, so a comparison that returned early would leak its length and then its
+/// bytes to anything that can reach the port, which on a provider network is
+/// more than just us.
+fn operator_authorized(state: &RelayState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(expected) = state.config.operator_token.as_deref() else {
+        return false;
+    };
+    let Some(offered) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let expected = expected.as_bytes();
+    let offered = offered.as_bytes();
+    if expected.len() != offered.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(offered)
+        .fold(0u8, |differences, (a, b)| differences | (a ^ b))
+        == 0
+}
+
+/// `GET /admitted`: how many principals this relay has admitted.
+///
+/// 503 rather than 0 when the database is unreachable. The caller branches on
+/// zero to decide whether a one-time bootstrap invite may still be claimed, and
+/// answering 0 for "I could not look" would hand out bootstrap authority for a
+/// workspace that may already have an admin. An unavailable answer is a retry;
+/// a wrong answer is the trust-root race in `specs/backend/cloud/provisioning.md`.
+async fn admitted(
+    State(state): State<Arc<RelayState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !operator_authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    };
+    match crate::access::store::admitted_principals(database.pool()).await {
+        Ok(admitted) => (StatusCode::OK, Json(Admitted { admitted })).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::logging::scrub(&error.to_string()),
+        )
+            .into_response(),
+    }
 }
 
 async fn readyz(State(state): State<Arc<RelayState>>) -> impl IntoResponse {

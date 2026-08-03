@@ -17,9 +17,9 @@
 //!   deployment ends up in a posture nobody chose, and two of these values
 //!   decide security posture.
 //! - **The relay has no dependency on any commercial-layer vendor.** There is no
-//!   key here that names an identity provider, a payment processor, a hosting
-//!   account or a licence server, and adding one would be a trust boundary
-//!   change because the hosted binary must be the audited binary.
+//!   key here that names anything in `specs/backend/cloud/`, and adding one
+//!   would be a trust boundary change because the hosted binary must be the
+//!   audited binary.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -44,6 +44,23 @@ pub mod keys {
     pub const RELEASE_CHECK: &str = "WEALD_RELAY_RELEASE_CHECK";
     pub const METRICS_GROUP_LABELS: &str = "WEALD_RELAY_METRICS_GROUP_LABELS";
     pub const BOOTSTRAP_HANDOFF_PUBKEY: &str = "WEALD_RELAY_BOOTSTRAP_HANDOFF_PUBKEY";
+    /// The bearer a control plane presents on the operator routes.
+    ///
+    /// `specs/backend/cloud/api.md` requires the relay to report how many
+    /// principals it has admitted, and `provisioning.md` requires the sealed
+    /// bootstrap handoff to be retrievable "over the provider-private path". Both
+    /// are on the observability listener, which is loopback by default and, on the
+    /// hosted tier, is exposed over provider-private networking rather than to the
+    /// internet (`specs/backend/relay/server.md`).
+    ///
+    /// Provider-private is a network boundary, and a network boundary is not an
+    /// authentication boundary: on a shared provider network every other service in
+    /// the environment can reach this port. So the operator routes are mounted only
+    /// where a token exists to check them against, exactly as the control plane
+    /// mounts its own webhook routes only where a signing secret exists. Absent
+    /// means the routes are not there at all, which is the self-host shape: a
+    /// self-hoster has no control plane and reads the invite off stdout.
+    pub const OPERATOR_TOKEN: &str = "WEALD_RELAY_OPERATOR_TOKEN";
     /// Which deployment this is. `self_host` by default; `hosted` refuses the
     /// settings `specs/backend/relay/server.md` says the hosted tier forbids.
     /// Configuration, never a compile-time branch: both profiles are in every
@@ -70,6 +87,7 @@ pub mod keys {
         RELEASE_CHECK,
         METRICS_GROUP_LABELS,
         BOOTSTRAP_HANDOFF_PUBKEY,
+        OPERATOR_TOKEN,
         PROFILE,
     ];
 }
@@ -98,8 +116,7 @@ pub enum MinEncryption {
 }
 
 /// TLS termination. `off` is bounded: the client refuses a plaintext socket
-/// unless the host resolves to loopback, so `off` is a local-development mode
-/// and not a way to run an exposed relay without transport security.
+/// unless the host resolves to loopback, which is step 4's test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     Acme,
@@ -156,6 +173,8 @@ pub struct Config {
     pub release_check: bool,
     pub metrics_group_labels: bool,
     pub bootstrap_handoff_pubkey: Option<String>,
+    /// The operator bearer, or `None` where the operator routes are not mounted.
+    pub operator_token: Option<String>,
     pub profile: crate::profile::Profile,
 }
 
@@ -434,7 +453,7 @@ impl Config {
             retention_days: limit(values, keys::RETENTION_DAYS)?,
             // `enforce` in every environment including local, so nobody ever
             // develops against the permissive path and discovers the difference
-            // once the relay is deployed.
+            // in staging (specs/backend/build/environments.md).
             access_set: one_of(
                 values,
                 keys::ACCESS_SET,
@@ -473,6 +492,7 @@ impl Config {
             metrics_group_labels: on_off(values, keys::METRICS_GROUP_LABELS, false)?,
             bootstrap_handoff_pubkey: optional(values, keys::BOOTSTRAP_HANDOFF_PUBKEY)?
                 .map(str::to_string),
+            operator_token: optional(values, keys::OPERATOR_TOKEN)?.map(str::to_string),
             profile: one_of(
                 values,
                 keys::PROFILE,

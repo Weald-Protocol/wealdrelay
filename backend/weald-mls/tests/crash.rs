@@ -2,9 +2,9 @@
 // Copyright 2026 Dicyanin Labs
 //! Kill the process at every boundary in the one transaction, and prove nothing tore.
 //!
-//! The obligation: kill the process between the MLS state write and the document write at
-//! every injection point, assert recovery on the next launch, and leave no epoch the app
-//! disagrees with.
+//! `specs/backend/build/phases-relay.md` step 7: "Crash: kill the process between MLS
+//! state write and document write at every injection point, assert recovery on next
+//! launch, no epoch the app disagrees with."
 //!
 //! `specs/backend/relay/mls-binding.md`, "State storage", says why: "processing a commit
 //! advances the epoch, and if the app crashes between advancing the MLS state and
@@ -18,7 +18,7 @@
 //! produce a chain fork, because a chain fork is a security alarm on everybody else's
 //! screen."
 //!
-//! The kill is a real one. `harness/crash-victim.rs` calls `std::process::abort`, this
+//! The kill is a real one. `src/bin/crash-victim.rs` calls `std::process::abort`, this
 //! file asserts the child died by signal, and a child that exited cleanly at a point that
 //! asked for a crash fails the case rather than passing it. A test that killed itself with
 //! `panic!` would be measuring Rust's unwinding: a rusqlite transaction rolls itself back
@@ -35,7 +35,7 @@ use openmls_traits::OpenMlsProvider as _;
 use weald_mls::session::{Config, Device};
 use weald_mls::store::Provider;
 
-/// The group the victim works in. Must match the constant in `harness/crash-victim.rs`,
+/// The group the victim works in. Must match the constant in `src/bin/crash-victim.rs`,
 /// which is the process that loads it.
 const GROUP: &[u8] = b"weald-crash-group";
 
@@ -463,16 +463,16 @@ fn one_injection_point(point: &str) -> Row {
     }
 }
 
-/// The recorded artifact for this suite: the crash matrix.
+/// The artifact `phases-relay.md` step 7 asks for: "the crash matrix".
 ///
 /// Written only under `WEALD_MLS_EVIDENCE=1`, so an ordinary `cargo test` does not write
-/// into the tree. The gate sets it.
+/// into the tree. The gate script sets it.
 fn write_evidence(rows: &[Row]) {
-    // `WEALD_GATE_EVIDENCE_DIR` is where the gate that asked for this is looking, and a
-    // gate run can redirect a whole sweep's evidence elsewhere. A matrix written to the
-    // checked-in path while the gate read the redirected directory was the shape that made
-    // this suite fail on a clean checkout and pass locally against the copy an earlier run
-    // had committed. The checked-in path stays the default.
+    // `WEALD_GATE_EVIDENCE_DIR` is where the gate that asked for this is looking.
+    // `scripts/backend-gate.sh --out DIR` redirects a sweep's evidence, and a matrix
+    // written to the checked-in path while the gate read `DIR` was the shape that made
+    // step 7's crash part fail on a clean checkout and pass locally against the copy an
+    // earlier run had committed. The checked-in path stays the default.
     let root = match std::env::var("WEALD_GATE_EVIDENCE_DIR") {
         Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
         _ => Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -485,7 +485,7 @@ fn write_evidence(rows: &[Row]) {
     std::fs::create_dir_all(&root).expect("the evidence directory");
     let document = serde_json::json!({
         "spec": "specs/backend/relay/mls-binding.md#state-storage",
-        "gate": "mls binding, crash consistency",
+        "gate": "specs/backend/build/phases-relay.md step 7, crash",
         "invariant":
             "either the merged commit and the envelopes decrypted under it are both \
              durable, or neither is; and a restart resends the identical reserved \

@@ -84,8 +84,7 @@ pub enum State {
     /// set is signed by its trust root and published over a socket, so the first
     /// connection a workspace ever takes has no set to be checked against. Refusing
     /// it would make a workspace unreachable forever; admitting it to everything
-    /// would make the access set optional, which is exactly what enforcing it is
-    /// supposed to prevent.
+    /// would make the access set optional, which is the hole step 6 exists to close.
     /// So the session is admitted to exactly one frame, `ACCESS`, until a set exists.
     /// `SEND`, `SUB` and `RECON` are refused with the same code a stranger gets.
     Bootstrapping,
@@ -128,20 +127,23 @@ pub enum Work {
     Accept { envelope: Vec<u8> },
     /// Subscribe and backfill from this cursor.
     Subscribe { group: Vec<u8>, from_seq: u64 },
-    /// A negentropy round trip, the set reconciliation half of sync.
+    /// A negentropy round trip, which arrives in step 5.
     Reconcile { group: Vec<u8>, payload: Vec<u8> },
-    /// An access-set rotation, accepted transactionally so a partly applied set
-    /// can never be the one enforced.
+    /// An access-set rotation, accepted transactionally in step 6.
     RotateAccessSet { body: Vec<u8> },
-    /// A blob ticket, the media upload and download path.
+    /// A blob ticket, which arrives in step 9.
     BlobTicket { payload: Vec<u8> },
-    /// One signed `drop_before` compaction instruction.
+    /// One signed `drop_before` compaction instruction (step 10).
     DropBefore { payload: Vec<u8> },
-    /// One recovery wrap, stored under its blinded tag.
+    /// One recovery wrap, stored under its blinded tag (step 8).
     PublishWrap { body: Vec<u8> },
-    /// One step of an invite redemption.
+    /// One step of an invite redemption (step 8).
     Redeem { body: Vec<u8> },
-    /// One MLS handshake message, stored in order and fanned out.
+    /// One invite administration request: issue, list, revoke, or the authority
+    /// question. `Ready` only, unlike ``Work::Redeem``: this is the privileged half
+    /// of the invite surface and its whole gate is that the session authenticated.
+    AdministerInvite { body: Vec<u8> },
+    /// One MLS handshake message, stored in order and fanned out (step 8).
     PublishHandshake { group: Vec<u8>, message: Vec<u8> },
 }
 
@@ -278,8 +280,8 @@ impl Session {
     /// which is what makes the ordering rule a property of this function rather
     /// than of the guards inside it.
     ///
-    /// `now_ms` is injected because nothing under test may read a wall clock, and
-    /// because the clock-skew rule is only checkable if
+    /// `now_ms` is injected because `testing.md` forbids a wall-clock read inside
+    /// anything under test, and because the clock-skew rule is only checkable if
     /// the test controls both clocks.
     pub fn handle(&mut self, frame: Frame, now_ms: u64) -> Reaction {
         match (self.state, frame) {
@@ -400,6 +402,14 @@ impl Session {
             // Ready only, like every other group-addressed frame: a handshake
             // message belongs to a group, and a bootstrapping session has no
             // workspace claim to check a group against.
+            // `Ready` and nothing else, deliberately narrower than `JOIN` above.
+            // A bootstrapping session has no access set to be an authorizer of, so
+            // there is no state in which admitting this frame there could answer
+            // anything but "no", and a refusal is clearer than a frame accepted into
+            // a path that cannot serve it.
+            (State::Ready, Frame::Invite { body }) => {
+                Reaction::Defer(Work::AdministerInvite { body })
+            }
             (State::Ready, Frame::Handshake { group, message, .. }) => {
                 Reaction::Defer(Work::PublishHandshake { group, message })
             }

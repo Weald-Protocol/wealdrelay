@@ -3,10 +3,10 @@
 //! The shared integration harness: a scratch database, a running relay, and a
 //! hand-written WebSocket client.
 //!
-//! Extracted from `tests/ws.rs` when reconciliation added a second integration
-//! suite over the same wire. One harness rather than two, because two would drift
-//! and the whole value of a hand-rolled client is that it speaks the protocol a
-//! real client has to speak rather than the relay's own encoder talking to itself.
+//! Extracted from `tests/ws.rs` when step 5 added a second integration suite over
+//! the same wire. One harness rather than two, because two would drift and the
+//! whole value of a hand-rolled client is that it speaks the protocol a real client
+//! has to speak rather than the relay's own encoder talking to itself.
 //!
 //! Nothing here is a mock. The database is the harness Postgres from
 //! `scripts/weald-stack`, the relay is `serve::run` on ephemeral ports, and the
@@ -41,9 +41,8 @@ pub fn admin_url() -> String {
     )
 }
 
-/// A database of its own per test, because the harness forbids two tests sharing
-/// a database name or a port (see `specs/backend/relay/test-harness.md`), so
-/// suites can run in parallel.
+/// A database of its own per test, because `testing.md` forbids two tests sharing
+/// a database name or a port.
 pub struct Scratch {
     pub name: String,
     pub url: String,
@@ -117,14 +116,13 @@ impl Running {
 
     /// The same, with one hook into the prepared state before it is shared.
     ///
-    /// The media suites need it: `media` behaves differently against an
-    /// S3-compatible bucket than against the filesystem backend (a real presigned
-    /// request rather than a token over the relay's own listener), and pointing a
-    /// relay at the harness MinIO means handing it a client built for that
-    /// endpoint rather than one built from the ambient AWS chain. Nothing is
-    /// faked here: the store the hook installs is the same `storage::Store`
-    /// `storage::open` returns, talking to the same MinIO the storage contract
-    /// suite uses.
+    /// Step 9 needs it: `media` behaves differently against an S3-compatible
+    /// bucket than against the filesystem backend (a real presigned request
+    /// rather than a token over the relay's own listener), and pointing a relay
+    /// at the harness MinIO means handing it a client built for that endpoint
+    /// rather than one built from the ambient AWS chain. Nothing is faked here:
+    /// the store the hook installs is the same `storage::Store` `storage::open`
+    /// returns, talking to the same MinIO the storage contract suite uses.
     pub async fn start_with(
         config: Config,
         clock: Clock,
@@ -344,10 +342,10 @@ impl Client {
     /// issued so a caller can check it was used.
     ///
     /// Signed by ``default_device()``, which is the device every suite's genesis
-    /// access set names. `AUTH` is a real check: the signature is verified against
-    /// the challenge this connection issued, and the key is tested against the
-    /// workspace's access set, so a handshake with a made-up key and a made-up
-    /// signature is a closed socket rather than an `AuthAck`.
+    /// access set names. Step 6 made `AUTH` a real check: the signature is verified
+    /// against the challenge this connection issued, and the key is tested against
+    /// the workspace's access set, so a handshake with a made-up key and a made-up
+    /// signature is now a closed socket rather than an `AuthAck`.
     pub async fn handshake(&mut self, groups: Vec<Vec<u8>>, client_clock: u64) -> Vec<u8> {
         self.handshake_as(&default_device(), groups, client_clock)
             .await
@@ -532,10 +530,10 @@ pub async fn seed_access_set_with_authorizers(
 /// devices every suite uses.
 ///
 /// The access set half is seeded here rather than at each of the thirty call sites.
-/// `enforce` is the default in every environment, so a group in a workspace with no
-/// set puts every connecting client into `Bootstrapping`, where the only frame it
-/// may send is `ACCESS`. Before access-set enforcement landed that state did not
-/// exist and this helper did not need to know about it.
+/// Step 6 made `enforce` the default in every environment, so a group in a workspace
+/// with no set puts every connecting client into `Bootstrapping`, where the only
+/// frame it may send is `ACCESS`. Before step 6 that state did not exist and this
+/// helper did not need to know about it.
 pub async fn make_group(state: &Arc<RelayState>, byte: u8) -> Vec<u8> {
     let pool = state.database.as_ref().expect("a database").pool();
     if wealdrelay::access::store::current(pool, "ws-step4")
@@ -570,11 +568,11 @@ pub fn envelope_for(group: &[u8], body: &[u8]) -> Envelope {
     }
 }
 
-/// Record one reconciliation exchange's cost, as the artifact this suite owes.
+/// Record one reconciliation exchange's cost, for step 5's artifact.
 ///
 /// Written to a file rather than only asserted, because "the reconcile round count
 /// against corpus size" is a gate deliverable and a number nobody wrote down is a
-/// number later work cannot compare against.
+/// number the next step cannot compare against.
 ///
 /// Two things here were wrong on the first attempt and are worth the comment:
 ///
@@ -591,7 +589,7 @@ pub fn record_recon_rounds(label: &str, corpus: usize, rounds: usize) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let directory = root.join("target").join("recon-rounds");
+    let directory = root.join("target").join("step-05");
     let _ = std::fs::create_dir_all(&directory);
     let slug: String = label
         .chars()
@@ -603,7 +601,7 @@ pub fn record_recon_rounds(label: &str, corpus: usize, rounds: usize) {
     );
 }
 
-// MARK: Media blobs
+// MARK: Step 9, media blobs
 //
 // The retention chain is signed with the same `ed25519_dalek` keys every other
 // suite uses and verified by the same `access::verify` the relay calls, so a
@@ -813,8 +811,8 @@ pub fn sign_all(signing_bytes: &[u8], signers: &[SigningKey]) -> Vec<Signature> 
 /// `tests/integration.rs` gives for its own one-line GET: the whole need is a
 /// handful of requests against a relay on 127.0.0.1, and a client crate would be
 /// a dependency the relay does not otherwise have. This one carries a body and
-/// returns bytes, because a media upload puts ciphertext through a presigned URL
-/// and a lossy string would not survive it.
+/// returns bytes, because step 9 uploads ciphertext through a presigned URL and
+/// a lossy string would not survive it.
 pub async fn http_request(
     address: std::net::SocketAddr,
     method: &str,

@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! The relay binary's integration proof, against real dependencies.
+//! Step 3's integration proof, against real dependencies.
 //!
-//! What has to hold: the binary against real Postgres and real MinIO, migrations
-//! from zero, `/readyz` truthful, restart with state intact. Every one of those
-//! words is load-bearing and none of them is satisfiable with a mock, so nothing
-//! here is mocked.
+//! `specs/backend/build/phases-relay.md`: "the binary against real Postgres and
+//! real MinIO, migrations from zero, `/readyz` truthful, restart with state
+//! intact". Every one of those words is load-bearing and none of them is
+//! satisfiable with a mock, so nothing here is mocked.
 //!
 //! The dependencies come from the local harness (`scripts/weald-stack up`). If
 //! they are not there these tests **fail** rather than skip. A skipped integration
 //! proof that reports success is the exact failure mode this programme exists to
-//! prevent, and nothing the customer runs may be mocked in its place.
+//! prevent: `specs/backend/build/testing.md` puts real Postgres and real object
+//! storage in tier 3 and says "no mock of anything the customer runs".
 //!
-//! Each test gets its own database, created and dropped here, because no test may
-//! share a port or a database name with another.
+//! Each test gets its own database, created and dropped here, because
+//! `testing.md` requires that no test share a port or a database name with
+//! another.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -107,7 +109,7 @@ fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
         (keys::DATABASE_URL, scratch.url.clone()),
         (keys::STORAGE_URL, format!("file://{}", blobs.display())),
         // Port zero: the operating system assigns, so no test shares a port with
-        // another. No test in this repository may hard-code a port.
+        // another. `testing.md` requires exactly this.
         (keys::LISTEN, "127.0.0.1:0".to_string()),
         (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
         // The one thing every environment agrees on, including local.
@@ -443,8 +445,8 @@ async fn the_per_group_counter_hands_out_sequence_numbers_without_touching_other
     // `operations.md`: sequence assignment is a single UPDATE ... RETURNING against
     // a per-group counter row inside the same transaction as the insert, so the
     // lock is per group and unrelated groups never contend. This asserts the shape
-    // the accept path will use, against the real database, before there is an
-    // accept path to get it wrong.
+    // the accept path in step 4 will use, against the real database, before there
+    // is an accept path to get it wrong.
     let scratch = Scratch::new("counter").await;
     let blobs = tempfile::tempdir().unwrap();
     let state = serve::prepare(config_for(&scratch, blobs.path()))
@@ -497,9 +499,7 @@ async fn readyz_reports_both_dependencies_and_the_security_posture() {
     assert!(readiness.database.ok, "{:?}", readiness.database);
     assert!(readiness.storage.ok, "{:?}", readiness.storage);
     assert!(readiness.ready);
-    // The field that says whether the relay is checking access sets at all. It has
-    // to be on the readiness document, because an operator otherwise cannot tell an
-    // enforcing relay from one that admits anyone.
+    // The field step 3's artifact must contain.
     assert_eq!(readiness.access_set, "enforce");
     assert_eq!(readiness.min_enc, "none");
     assert_eq!(readiness.write_mode, "full");
@@ -615,10 +615,10 @@ async fn a_relay_running_access_set_off_says_so_on_readyz() {
 #[tokio::test]
 async fn a_frozen_group_is_named_on_readyz_and_stops_readiness() {
     // `media.md`: a group whose retention control chain has a contested successor
-    // is reported as frozen on `/readyz`. Nothing in this suite drives a retention
-    // chain into contention, so the column is set directly here: the point is that
-    // the document reports it, and a poller that learned the field later would have
-    // to learn a new document shape.
+    // is reported as frozen on `/readyz`. Nothing can freeze a group until step 10,
+    // so the column is set directly here: the point is that the document reports
+    // it, and a poller that learned the field later would have to learn a new
+    // document shape.
     let scratch = Scratch::new("frozen").await;
     let blobs = tempfile::tempdir().unwrap();
     let state = serve::prepare(config_for(&scratch, blobs.path()))
@@ -904,6 +904,31 @@ async fn the_relay_starts_against_real_minio() {
 /// A minimal HTTP GET. Written here rather than pulled in as a dependency because
 /// the whole need is one request against loopback, and a client crate would be a
 /// dependency the relay does not otherwise have.
+/// A GET carrying an `Authorization: Bearer`, for the operator routes.
+async fn get_with_bearer(url: &str, token: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let without_scheme = url.strip_prefix("http://").expect("an http url");
+    let (authority, path) = without_scheme.split_once('/').expect("a path");
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .expect("connect to the relay");
+    let request = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let text = String::from_utf8_lossy(&response).to_string();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
 async fn get(url: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let without_scheme = url.strip_prefix("http://").expect("an http url");
@@ -1459,4 +1484,107 @@ async fn the_bootstrap_workspace_is_derived_from_the_relays_own_hostname() {
         serve::bootstrap_workspace("relay.acme.com"),
         serve::bootstrap_workspace("relay.other.com")
     );
+}
+
+// MARK: The operator surface
+
+/// `GET /admitted`, the count the control plane branches on, over a real socket
+/// against a real database.
+///
+/// `specs/backend/cloud/api.md` requires this route and
+/// `weald-cloud/src/provisioner/render-operations.ts` already calls it. It did not
+/// exist: the relay served `/healthz` and `/readyz` and nothing else, so every
+/// hosted bootstrap availability check and every reprovision decision would have
+/// read a 404 against a real relay.
+///
+/// Four things are asserted together because they are one contract: the route is
+/// on the private listener and not the public one, it refuses a request with no
+/// bearer and one with the wrong bearer, it answers the right shape with the right
+/// one, and the number it reports is the number the store reports.
+#[tokio::test]
+async fn the_operator_route_answers_the_admitted_count_and_refuses_everyone_else() {
+    let scratch = Scratch::new("admitted_route").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let mut config = config_for(&scratch, blobs.path());
+    config.operator_token = Some("operator-token-value-0123456789".to_string());
+    let state = Arc::new(serve::prepare(config).await.unwrap());
+    let (public, private) = serve::bind(&state).await.unwrap();
+    let public_address = public.local_addr().unwrap();
+    let private_address = private.local_addr().unwrap();
+
+    let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(serve::run(Arc::clone(&state), public, private, async {
+        let _ = wait.await;
+    }));
+
+    // Not on the public listener. The roster size is not a fact for the internet:
+    // `server.md` keeps the public listener to liveness and nothing else.
+    let (status, _) = get(&format!("http://{public_address}/admitted")).await;
+    assert_eq!(status, 404, "the public listener served the admitted count");
+
+    // Provider-private is a network boundary, not an authentication boundary.
+    let (status, _) = get(&format!("http://{private_address}/admitted")).await;
+    assert_eq!(status, 401, "an unauthenticated caller read the count");
+    let (status, _) = get_with_bearer(
+        &format!("http://{private_address}/admitted"),
+        "operator-token-value-0123456780",
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "a wrong token of the right length was accepted"
+    );
+
+    // The real answer, and it is zero: nothing has been admitted.
+    let (status, body) = get_with_bearer(
+        &format!("http://{private_address}/admitted"),
+        "operator-token-value-0123456789",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(document["admitted"], 0);
+    // A count, and nothing else about the roster (`api.md`).
+    assert_eq!(
+        document.as_object().map(|fields| fields.len()),
+        Some(1),
+        "the admitted document carried more than the count: {body}"
+    );
+
+    let _ = stop.send(());
+    let _ = served.await;
+    scratch.drop_database().await;
+}
+
+/// Without a token the route is absent, which is the self-host shape.
+///
+/// A self-hoster has no control plane and nothing that would ever call this, so
+/// 404 is the honest answer. Mounting it always and refusing always would leave a
+/// surface to reason about that nobody in that deployment can use, and a variable
+/// name misread in the hosted one would then leave it mounted and open rather than
+/// absent and loud.
+#[tokio::test]
+async fn a_relay_with_no_operator_token_does_not_serve_the_route_at_all() {
+    let scratch = Scratch::new("admitted_selfhost").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let config = config_for(&scratch, blobs.path());
+    assert!(config.operator_token.is_none(), "the default is no token");
+    let state = Arc::new(serve::prepare(config).await.unwrap());
+    let (public, private) = serve::bind(&state).await.unwrap();
+    let private_address = private.local_addr().unwrap();
+
+    let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+    let served = tokio::spawn(serve::run(Arc::clone(&state), public, private, async {
+        let _ = wait.await;
+    }));
+
+    let (status, _) = get(&format!("http://{private_address}/admitted")).await;
+    assert_eq!(status, 404, "an unauthenticable route was mounted anyway");
+    // Readiness is unaffected: it is not an operator route.
+    let (status, _) = get(&format!("http://{private_address}/readyz")).await;
+    assert_eq!(status, 200);
+
+    let _ = stop.send(());
+    let _ = served.await;
+    scratch.drop_database().await;
 }

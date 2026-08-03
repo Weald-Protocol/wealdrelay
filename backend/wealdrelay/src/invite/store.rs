@@ -61,6 +61,34 @@ impl StoreError {
     }
 }
 
+/// The same mapping, for the sibling modules that run their own queries.
+///
+/// `invite::admin` reads a summary view this module has no other reason to expose, and
+/// a second private copy of this conversion would be a second place for a database
+/// error to be reported as something else.
+pub fn db_error(error: sqlx::Error) -> StoreError {
+    db(error)
+}
+
+/// Whether a token belongs to this workspace.
+///
+/// Answered before any write on the admin path, so an authorizer of one workspace
+/// cannot revoke another workspace's invite by presenting its token. `false` for a
+/// token that does not exist at all, which is the same answer and deliberately so.
+pub async fn belongs_to(
+    pool: &PgPool,
+    token: &[u8],
+    workspace_id: &str,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query("select 1 from relay_invite where token = $1 and workspace_id = $2")
+        .bind(token)
+        .bind(workspace_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db)?;
+    Ok(row.is_some())
+}
+
 pub(super) fn db(error: sqlx::Error) -> StoreError {
     StoreError::Database(crate::logging::scrub(&error.to_string()))
 }

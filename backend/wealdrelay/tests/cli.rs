@@ -4,11 +4,11 @@
 //! cannot reach a `main`, and a `main` nobody runs is where an argument
 //! handling mistake hides.
 //!
-//! It is also where the configuration negative proof is made against a real
-//! process: a missing required variable exits non-zero with a message naming the
-//! variable. An operator whose relay will not start reads that message and nothing
-//! else, so the test that guarantees it has to run the process rather than the
-//! function.
+//! It is also where step 3's negative proof is made against a real process:
+//! "a missing required variable exits non-zero with a message naming the
+//! variable" (`specs/backend/build/phases-relay.md`). An operator whose relay will
+//! not start reads that message and nothing else, so the test that guarantees it
+//! has to run the process rather than the function.
 
 use std::process::Command;
 
@@ -108,7 +108,7 @@ fn help_goes_to_stdout_with_a_zero_exit() {
 
 #[test]
 fn serving_without_a_configuration_exits_non_zero_and_names_the_missing_variable() {
-    // The configuration negative proof, at the process boundary. The exit code is
+    // Step 3's negative proof, at the process boundary. The exit code is
     // `EX_CONFIG` so an init system or a compose healthcheck can tell a
     // misconfiguration apart from a crash.
     let (stdout, stderr, code) = run(&[]);
@@ -235,14 +235,14 @@ fn a_relay_toml_in_the_working_directory_is_read() {
 fn a_malformed_relay_toml_stops_the_process_and_names_the_file() {
     let scratch = std::env::temp_dir().join(format!("weald-cli-bad-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
-    std::fs::write(scratch.join("relay.toml"), "SOME_VENDOR_KEY = \"nope\"\n").unwrap();
+    std::fs::write(scratch.join("relay.toml"), "STRIPE_KEY = \"nope\"\n").unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_wealdrelay"));
     keep_instrumentation(&mut command);
     let out = command.current_dir(&scratch).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(78), "{stderr}");
-    assert!(stderr.contains("SOME_VENDOR_KEY"), "{stderr}");
+    assert!(stderr.contains("STRIPE_KEY"), "{stderr}");
     assert!(stderr.contains("relay.toml"), "{stderr}");
     let _ = std::fs::remove_dir_all(&scratch);
 }

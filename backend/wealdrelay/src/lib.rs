@@ -2,14 +2,14 @@
 // Copyright 2026 Dicyanin Labs
 //! The Weald blind relay.
 //!
-//! The build root, the toolchain pin and the coverage gate came first. On top of
-//! them sits the skeleton the rest of the relay is built from: configuration, the
-//! Postgres schema, the object storage abstraction, the two health surfaces and
-//! the logging layer.
+//! Step 0 established the build root, the toolchain pin and the coverage gate.
+//! Step 3 adds the skeleton: configuration, the Postgres schema, the object
+//! storage abstraction, the two health surfaces and the logging layer
+//! (`specs/backend/build/phases-relay.md`).
 //!
-//! The wire protocol is deliberately not part of that skeleton. A relay that
-//! could accept an envelope before its storage contract was proven would have no
-//! way to show that the storage contract holds, and showing it is the point.
+//! The wire protocol is deliberately not here. A relay that could accept an
+//! envelope before its storage contract was proven would have no way to show
+//! that the storage contract holds, which is the whole of step 3's gate.
 //!
 //! `BuildInfo` below is the identity the relay must be able to report about
 //! itself, because `specs/backend/relay/verification.md` proof 1 turns on a
@@ -39,7 +39,8 @@ pub mod storage;
 pub mod sync;
 pub mod ws;
 
-/// Identity of this build, reported by `wealdrelay --version` and by `/readyz`.
+/// Identity of this build, reported by `wealdrelay --version` and, from step 3,
+/// by `/readyz`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildInfo {
     pub name: &'static str,
@@ -58,7 +59,7 @@ pub struct BuildInfo {
 /// Two forms, and they are deliberately not interchangeable.
 ///
 /// - `sha256:<64 hex>` is the published image manifest digest, baked in at image
-///   build time from the same value the reproducible build agreed on. Only
+///   build time from the same value step 13's reproducible build agreed on. Only
 ///   this form is ever compared against a release.
 /// - `exe-blake3:<64 hex>` is this process hashing its own executable, used when
 ///   nothing baked a digest in. It is a true statement about the running binary
@@ -128,9 +129,8 @@ impl BuildInfo {
         }
     }
 
-    /// One line, stable in shape, because the reproducibility check diffs it
-    /// across independent builds and a formatting change would read as a
-    /// reproducibility failure.
+    /// One line, stable in shape, because step 13 diffs it across independent
+    /// builds and a formatting change would read as a reproducibility failure.
     pub fn line(&self) -> String {
         format!("{} {}", self.name, self.version)
     }
@@ -235,8 +235,9 @@ pub enum Startup {
 /// Resolve argv and the environment into an action.
 ///
 /// A missing or unusable configuration value returns `Print` with a non-zero code
-/// and a message **naming the key**, because an operator whose relay will not
-/// start must be told which variable to fix rather than left to guess.
+/// and a message **naming the key**, which is step 3's negative proof: an operator
+/// whose relay will not start must be told which variable to fix rather than left
+/// to guess.
 pub fn startup<I, S>(args: I, values: &config::Values) -> Startup
 where
     I: IntoIterator<Item = S>,
@@ -336,6 +337,16 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
     row(
         keys::BOOTSTRAP_HANDOFF_PUBKEY,
         match resolved.bootstrap_handoff_pubkey {
+            Some(_) => "[set]".to_string(),
+            None => "unset".to_string(),
+        },
+    );
+    // Set or unset, never the value. This one is a shared secret rather than a
+    // public key, and `check-config` output is the first thing anybody pastes
+    // into a support ticket.
+    row(
+        keys::OPERATOR_TOKEN,
+        match resolved.operator_token {
             Some(_) => "[set]".to_string(),
             None => "unset".to_string(),
         },

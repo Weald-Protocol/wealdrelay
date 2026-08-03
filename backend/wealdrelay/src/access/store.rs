@@ -485,8 +485,8 @@ pub async fn admits(
     // lookup cannot miss, a SQL `exists` is `bool` by the parser regardless of the
     // catalog, and `exists` is never null. A `?` no database state can reach is a line
     // no test can honestly cover, and the coverage floor for this file is 100 percent
-    // with no coverage-exclusion attribute permitted anywhere near the access set.
-    // The fix is to not write the branch.
+    // with no exclusions permitted anywhere near the access set
+    // (`specs/backend/build/testing.md`). The fix is to not write the branch.
     let present: bool = sqlx::query_scalar(
         "select exists ( \
              select 1 from relay_access_entry e \
@@ -645,9 +645,10 @@ pub async fn admission(
 /// not, and carrying that mark into a freshly issued grant would void the new one on
 /// the next publication for something the old one did.
 ///
-/// The invite machinery that creates these lives in
-/// `specs/backend/relay/invites.md`; what this function owes is that a grant, once
-/// it exists, dies exactly when the three rules say it does.
+/// The
+/// invite machinery that creates these arrives with `specs/backend/relay/invites.md`;
+/// what step 6 owes is that a grant, once it exists, dies exactly when the three
+/// rules say it does.
 pub async fn grant(
     pool: &PgPool,
     workspace: &str,
@@ -743,4 +744,37 @@ pub async fn workspace_of(pool: &PgPool, group: &[u8]) -> Result<Option<String>,
         Some(row) => Ok(Some(row.try_get::<String, _>("workspace_id").map_err(db)?)),
         None => Ok(None),
     }
+}
+
+/// How many principals this relay has admitted, across every workspace on it.
+///
+/// A count, and nothing else. `specs/backend/cloud/api.md` is unusually specific
+/// about the shape: `POST /instances/:id/bootstrap` is available only while the
+/// instance reports zero admitted principals, and "the relay exposes that count
+/// and nothing else about the roster". Reprovision then branches on the same
+/// number and is explicitly forbidden from learning whether the admitted
+/// principal is the paying account, because that would link billing identity to
+/// workspace identity.
+///
+/// So this returns a number. Not identities, not entry hashes, not a per
+/// workspace breakdown: each of those is a trust-boundary change and belongs in
+/// `specs/backend/relay/overview.md` rather than in a convenience return type.
+///
+/// Counted over the newest version of each workspace's access set, because that
+/// is what "currently admitted" means: a device revoked in version 4 is in
+/// version 3's entry list forever, and summing every version would report a
+/// roster that has never existed. Zero before any set is published, which is the
+/// state a freshly provisioned relay is in and the one the bootstrap claim
+/// requires.
+pub async fn admitted_principals(pool: &PgPool) -> Result<i64, StoreError> {
+    let row = sqlx::query(
+        "select count(*) as admitted from relay_access_entry e \
+         join (select workspace_id, max(version) as version \
+               from relay_access_set group by workspace_id) latest \
+           on latest.workspace_id = e.workspace_id and latest.version = e.version",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
+    row.try_get::<i64, _>("admitted").map_err(db)
 }

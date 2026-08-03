@@ -2,9 +2,9 @@
 // Copyright 2026 Dicyanin Labs
 //! Two clients over real sockets, against a real relay and a real database.
 //!
-//! The integration proof for the live path: two clients over real sockets, publish
-//! to subscribe latency measured on the fixture workspace and recorded as the
-//! baseline every later change is compared against.
+//! Step 4's integration proof, from `specs/backend/build/phases-relay.md`: "two
+//! clients over real sockets, publish to subscribe latency measured on the fixture
+//! workspace and recorded as the baseline every later step is compared against".
 //!
 //! Nothing here is mocked. The relay is `serve::run` on ephemeral ports, the
 //! sockets are real WebSockets, and the database is the harness Postgres. The
@@ -108,10 +108,10 @@ async fn two_clients_over_real_sockets_publish_and_subscribe() {
         other => panic!("expected a SendAck for the retry, got {other:?}"),
     }
 
-    // Bo subscribed before any of that, so the three envelopes arrive on its socket
-    // as they are accepted, with the relay-assigned sequence numbers. This is
-    // `wire.md`'s live path, and it is what the first version of this test could not
-    // assert because the relay had no fanout yet.
+    // Bo subscribed before any of that, so from step 5 the three envelopes arrive on
+    // its socket as they are accepted, with the relay-assigned sequence numbers.
+    // This is `wire.md`'s live path, and it is what step 4's version of this test
+    // could not assert because the relay had no fanout yet.
     //
     // A repeat is allowed here and is not a relay bug. `sync::subscribe` registers
     // the connection after the acknowledgement and before the backfill read, and an
@@ -321,8 +321,7 @@ async fn the_publish_to_acknowledge_latency_is_recorded_as_the_baseline() {
 
     // Recorded where the gate can pick it up. The fixture hash goes in the same
     // file, because a performance number without one is not a number.
-    let out =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/publish-latency");
+    let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/step-04");
     std::fs::create_dir_all(&out).expect("create the evidence directory");
     let text = format!(
         "# Publish to acknowledge, over a real socket against a real Postgres\n\
@@ -330,7 +329,7 @@ async fn the_publish_to_acknowledge_latency_is_recorded_as_the_baseline() {
          # One client, one group, 200 samples after 20 warm-up writes. Each sample is\n\
          # a whole SEND to SendAck round trip: encode, mask, write, the relay's\n\
          # duplicate check, its per-group counter claim, the insert, the commit, and\n\
-         # the acknowledgement back. This is the baseline every later change is\n\
+         # the acknowledgement back. This is the baseline every later step is\n\
          # compared against.\n\
          \n\
          samples    {}\n\
@@ -718,8 +717,8 @@ async fn a_plaintext_envelope_is_denied_when_the_relay_requires_mls() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_this_build_cannot_parse_is_refused_with_a_code_rather_than_silence() {
-    // There is no unserved frame left to send. `RECON`, `ACCESS` and `BLOB` were
-    // each on this list until the relay learned to serve them; each now has its own
+    // There is no unserved frame left to send. `RECON` was on this list until step 5
+    // served it, `ACCESS` until step 6, and `BLOB` until step 9; each now has its own
     // suite, in `tests/reconcile.rs`, `tests/access.rs` and `tests/media_socket.rs`.
     //
     // What the test was really holding is a rule that outlives the list: a frame the

@@ -40,6 +40,23 @@ pub enum Request {
     },
     /// The sealed `GroupInfo` bundles for one scope of a reserved invite.
     Bundles { token: Vec<u8>, group: Vec<u8> },
+    /// The record itself, so a joiner can verify the issuer's signature and learn
+    /// which scopes the invite carries.
+    ///
+    /// `invites.md` step 5 requires both, and until this step existed neither was
+    /// possible: a client had no way to fetch the record, so it could not check that
+    /// the invite chained to the workspace trust root rather than to whoever holds the
+    /// relay, and it could not know which groups to ask for bundles of. It was
+    /// guessing, which for a joiner that knows nothing about the workspace means it
+    /// could not proceed at all.
+    ///
+    /// Answered with the bytes the issuer signed, byte for byte, never re-encoded, so
+    /// the signature is checked over the issuer's encoder and not over the relay's.
+    /// Not gated on a reservation and deliberately not: the record is public to
+    /// whoever holds the token, it contains no code, no secret and nothing but
+    /// ciphertext nobody without the fragment can open, and gating it would mean
+    /// spending a code attempt to find out an invite is malformed.
+    Record { token: Vec<u8> },
     /// This scope is entered. The last one consumes the seat.
     Commit {
         token: Vec<u8>,
@@ -58,6 +75,10 @@ pub enum Response {
     Bundles(Vec<super::EncBundle>),
     /// The receipt for a scope commit, which is a hash of what it is a receipt for.
     Committed { receipt: Vec<u8> },
+    /// The stored record, exactly as its issuer signed it. Empty for a token that
+    /// does not exist, which is the same answer as for one that does and was revoked:
+    /// this path stays uninformative about which tokens are real.
+    Record { body: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -104,6 +125,7 @@ impl Request {
             Self::Bundles { token, group } => {
                 cbor::array(&[cbor::uint(1), cbor::bytes(token), cbor::bytes(group)])
             }
+            Self::Record { token } => cbor::array(&[cbor::uint(3), cbor::bytes(token)]),
             Self::Commit {
                 token,
                 nonce,
@@ -144,7 +166,10 @@ impl Request {
                 device: reader.bytes()?,
                 group: reader.bytes()?,
             },
-            (0..=2, count) => {
+            (3, 2) => Self::Record {
+                token: reader.bytes()?,
+            },
+            (0..=3, count) => {
                 return Err(RedeemError::Malformed(format!(
                     "step {step} takes a different number of fields than {count}"
                 )))
@@ -179,6 +204,7 @@ impl Response {
                 ),
             ]),
             Self::Committed { receipt } => cbor::array(&[cbor::uint(2), cbor::bytes(receipt)]),
+            Self::Record { body } => cbor::array(&[cbor::uint(3), cbor::bytes(body)]),
         }
     }
 
@@ -212,6 +238,9 @@ impl Response {
             }
             2 => Self::Committed {
                 receipt: reader.bytes()?,
+            },
+            3 => Self::Record {
+                body: reader.bytes()?,
             },
             other => return Err(RedeemError::UnknownStep(other)),
         };

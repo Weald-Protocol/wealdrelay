@@ -390,9 +390,9 @@ async fn admit(state: &Arc<RelayState>, session: &Session, device_key: &[u8]) ->
     use crate::config::AccessSetMode;
 
     if matches!(state.config.access_set, AccessSetMode::Off) {
-        // Exactly one suite runs with enforcement off, and only to assert that
-        // `/readyz` reports the difference. It is `enforce` in every deployment
-        // worth running, and the health surface says which one this is.
+        // `environments.md` allows exactly one ci suite to run with enforcement off,
+        // to assert that `/readyz` reports the difference. It is `enforce` in every
+        // environment we operate, and the health surface says which one this is.
         // Unsalted here on purpose: with no set there is no salt to be consistent
         // with, and a hash of the key alone is a stable handle for eviction that
         // claims nothing about membership.
@@ -598,6 +598,63 @@ async fn publish_wrap(
 /// Every refusal is `invite::UNAVAILABLE`. Not one code per reason: an endpoint that
 /// answered "wrong code" differently from "no such token" is an endpoint that
 /// confirms which tokens exist, and this one is reachable without authenticating.
+/// Issue, list or revoke an invite, for a session that has authenticated.
+///
+/// The workspace comes from the session's own authorization and the device key from
+/// what it authenticated with, so neither is taken from the frame: a caller that could
+/// name its own workspace here would be a caller that could issue invites into
+/// somebody else's.
+async fn administer_invite(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &Session,
+    body: Vec<u8>,
+) -> bool {
+    use crate::invite::admin::{self, Request};
+
+    let request = match Request::decode(&body) {
+        Ok(request) => request,
+        Err(error) => return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+    };
+    let Some(database) = &state.database else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
+    // `Ready` is the only state this work item is produced from, so both of these are
+    // present by construction. Handled rather than unwrapped anyway: an unwrap in the
+    // privileged path is a panic waiting for a state machine change nobody re-read.
+    let (Some(workspace), Some(device_key)) =
+        (session.authorized_workspace(), session.device_key())
+    else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(
+                ErrorCode::WriterNotInAccessSet,
+            ))],
+        );
+    };
+
+    match admin::handle(
+        database.pool(),
+        workspace,
+        device_key,
+        request,
+        state.now_ms() as i64,
+    )
+    .await
+    {
+        Ok(response) => queue_all(
+            sender,
+            vec![Frame::Invite {
+                body: response.encode(),
+            }],
+        ),
+        Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
+    }
+}
+
 async fn redeem(
     sender: &OutboundSender,
     state: &Arc<RelayState>,
@@ -630,6 +687,7 @@ async fn redeem(
     let token = match &request {
         Request::Reserve { token, .. }
         | Request::Bundles { token, .. }
+        | Request::Record { token, .. }
         | Request::Commit { token, .. } => token.clone(),
     };
     let Ok(Some(record)) = store::fetch(pool, &token).await else {
@@ -681,6 +739,29 @@ async fn redeem(
                 Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
             }
         }
+        Request::Record { .. } => match store::fetch(pool, &token).await {
+            // The issuer's own bytes, never re-encoded. A client verifies the
+            // signature over what the issuer signed, not over this relay's encoder.
+            Ok(Some(record)) => queue_all(
+                sender,
+                vec![Frame::Join {
+                    body: Response::Record { body: record.body }.encode(),
+                }],
+            ),
+            // An empty body for a token that does not exist, and the same empty body
+            // for one that does: this path stays uninformative about which tokens are
+            // real, which is the whole reason the refusals here are flat.
+            Ok(None) => queue_all(
+                sender,
+                vec![Frame::Join {
+                    body: Response::Record { body: Vec::new() }.encode(),
+                }],
+            ),
+            Err(_) => queue_all(
+                sender,
+                vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+            ),
+        },
         Request::Bundles { group, .. } => match store::bundles_for(pool, &token, &group).await {
             // Ciphertext, served back. The relay holds no key for any of it: the
             // private half of `update_pub` is derived by the joiner from bytes that
@@ -1044,6 +1125,7 @@ pub async fn perform(
         Work::RotateAccessSet { body } => rotate_access_set(sender, state, session, body).await,
         Work::PublishWrap { body } => publish_wrap(sender, state, session, body).await,
         Work::Redeem { body } => redeem(sender, state, session, body).await,
+        Work::AdministerInvite { body } => administer_invite(sender, state, session, body).await,
         Work::PublishHandshake { group, message } => {
             publish_handshake(sender, state, session, connection, group, message).await
         }

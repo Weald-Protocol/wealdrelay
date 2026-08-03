@@ -3,8 +3,7 @@
 //! The access set against real Postgres: the transaction, the chain, and the one
 //! question `AUTH` asks.
 //!
-//! The integration half of access-set enforcement. Nothing here is mocked and
-//! nothing here is skipped:
+//! Step 6's integration half. Nothing here is mocked and nothing here is skipped:
 //! the harness Postgres is the database, the migrations are the ones the binary
 //! embeds, and the compare-and-swap is proven by two writers racing rather than by
 //! reading the SQL.
@@ -623,9 +622,8 @@ async fn a_group_names_its_workspace_and_an_unknown_group_names_none() {
 
 #[tokio::test]
 async fn exactly_the_currently_authorised_principals_are_admitted() {
-    // The property access-set enforcement has to hold: for any sequence of grants
-    // and revocations, exactly the currently authorized principals can open a
-    // socket. Randomised over both
+    // Step 6's property gate: "for any sequence of grants and revocations, exactly
+    // the currently authorized principals can open a socket". Randomised over both
     // mechanisms at once, because the two interact: a grant is voided implicitly by
     // a publication, and a publication's removals are the other half of offboarding.
     //
@@ -760,9 +758,10 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
 
 #[tokio::test]
 async fn the_access_tables_hold_salted_hashes_and_the_keys_they_must_verify_and_nothing_else() {
-    // The access set table dump, showing salted hashes and nothing else. Written out
-    // as a file rather than only asserted, because what the relay learns from these
-    // tables is a claim, and a claim with no dump behind it is a promise.
+    // Step 6's artifact: "the access set table dump showing salted hashes and nothing
+    // else". Written to `build-evidence/step-06/` rather than only asserted, because
+    // what the relay learns from these tables is a claim, and a claim with no dump
+    // behind it is a promise.
     //
     // What is legitimately clear here, and why: `relay_access_principal` holds
     // authorizer, recovery and quorum pubkeys, because the relay verifies signatures
@@ -796,7 +795,7 @@ async fn the_access_tables_hold_salted_hashes_and_the_keys_they_must_verify_and_
     .unwrap();
 
     let mut dump = String::from(
-        "the access set as the relay holds it\n\
+        "step 6, the access set as the relay holds it\n\
          every row of every access table for one workspace, after a genesis publication\n\
          and one provisional grant\n\n",
     );
@@ -943,5 +942,91 @@ async fn a_genesis_lookup_that_cannot_run_is_reported_by_both_paths() {
         .execute(pool)
         .await
         .expect("restore the genesis table");
+    scratch.drop_database().await;
+}
+
+// MARK: The admitted count
+
+/// Zero before anything is published, and that zero is load bearing.
+///
+/// `specs/backend/cloud/api.md` makes the one-time bootstrap claim available only
+/// while the relay reports zero admitted principals. A freshly provisioned relay
+/// is exactly this state, and it is the state the whole trust-root race in
+/// `provisioning.md` turns on.
+#[tokio::test]
+async fn a_relay_that_has_admitted_nobody_says_zero() {
+    let (scratch, _blobs, state) = prepared("admitted_zero").await;
+    let pool = pool_of(&state);
+    assert_eq!(store::admitted_principals(pool).await.unwrap(), 0);
+    // A salt is created on first read and is not an admission.
+    store::salt(pool, WORKSPACE).await.unwrap();
+    assert_eq!(
+        store::admitted_principals(pool).await.unwrap(),
+        0,
+        "creating a workspace salt admitted somebody"
+    );
+    scratch.drop_database().await;
+}
+
+/// The count is the newest set's entries, not every entry ever written.
+///
+/// A device revoked in version 4 stays in version 3's entry list forever, so a
+/// count that summed versions would report a roster that has never existed and
+/// would grow every time anybody was removed. The control plane branches on
+/// zero or not zero, and both of those have to keep meaning what they say.
+#[tokio::test]
+async fn the_count_follows_the_newest_set_and_not_the_history() {
+    let (scratch, _blobs, state) = prepared("admitted_count").await;
+    let pool = pool_of(&state);
+    let salt = store::salt(pool, WORKSPACE).await.unwrap();
+
+    let genesis = sign(
+        build(&salt, 0, vec![0u8; 32], &[&key(1)], &[&key(1)], &[&key(1)]),
+        &key(1),
+    );
+    publish(pool, &genesis).await.unwrap();
+    let after_genesis = store::admitted_principals(pool).await.unwrap();
+    assert!(
+        after_genesis >= 1,
+        "a published genesis set admitted nobody: {after_genesis}"
+    );
+
+    // Two devices where there was one.
+    let grown = sign(
+        build(
+            &salt,
+            1,
+            genesis.digest().to_vec(),
+            &[&key(1), &key(2)],
+            &[&key(1)],
+            &[&key(1)],
+        ),
+        &key(1),
+    );
+    publish(pool, &grown).await.unwrap();
+    let after_growth = store::admitted_principals(pool).await.unwrap();
+    assert!(
+        after_growth > after_genesis,
+        "adding a device did not raise the count: {after_genesis} then {after_growth}"
+    );
+
+    // And back down. This is the assertion a sum over versions fails.
+    let shrunk = sign(
+        build(
+            &salt,
+            2,
+            grown.digest().to_vec(),
+            &[&key(1)],
+            &[&key(1)],
+            &[&key(1)],
+        ),
+        &key(1),
+    );
+    publish(pool, &shrunk).await.unwrap();
+    assert_eq!(
+        store::admitted_principals(pool).await.unwrap(),
+        after_genesis,
+        "a revocation left the removed device in the count"
+    );
     scratch.drop_database().await;
 }

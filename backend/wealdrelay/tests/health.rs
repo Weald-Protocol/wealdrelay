@@ -237,6 +237,30 @@ fn futures_lite_block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(future)
+}
+
+/// One request against a router, without binding a port.
+fn answer(router: axum::Router, path: &str) -> axum::http::StatusCode {
+    block_on(async {
+        use tower::ServiceExt as _;
+        router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("the router answers")
+            .status()
+    })
+}
+
 #[test]
 fn the_invite_link_the_relay_prints_is_a_route_the_relay_serves() {
     // The first-run banner prints `https://<hostname>/join/<token>`. For a while
@@ -268,21 +292,28 @@ fn the_invite_link_the_relay_prints_is_a_route_the_relay_serves() {
         .map(|(_, rest)| format!("/{rest}"))
         .expect("the link carries a path");
 
-    let response = futures_lite_block_on(async {
-        use tower::ServiceExt as _;
-        wealdrelay::health::public_router(Arc::clone(&state))
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(&path)
-                    .body(axum::body::Body::empty())
-                    .expect("a request"),
-            )
-            .await
-            .expect("the router answers")
-    });
     assert_eq!(
-        response.status(),
+        answer(wealdrelay::health::public_router(Arc::clone(&state)), &path),
         axum::http::StatusCode::OK,
         "the printed invite path {path} must be served, not 404"
+    );
+}
+
+/// The landing page names no client the relay cannot deliver.
+///
+/// It used to link `/download`, which is a route on the marketing site and not on
+/// a relay: every self-hosted invite offered the joiner a 404. The page is served
+/// by whoever runs the relay, so it can name the protocol and must not promise a
+/// binary.
+#[test]
+fn the_landing_page_does_not_offer_a_download_the_relay_cannot_serve() {
+    let page = wealdrelay::invite::delivery::landing_page();
+    assert!(
+        !page.contains("href=\"/download\""),
+        "the landing page links a path no relay serves"
+    );
+    assert!(
+        page.contains("weald://join/") || page.contains("weald://"),
+        "the landing page must still hand the invite to a client"
     );
 }

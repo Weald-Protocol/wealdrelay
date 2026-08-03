@@ -3,16 +3,16 @@
 //! `ACCESS` over a real socket, and what a publication does to other people's
 //! sockets.
 //!
-//! The integration and negative proofs for access-set enforcement.
+//! Step 6's integration and negative proofs from `specs/backend/build/phases-relay.md`.
 //! The pure rules are `tests/access.rs` and the transaction is `tests/access_store.rs`;
 //! what only a relay can prove is here: that a genesis set can be published by the
 //! one connection a workspace has before it has a set, that a revocation closes the
 //! revoked device's socket rather than waiting for it to reconnect, and that a device
 //! admitted minutes earlier on a live invite is cut off by the same publication.
 //!
-//! The timings this suite measures are written out as files rather than only
-//! asserted, because "a revoked device's socket closes within seconds" is a number
-//! and a number nobody wrote down is not evidence.
+//! The timings this suite measures are written to `build-evidence/step-06/`, because
+//! "a revoked device's socket closes within seconds" is a number and a number nobody
+//! wrote down is not evidence.
 
 mod support;
 
@@ -177,8 +177,8 @@ async fn a_workspace_publishes_its_genesis_set_over_the_one_socket_it_can_open()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_the_set_does_not_name_cannot_open_a_socket() {
-    // The negative proof for `AUTH`. Before access-set enforcement existed this
-    // handshake succeeded with a made-up key and 64 bytes of nothing.
+    // The negative proof for `AUTH`. Before step 6 this handshake succeeded with a
+    // made-up key and 64 bytes of nothing.
     let scratch = Scratch::new("stranger").await;
     let blobs = tempfile::tempdir().unwrap();
     let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
@@ -436,7 +436,7 @@ async fn a_revoked_device_loses_its_open_socket_and_cannot_come_back() {
     evidence(
         "disconnect-timing.txt",
         &format!(
-            "revocation to socket close\n\
+            "step 6, revocation to socket close\n\
              device removed by an ACCESS publication over another device's socket\n\
              elapsed_ms={}\n\
              budget_ms=5000\n\
@@ -534,7 +534,7 @@ async fn a_device_that_joined_on_a_live_invite_is_cut_off_by_the_same_publicatio
     evidence(
         "provisional-disconnect-timing.txt",
         &format!(
-            "revocation of a device holding a live provisional grant\n\
+            "step 6, revocation of a device holding a live provisional grant\n\
              grant_expiry_remaining=about 100 years\n\
              elapsed_ms={}\n\
              budget_ms=5000\n\
@@ -551,7 +551,7 @@ async fn a_device_that_joined_on_a_live_invite_is_cut_off_by_the_same_publicatio
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recovery_introduced_device_may_not_remove_more_however_long_it_waits() {
-    // The negative proof this rule needs: a recovery-introduced device
+    // The negative proof `phases-relay.md` asks for: a recovery-introduced device
     // attempting a removal before confirmation by a pre-existing authorizer is
     // refused, including after every simulated time advance. There is no timer to
     // advance, which is the point: time cannot tell the owner who lost a laptop from
@@ -701,7 +701,7 @@ async fn a_recovery_introduced_device_may_not_remove_more_however_long_it_waits(
 
     evidence(
         "probation-refusals.txt",
-        "a recovery-introduced device attempting an unpinned removal\n\
+        "step 6, a recovery-introduced device attempting an unpinned removal\n\
          immediately: denied/writer_not_in_access_set\n\
          after a year of simulated age: denied/writer_not_in_access_set\n\
          cleared only by a publication from the authorizer that predates the rotation\n",
@@ -881,8 +881,8 @@ async fn a_connection_naming_no_group_this_relay_knows_is_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_enforcement_off_a_publication_still_needs_a_group_this_relay_knows() {
-    // Exactly one suite runs with enforcement off, and only to assert that the
-    // difference is reported. This is that suite's other half: with
+    // `environments.md` allows exactly one ci suite to run with enforcement off, to
+    // assert that the difference is reported. This is that suite's other half: with
     // the access check off, `AUTH` admits without consulting a workspace, so `ACCESS`
     // is the frame that has to find one, and a connection that named no known group
     // is told rather than being left to think its publication landed.
