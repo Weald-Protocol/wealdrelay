@@ -95,11 +95,18 @@ jobs:
     name: reproducible build, runner ${{ matrix.runner }}
     needs: test
     runs-on: ${{ matrix.os }}
-    # 180 rather than 90: the Dockerfile now pins its builder to linux/amd64 so
-    # that the toolchain is a property of the file rather than of the host, which
-    # means runner b builds under QEMU. That is the trade v0.1.2 bought with a
-    # failed compare, and an emulated Rust build of this crate is slow.
-    timeout-minutes: 180
+    # 330, and the number is measured rather than guessed. The Dockerfile pins
+    # its builder to linux/arm64 so that the toolchain is a property of the file
+    # rather than of the host, which means the x86_64 runner builds under QEMU.
+    # A dispatch-only run of exactly this build took 10776 seconds there and 557
+    # on the native host, and 10776 is 179.6 minutes: at the previous 180 the job
+    # was killed in the same second its last step succeeded. Twice the measured
+    # time leaves room for a slower runner without leaving a hung build to burn
+    # six hours.
+    #
+    # The two manifests from that pair agreed exactly, which is the whole point:
+    #   both hosts  artifact sha256:cc1b7e7c5c05ecfc394a52df32c951487454d55e...
+    timeout-minutes: 330
     strategy:
       matrix:
         include:

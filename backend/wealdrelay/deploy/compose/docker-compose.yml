@@ -105,7 +105,7 @@ services:
     #
     # RELEASE PIN. This is the one line in this file to update per release, and
     # deploy/README.md lists the others.
-    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.3}
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.4}
     restart: unless-stopped
     depends_on:
       postgres:
