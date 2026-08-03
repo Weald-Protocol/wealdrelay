@@ -142,7 +142,7 @@ before you install it, because this is the path with no container digest doing
 that for you:
 
 ```sh
-tag=wealdrelay-v0.1.1
+tag=wealdrelay-v0.1.2
 target=x86_64-unknown-linux-musl        # or aarch64-unknown-linux-musl
 base=https://github.com/Weald-Protocol/wealdrelay/releases/download/$tag
 curl -fLO "$base/wealdrelay-$target.tar.gz"
