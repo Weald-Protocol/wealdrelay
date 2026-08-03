@@ -411,7 +411,7 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "ghcr.io/weald-protocol/wealdrelay@${{ needs.image.outputs.digest }}" \
-            | tee cosign-verify.txt
+            2>&1 | tee cosign-verify.txt
       - uses: actions/upload-artifact@v4
         with:
           name: verify-published-${{ github.ref_name }}
