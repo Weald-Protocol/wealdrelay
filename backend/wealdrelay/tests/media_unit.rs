@@ -82,8 +82,8 @@ fn a_part_key_is_built_only_from_components_that_cannot_escape() {
 
 // MARK: The local presigned-URL token
 //
-// Reachable only when storage is the filesystem backend, which
-// `specs/backend/build/environments.md` runs in `local` alone. It stands in for
+// Reachable only when storage is the filesystem backend, which is a local
+// development configuration and never a deployed one. It stands in for
 // AWS SigV4 on a laptop, so it has to hold the two properties SigV4 holds: a
 // token for one object cannot be replayed against another, and an expired token
 // is refused whatever its signature.
@@ -228,10 +228,9 @@ fn a_control_matches_only_when_every_field_that_identifies_it_agrees() {
     //
     // This is also the case a client must never produce by accident. CryptoKit
     // randomises Ed25519, so a client that re-signed a record it had already
-    // published would land here and freeze its own group; it therefore stores the
-    // signed record and retransmits those bytes
-    // (`Sources/Sync/RetentionKeyStore.swift`). A record that reaches this branch
-    // is one nobody honest wrote.
+    // published would land here and freeze its own group; the client therefore
+    // stores the signed record and retransmits those exact bytes. A record that
+    // reaches this branch is one nobody honest wrote.
     assert!(
         !same(&record.verifier, Some(&[0x03; 32]), &[0xff; 64]),
         "a second signature over the same fields is a different record"

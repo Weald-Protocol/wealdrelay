@@ -17,9 +17,9 @@
 //!   deployment ends up in a posture nobody chose, and two of these values
 //!   decide security posture.
 //! - **The relay has no dependency on any commercial-layer vendor.** There is no
-//!   key here that names anything in `specs/backend/cloud/`, and adding one
-//!   would be a trust boundary change because the hosted binary must be the
-//!   audited binary.
+//!   key here that names an identity provider, a payment processor, a hosting
+//!   account or a licence server, and adding one would be a trust boundary
+//!   change because the hosted binary must be the audited binary.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -98,7 +98,8 @@ pub enum MinEncryption {
 }
 
 /// TLS termination. `off` is bounded: the client refuses a plaintext socket
-/// unless the host resolves to loopback, which is step 4's test.
+/// unless the host resolves to loopback, so `off` is a local-development mode
+/// and not a way to run an exposed relay without transport security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     Acme,
@@ -433,7 +434,7 @@ impl Config {
             retention_days: limit(values, keys::RETENTION_DAYS)?,
             // `enforce` in every environment including local, so nobody ever
             // develops against the permissive path and discovers the difference
-            // in staging (specs/backend/build/environments.md).
+            // once the relay is deployed.
             access_set: one_of(
                 values,
                 keys::ACCESS_SET,

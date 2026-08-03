@@ -8,9 +8,9 @@
 //! skipped rather than reported, and every failure is the one typed error the read
 //! side has.
 //!
-//! No mock. `testing.md`: real Postgres, real sockets, real process boundaries, and
-//! the only permitted fake is the one `environments.md` names for the step. There is
-//! none for this.
+//! No mock: real Postgres, real sockets, real process boundaries. A fake is
+//! permitted only where a shared contract suite runs against both it and the real
+//! thing, and there is no such fake here.
 
 mod support;
 

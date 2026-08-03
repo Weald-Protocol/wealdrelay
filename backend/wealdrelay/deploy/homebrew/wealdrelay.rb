@@ -1,6 +1,7 @@
-# The formula published to the weald/homebrew-tap repository at release time.
+# The formula published to the hunterh37/homebrew-tap repository at release
+# time.
 #
-#   brew install weald/tap/wealdrelay
+#   brew install hunterh37/tap/wealdrelay
 #
 # specs/backend/relay/server.md distribution channel 4: for local development,
 # and for a team that genuinely wants to run this on a Mac mini in a cupboard,
@@ -12,6 +13,10 @@
 # thing the release notes name, which is the whole of
 # specs/backend/relay/verification.md proof 2. A bottle would be a fifth artifact
 # nobody verified.
+#
+# Status: the tap does not exist until the first signed release is tagged, and
+# neither do the tarballs this formula points at. The placeholder version and
+# checksums below are what an unreleased formula looks like.
 #
 # The version, the URLs and the four sha256 values below are rewritten by
 # scripts/release-homebrew.sh from the release manifest. Editing them by hand is
@@ -53,9 +58,29 @@ class Wealdrelay < Formula
   # so neither is a formula dependency.
   depends_on "postgresql@16"
 
+  # The relay reads `relay.toml` from its working directory and from nowhere
+  # else, so the config file has to live where the service runs rather than
+  # under etc. That directory is created here, with a commented-out starter file
+  # in it, so the caveat below can name a path that exists.
   def install
     bin.install "wealdrelay"
-    (etc/"wealdrelay").install "relay.toml.example" if File.exist?("relay.toml.example")
+    (var/"wealdrelay/blobs").mkpath
+    config = var/"wealdrelay/relay.toml"
+    config.write <<~TOML unless config.exist?
+      # wealdrelay configuration. Read from the working directory of the running
+      # relay, which for `brew services` is the directory holding this file.
+      #
+      # Keys are the environment variable names without the WEALD_RELAY_ prefix,
+      # lowercased, under [relay]. An environment variable wins over this file,
+      # and a key the relay does not recognise is an error rather than a shrug.
+      #
+      # Uncomment and fill in the two that have no default. Storage already
+      # points at ./blobs beside this file.
+
+      [relay]
+      # hostname = "relay.example.com"
+      # database_url = "postgres://wealdrelay:PASSWORD@127.0.0.1:5432/wealdrelay"
+    TOML
   end
 
   service do
@@ -69,19 +94,34 @@ class Wealdrelay < Formula
 
   def caveats
     <<~EOS
-      Set the three required variables before starting the service:
+      Two of the three required settings have no default. Put them in
 
-        WEALD_RELAY_HOSTNAME
-        WEALD_RELAY_DATABASE_URL
-        WEALD_RELAY_STORAGE_URL
+        #{var}/wealdrelay/relay.toml
 
-      or put them in #{etc}/wealdrelay/relay.toml. Then:
+      which is where this formula wrote a starter file. The relay reads
+      relay.toml from its working directory and from nowhere else, and this
+      formula's service runs in #{var}/wealdrelay, so that path is the config
+      file and any other location is read by nothing.
+
+        [relay]
+        hostname = "relay.example.com"
+        database_url = "postgres://wealdrelay:PASSWORD@127.0.0.1:5432/wealdrelay"
+
+      storage_url already defaults to #{var}/wealdrelay/blobs through the
+      service's environment. Environment variables of the same name with a
+      WEALD_RELAY_ prefix override the file, which is the route to use if you
+      run the binary by hand from some other directory.
+
+      Then:
 
         brew services start wealdrelay
+        wealdrelay --check-config      # from #{var}/wealdrelay
 
-      The first run prints a one-time enrollment URL. It expires in 24 hours or
-      on first use, and the first device to open it becomes the workspace trust
-      root.
+      The first run prints a one-time enrollment URL and a one-time code. The
+      URL is reprinted on every start while the workspace is still unenrolled.
+      The code is not, ever: the relay keeps only its hash, so there is nothing
+      left to print. Lose the code before a device enrols and the only way
+      forward is an empty database.
     EOS
   end
 

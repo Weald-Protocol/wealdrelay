@@ -390,9 +390,9 @@ async fn admit(state: &Arc<RelayState>, session: &Session, device_key: &[u8]) ->
     use crate::config::AccessSetMode;
 
     if matches!(state.config.access_set, AccessSetMode::Off) {
-        // `environments.md` allows exactly one ci suite to run with enforcement off,
-        // to assert that `/readyz` reports the difference. It is `enforce` in every
-        // environment we operate, and the health surface says which one this is.
+        // Exactly one suite runs with enforcement off, and only to assert that
+        // `/readyz` reports the difference. It is `enforce` in every deployment
+        // worth running, and the health surface says which one this is.
         // Unsalted here on purpose: with no set there is no salt to be consistent
         // with, and a hash of the key alone is a stable handle for eviction that
         // claims nothing about membership.

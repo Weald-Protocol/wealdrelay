@@ -22,8 +22,7 @@ Reasons, in order of weight:
    in this design where we can refuse to be novel, we refuse.
 
 Prior art worth reading before changing anything here: Keyhive's causal-key
-design (`specs/sync-substrate.md` has the link) solves a strictly harder problem
-and is pre-alpha. Marmot and NIP-EE are MLS carried over Nostr relays and are
+design solves a strictly harder problem and is pre-alpha. Marmot and NIP-EE are MLS carried over Nostr relays and are
 the closest working reference for MLS on a dumb relay.
 
 ## Group topology
@@ -48,7 +47,7 @@ laptops would fork the moment either person opened their second one. The id is
 rather than from any key, so it is stable across device pairing, device loss and
 recovery. **Each of those four fields is length-framed**, with the same
 deterministic CBOR framing every other digest in this design uses, and that was
-added in step 8 rather than assumed: a bare concatenation of variable-length
+specified rather than assumed: a bare concatenation of variable-length
 fields is ambiguous, so user ids `ab` and `c` would hash to the same id as `a` and
 `bc`, and a user id chosen for the purpose could land one pair's conversation in
 the group of another pair. The fields, their order and the sort are unchanged. Every current device of both users is a leaf, and pairing a new device
@@ -106,7 +105,7 @@ Every symmetric key outside the MLS key schedule is derived from it with the RFC
 | Retention signing seed | `weald retain v1` | Ed25519 seed for public, relay-verifiable retention manifests and checkpoints. |
 | Enrolment key | `weald enrol v1` | Wrapping a child group's `GroupInfo`, and its history key, for principals entitled to self-join it (`specs/backend/relay/channels.md`). |
 | Wrap tag key | `weald wraptag v1` | Deriving the per-epoch blinded index under which the relay stores recovery wraps, so that a long-lived recovery key never appears in relay state. |
-| History epoch secret | `weald history v1` | The per-epoch value an `open` group seals into `history.publish`, and the content key the envelope layer uses for that epoch. Added in step 8; see "History policy" for why the list cannot hold raw MLS epoch secrets. |
+| History epoch secret | `weald history v1` | The per-epoch value an `open` group seals into `history.publish`, and the content key the envelope layer uses for that epoch. See "History policy" for why the list cannot hold raw MLS epoch secrets. |
 
 An earlier draft used one GroupInfo publication key shared by every member of the
 group being joined. A removed member could retain it, unwrap a current GroupInfo,
@@ -171,7 +170,7 @@ epoch secrets is sealed and published as `history.publish`
 only thing that has to be re-wrapped when the enrolment key rotates, and the
 sealed history blob is rewritten only when the group gains an epoch.
 
-**What is in that list, corrected in step 8.** An earlier version of this
+**What is in that list, corrected.** An earlier version of this
 paragraph said the list holds historical epoch secrets, meaning the MLS key
 schedule's own. It cannot, and the correction is not cosmetic. No RFC 9420
 implementation hands an epoch secret out, the exporter is the only way key
@@ -368,7 +367,8 @@ anyone who is still a member or who joins later. Deletion in an `open` group
 means the blob is gone from the relay and from every client that honours the
 tombstone. It does not mean the old key stopped existing. `closed` groups get
 the stronger property. The channel header lock state already distinguishes the
-two, and `/security` says which one it is describing.
+two, and any description of the deletion guarantee has to say which of the two
+it is describing.
 
 Retention and compaction are specified in `specs/backend/relay/lifecycle.md`,
 because dropping envelopes has to stay compatible with author chains, with
@@ -400,7 +400,7 @@ agent key.
 definition holds plaintext. Traffic analysis: the relay sees group ids, message
 sizes, and timing, and correlating those with a known team is not hard. Malicious
 model providers: if an agent sends channel content to an inference API, that
-content has left the boundary, and this is the same hole Buzz has. The client
+content has left the boundary, and no transport-level encryption closes that. The client
 must show, per agent, which provider its context is going to, and that UI is a
 requirement of this spec rather than a nicety.
 

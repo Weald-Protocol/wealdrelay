@@ -1,10 +1,20 @@
 #!/bin/sh
-# The thing behind `curl -fsSL https://get.weald.team/relay | sh`.
+# The compose bundle installer.
+#
+# It is attached to every release and shipped inside the bundle it fetches, so
+# there are two ways to have it: download it from the release page for the tag
+# you want, or take it from a clone of the repository. There is no install
+# one-liner piped from a domain, and there will not be one: an installer you
+# cannot read before it runs is an installer you cannot check.
+#
+#   sh install.sh                                  the newest release
+#   WEALD_RELAY_VERSION=wealdrelay-v0.1.0 sh install.sh    a specific tag
 #
 # specs/backend/relay/server.md distribution channel 2. It fetches the compose
-# bundle for a release, generates the two passwords, and stops. It does not run
-# `docker compose up`, because a script that starts a service the moment it is
-# piped into a shell has taken a decision that belongs to the operator.
+# bundle for a release, verifies its checksum, generates the two passwords, and
+# stops. It does not run `docker compose up`, because a script that starts a
+# service the moment it is run has taken a decision that belongs to the
+# operator.
 #
 # POSIX sh on purpose. This runs on whatever a fresh VPS happens to have.
 set -eu
@@ -91,12 +101,15 @@ fi
 say ""
 say "Installed into ./${DIR}"
 say ""
+say "Both passwords in .env are generated. Do not copy .env.example over it."
+say ""
 say "Two things left:"
 say "  1. cd ${DIR} && \$EDITOR .env      set WEALD_RELAY_HOSTNAME to your hostname"
 say "  2. docker compose up -d"
 say ""
-say "Then read the one-time enrollment URL out of the log:"
+say "Then read the one-time enrollment URL and code out of the log:"
 say "  docker compose logs relay"
 say ""
-say "It expires in 24 hours or on first use. The first device to open it becomes"
-say "the workspace trust root."
+say "It expires in 24 hours or on first use, and the first device to open it"
+say "becomes the workspace trust root. The link is reprinted on every start while"
+say "the workspace is unenrolled. The code is not: the relay keeps only its hash."

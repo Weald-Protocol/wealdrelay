@@ -30,7 +30,7 @@ Spec family:
 | `specs/backend/relay/server.md` | The self-host package. What the customer actually downloads. |
 | `specs/backend/relay/deployment.md` | The four concrete paths to a running relay, including private-network. |
 | `specs/backend/relay/operations.md` | Sequence assignment, frame errors, backpressure, denial of service, clocks, key packages. |
-| `specs/backend/relay/mls-binding.md` | OpenMLS behind a twelve-function Rust FFI. The highest-risk engineering here. |
+| `specs/backend/relay/mls-binding.md` | OpenMLS behind a fourteen-function Rust FFI. The highest-risk engineering here. |
 | `specs/backend/relay/media.md` | Blob upload, download, quota and garbage collection. |
 | `specs/backend/relay/search.md` | Client-side index and the cold-start budget. |
 | `specs/backend/relay/agents.md` | How agents connect: through the local app, never their own MLS stack. |
@@ -40,32 +40,31 @@ Spec family:
 | `specs/backend/relay/verification.md` | The proofs, as UI surfaces rather than a docs page. |
 | `specs/backend/relay/migration.md` | Git-to-relay path, dual transport, rollback. |
 
-Background on why git alone is not enough, and the scored comparison against
-Radicle, iroh, Willow, Keyhive, Matrix and Nostr, is in
-`specs/sync-substrate.md`. Read that first. This spec assumes its rubric.
+Git alone is not enough for this workload, and the alternatives in the same
+space (peer-to-peer code collaboration, capability-scoped stores, federated
+messaging, signed event logs) were each scored against the eight dimensions
+listed under "Rubric delta" below before this design was chosen.
 
-## Why now
+## The problem
 
-Block shipped Buzz on 2026-07-21: a Nostr-based workspace where humans and AI
-agents share one signed event log, Apache 2.0, self-hostable. It is the closest
-thing to Weald that exists and it validates the shape of the product.
+A shared workspace where humans and coding agents write to one log usually
+solves durability and ordering, and then stores content the operator can read.
+Signing an event proves who wrote it. It does not stop whoever runs the server
+from filtering, threading and indexing the plaintext, which means the operator
+is inside the trust boundary whether or not anyone intends them to be.
+Self-hosting moves that boundary rather than removing it, and a team that has to
+run its own infrastructure to get confidentiality is paying for the wrong thing.
 
-It also has a hole. Buzz events are signed but not encrypted. The relay reads
-plaintext to filter, thread and full-text search. Block's hosted terms reserve
-the right to access and scan content. Self-hosting moves the trust boundary but
-does not create one, and there is no MLS or equivalent in the build. Their
-sovereignty story is "you can own the server". Ours is "owning the server does
-not matter, because the server is blind either way".
-
-That difference is not a feature bullet. It decides the architecture, because a
-relay that cannot read content cannot index it, and everything downstream of
-search has to move to the client.
+The position here is that owning the server should not matter, because the
+server is blind either way. That is not a feature bullet. It decides the
+architecture, because a relay that cannot read content cannot index it, and
+everything downstream of search has to move to the client.
 
 ## Posture
 
-Unchanged from `specs/sync-substrate.md`: teams of 3 to 30. The relay adds one
-group to the target that git excluded, the member without a clone, and that is
-the `reach` row the existing spec calls the standing product risk.
+Teams of 3 to 30. The relay adds one group to the target that git alone
+excluded, the member without a clone, which is the `reach` row in the rubric
+below and the standing product risk.
 
 Explicit non-goals:
 
@@ -91,22 +90,22 @@ Six layers. Each is replaceable without touching the ones above it.
 The relay implements layers 1 and 2 only. It sees an opaque blob, a group id, a
 sequence number and a size. It does not hold a key that decrypts anything.
 
-## The three things Buzz does not have
+## The three properties that follow from that
 
 **1. Content the operator cannot read.** MLS group per scope, keys negotiated
 between clients, ciphertext at rest and in flight. Detail in
 `specs/backend/relay/groups.md`.
 
-**2. Scope smaller than the workspace.** Buzz scopes by relay and by channel
-membership, enforced server-side. We scope by which group holds the key, so a
+**2. Scope smaller than the workspace.** A plaintext log scopes by server and by
+channel membership, enforced server-side. We scope by which group holds the key, so a
 contractor admitted to one channel is cryptographically excluded from the rest
 rather than filtered out of them, and a contractor working on one project is
 never in the other projects' rosters at all, because a workspace is exactly one
 project (`specs/backend/relay/multi-workspace.md`). Removal is an MLS epoch change, which means
 forward secrecy against a member who kept a copy of the ciphertext.
 
-**3. Revocable, time-boxed agent authority.** Buzz gives an agent a keypair and
-membership. We give an agent a keypair plus a signed delegation certificate
+**3. Revocable, time-boxed agent authority.** The usual arrangement gives an
+agent a keypair and membership, and nothing else. We give an agent a keypair plus a signed delegation certificate
 naming its scopes, its permitted ticket transitions and an expiry, and expiry
 evicts the agent's MLS leaf rather than only voiding its signature.
 
@@ -151,8 +150,9 @@ Written here so it is not rediscovered in month four.
 
 ## Rubric delta
 
-Projected scores for the relay path against the eight dimensions in
-`specs/sync-substrate.md`. Git's current scores in brackets.
+Projected scores for the relay path against the eight dimensions this design was
+evaluated on, each scored 0 to 5. The figure in brackets is what a purely
+git-backed transport scores on the same dimension.
 
 | Dimension | Relay | Why |
 | --- | --- | --- |
@@ -166,8 +166,8 @@ Projected scores for the relay path against the eight dimensions in
 | `maturity` | 2 [5] | MLS is a finished RFC with a solid Rust implementation. Our composition of it is new code. |
 
 `infra` at 3 and `maturity` at 2 are the honest price. The bet is that `reach`
-0 to 4 and `identity` 4 to 5, plus a privacy claim no competitor can currently
-make, are worth it, and that keeping git alive means the bet is reversible.
+0 to 4 and `identity` 4 to 5, plus a relay that cannot read what it carries, are
+worth it, and that keeping git alive means the bet is reversible.
 
 ## Deliverable
 

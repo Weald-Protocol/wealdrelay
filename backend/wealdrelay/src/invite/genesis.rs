@@ -44,8 +44,8 @@
 //! invites.md calls that publication "the first valid `ACCESS` frame at `version`
 //! 1". The genesis publication is version **0** everywhere else in the system:
 //! `specs/backend/relay/wire.md` writes `prev_hash` as "zero at genesis" and
-//! `access::judge` has required `version == 0` with an all-zero `prev_hash` since
-//! step 6, which is green and shipped. "Version 1" reads as "the first version"
+//! `access::judge` has always required `version == 0` with an all-zero
+//! `prev_hash`, and that is shipped. "Version 1" reads as "the first version"
 //! rather than as a second publication, so the rule implemented here is "the first
 //! accepted set", and invites.md is corrected rather than the four things that
 //! already agree.
@@ -161,6 +161,35 @@ pub fn banner(hostname: &str, run: &FirstRun) -> String {
         token = hex(&run.token),
         code = run.code.grouped(),
         fingerprint = hex(&run.fingerprint),
+    )
+}
+
+/// What a self-hoster reads on every later start while the workspace is still
+/// empty.
+///
+/// The link only. The code is not in it because the code is not recoverable: the
+/// relay stores an Argon2id hash of it and never the value, so there is nothing to
+/// reprint. Saying that plainly is the point of this banner. An operator who lost
+/// the first-run output would otherwise go looking for a reissue command, and
+/// there is deliberately none: reissuing a bootstrap invite would create a second
+/// route to trust root, which is the attack
+/// `specs/backend/contracts/threat-model/bootstrap-handoff.md` control B6 exists
+/// to close.
+///
+/// Reprinting the link is safe in a way reprinting the code would not be. The link
+/// half enrolls nobody on its own, and it is already in the hands of whoever asked
+/// for it.
+pub fn reminder(hostname: &str, token: &[u8], fingerprint: &[u8]) -> String {
+    format!(
+        "weald: this workspace still has no members.\n\
+         weald:   invite link  https://{hostname}/join/{token}\n\
+         weald:   genesis key  {fingerprint}\n\
+         weald: the one-time code cannot be reprinted. The relay keeps only its\n\
+         weald: hash, and there is no reissue: a second bootstrap invite would be a\n\
+         weald: second route to trust root. If the code is lost, start this relay\n\
+         weald: again against an empty database.",
+        token = hex(token),
+        fingerprint = hex(fingerprint),
     )
 }
 

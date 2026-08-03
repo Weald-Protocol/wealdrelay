@@ -2,19 +2,21 @@
 // Copyright 2026 Dicyanin Labs
 //! The relay checked against the client, on the access set.
 //!
-//! Step 6 adds a third piece of shared wire format. The digest is what the chain links
-//! on and what an authorizer signs, so if the two encoders differ by one byte then
-//! every publication a client makes is unverifiable at the relay, and the failure
-//! surfaces as `denied/writer_not_in_access_set` on a set that is entirely valid.
+//! The access set is a third piece of shared wire format. The digest is what the
+//! chain links on and what an authorizer signs, so if the two encoders differ by one
+//! byte then every publication a client makes is unverifiable at the relay, and the
+//! failure surfaces as `denied/writer_not_in_access_set` on a set that is entirely
+//! valid.
 //!
-//! The vectors in `specs/backend/contracts/wire/vectors/access-set.json` are generated
-//! by the **client's** code, by `scripts/fixture-log.sh --access-vectors`, which
-//! compiles `Sources/Sync`. This suite asserts the relay reproduces them, decoder and
-//! digest both. A Rust test asserting against a Rust-generated value would prove that
-//! Rust is self-consistent, which is not the claim.
+//! The vectors in `specs/backend/contracts/wire/vectors/access-set.json` are
+//! generated from the client's implementation, outside this repository, and checked
+//! in here as the fixed contract the relay is held to. This suite asserts the relay
+//! reproduces them, decoder and digest both. A Rust test asserting against a
+//! Rust-generated value would prove that Rust is self-consistent, which is not the
+//! claim.
 //!
-//! `scripts/backend-gate.sh 6` regenerates the file from Swift and fails on any
-//! difference, so a change to either encoder is caught by the side that did not change.
+//! Regenerating the file from the client and diffing it is part of releasing a
+//! change, so a change to either encoder is caught by the side that did not change.
 
 use std::path::PathBuf;
 
@@ -39,7 +41,8 @@ fn to_hex(bytes: &[u8]) -> String {
 fn vectors() -> serde_json::Value {
     let text = std::fs::read_to_string(vectors_path()).expect(
         "specs/backend/contracts/wire/vectors/access-set.json is missing. \
-         Generate it with scripts/fixture-log.sh --access-vectors.",
+         It is generated from the client implementation outside this repository \
+         and checked in here.",
     );
     serde_json::from_str(&text).expect("the vectors are JSON")
 }

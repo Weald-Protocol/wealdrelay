@@ -9,9 +9,8 @@
 //! fake of Postgres would be a fake of exactly the thing being asserted.
 //!
 //! The database comes from the local harness (`scripts/weald-stack up`). If it is
-//! not there these tests **fail** rather than skip, for the reason
-//! `specs/backend/build/testing.md` gives: a skipped integration proof that
-//! reports success is the failure mode this programme exists to prevent.
+//! not there these tests **fail** rather than skip: a skipped integration proof
+//! that reports success is the failure mode this programme exists to prevent.
 //!
 //! Each test gets a database of its own, created and dropped here, because no
 //! test may share a database name with another.

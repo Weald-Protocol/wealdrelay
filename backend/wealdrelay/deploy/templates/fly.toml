@@ -11,7 +11,11 @@
 #   fly secrets set WEALD_RELAY_DATABASE_URL="$(fly ssh console -C 'printenv DATABASE_URL')"
 #   fly deploy
 #
-# Then read the one-time enrollment URL out of `fly logs`.
+# Then read the one-time enrollment URL and code out of `fly logs`. The link is
+# reprinted on every start while the workspace is unenrolled; the code is not.
+#
+# Status: the image below is published from the first signed release onwards and
+# not before. Until then, build it yourself with scripts/relay-reproduce.sh.
 
 app = "weald-relay"
 primary_region = "iad"
@@ -21,6 +25,9 @@ primary_region = "iad"
   # publishes no moving tag, so `:latest` would never resolve:
   #
   #   image = "ghcr.io/hunterh37/weald-relay@sha256:..."
+  #
+  # RELEASE PIN. The one line in this file to update per release, and
+  # deploy/README.md lists the others.
   image = "ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0"
 
 [env]

@@ -40,8 +40,7 @@ const MAGIC: u64 = 0x5745_414C_4D4C_5300; // "WEALMLS\0"
 /// claimed it did.** Reading the tag requires dereferencing the pointer, and once
 /// ``consume`` has handed the `Box` back to the allocator there is no defined dereference
 /// of it, whatever bytes happen to still be there. `miri` says exactly that, and the
-/// finding is recorded in `build-evidence/step-07/miri.txt` and in the deleted test at the
-/// bottom of this file.
+/// finding is written out in the deleted test at the bottom of this file.
 ///
 /// It is kept because stamping it costs one store and does turn the common mistake, a
 /// Swift `deinit` that runs twice, into a status often enough to be worth having. It is
@@ -166,8 +165,7 @@ mod tests {
     // is deleted rather than skipped. It asserted that calling `borrow` on a pointer that
     // `consume` had already reclaimed answers `InvalidHandle`, and it passed.
     //
-    // It passed by performing undefined behaviour. `miri` says so in one line, recorded in
-    // `build-evidence/step-07/miri.txt`:
+    // It passed by performing undefined behaviour. `miri` says so in one line:
     //
     //     error: Undefined Behavior: constructing invalid value of type
     //     &mut handle::Handle<i32>: encountered a dangling reference (use-after-free)
@@ -188,8 +186,8 @@ mod tests {
     // is a defence is withdrawn. What actually keeps use-after-free out of this product is
     // one level up: the Swift wrapper owns each handle, frees it exactly once in `deinit`,
     // and never exposes the pointer, which is a property the compiler checks rather than
-    // one a runtime tag hopes for. `Sources/MLS/MLSSession.swift` is where that is
-    // enforced and `Tests/MLSBindingTests.swift` is where it is asserted.
+    // one a runtime tag hopes for. That obligation belongs to the caller and is stated in
+    // `specs/backend/relay/mls-binding.md`, not to this crate.
     //
     // The two soundly-testable refusals, a null pointer and a live pointer that is not
     // ours, are covered by the two tests above this comment.

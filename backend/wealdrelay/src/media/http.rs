@@ -2,14 +2,13 @@
 // Copyright 2026 Dicyanin Labs
 //! The local stand-in for a presigned URL, over the relay's own public listener.
 //!
-//! `specs/backend/build/environments.md`: the filesystem storage backend is
-//! `local`'s only, and `ci`, `staging` and `production` all run against an
-//! S3-compatible bucket that can presign a real request. A laptop running
-//! `local` has no such bucket, so when storage is the filesystem backend the
-//! relay presigns a request against **itself**: a URL naming this route, with an
-//! HMAC token in its query string standing in for AWS SigV4. `media::presign`
-//! decides which of the two happens; this module is only ever reached in the
-//! first case.
+//! The filesystem storage backend belongs to local development only. Every
+//! deployed environment runs against an S3-compatible bucket that can presign a
+//! real request. A laptop has no such bucket, so when storage is the filesystem
+//! backend the relay presigns a request against **itself**: a URL naming this
+//! route, with an HMAC token in its query string standing in for AWS SigV4.
+//! `media::presign` decides which of the two happens; this module is only ever
+//! reached in the first case.
 //!
 //! The token covers the method, the object key and an expiry, keyed by
 //! `RelayState::media_presign_secret`, a process secret generated once at

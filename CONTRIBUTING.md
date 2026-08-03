@@ -84,14 +84,13 @@ Prefer a new file to growing one past about 500 lines.
 
 ## Some notes on reading the specifications
 
-Two conventions come from where these documents were written and mean nothing to
-an implementer. "Step N" dates a decision against Weald's private build ledger.
-Citations of `specs/backend/build/*`, `specs/backend/cloud/*`, `Sources/*`,
-`Tests/*` and the `scripts/backend-gate.sh` family name files in the private
-monorepo holding the macOS client and that ledger. They are provenance, not
-reading you are missing: everything needed to implement, run and verify a relay is
-in this repository, and `specs/backend/relay/verification.md` restates in
-checkable terms any claim that rests on evidence you cannot see.
+One convention comes from where these documents were written. A few test suites
+write timing and evidence files under a `build-evidence/` directory, which is a
+path in the private monorepo holding the reference client rather than anything in
+this tree. Those are outputs, not reading you are missing: everything needed to
+implement, run and verify a relay is in this repository, and
+`specs/backend/relay/verification.md` restates in checkable terms any claim that
+rests on evidence you cannot see.
 
 ## Licence
 

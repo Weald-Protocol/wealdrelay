@@ -25,11 +25,12 @@ subscriptions.
 - One relay instance per workspace. Not multi-tenant.
 - Tenant isolation is enforced by the absence of keys rather than by our query
   scoping. A cross-tenant bug leaks ciphertext to someone who cannot read it.
-- The smallest paid tier must cover a container plus a dedicated Postgres, which
-  is why there is no free hosted tier.
+- The floor for running one workspace is a container plus a dedicated Postgres.
+  Anyone operating this for others, including us, carries that cost per
+  workspace rather than amortising it across tenants.
 - An agency or multi-project company is the normal shape rather than an edge
-  case, so the dashboard lists instances by project name and checkout expects
-  repeat purchases from the same account.
+  case, so an operator should expect one account to hold several instances and
+  should label them by project rather than by hostname.
 
 ## Rejected
 

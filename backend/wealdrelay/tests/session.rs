@@ -501,13 +501,13 @@ fn every_frame_in_every_state_follows_the_documented_rule() {
     // the four live states, and `ACCESS` again in `Bootstrapping`. That last one is
     // the whole of the bootstrap hole, and counting it here is what stops it
     // widening: a second frame permitted in that state moves this number and fails.
-    // The count went from twelve to eighteen in step 8: `WRAP` and `HANDSHAKE`
-    // became the sixth and seventh content frames in `Ready`, and `JOIN` is
-    // accepted in all four live states because a device redeeming an invite has no
-    // membership to authenticate with yet. Step 10 makes it nineteen: `DROP`, the
-    // compaction instruction, is the eighth content frame and is `Ready` only,
-    // because it names a group and a group is checked against an authenticated
-    // workspace.
+    // The count went from twelve to eighteen when recovery and invites landed:
+    // `WRAP` and `HANDSHAKE` became the sixth and seventh content frames in
+    // `Ready`, and `JOIN` is accepted in all four live states because a device
+    // redeeming an invite has no membership to authenticate with yet. Compaction
+    // makes it nineteen: `DROP`, the instruction that carries it, is the eighth
+    // content frame and is `Ready` only, because it names a group and a group is
+    // checked against an authenticated workspace.
     //
     // The bootstrap hole is what this number is really guarding, and it is now two
     // frames wide rather than one: `ACCESS`, which publishes the genesis set, and
@@ -1044,7 +1044,7 @@ fn any_frame() -> impl Strategy<Value = Frame> {
 }
 
 /// Case count comes from the environment so ci can run reduced counts on push
-/// and full counts on a pull request, per `specs/backend/build/testing.md`.
+/// and full counts on a pull request.
 fn proptest_config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
@@ -1106,7 +1106,7 @@ fn auth_ack(key_packages_remaining: u32, write_mode: u8) -> Frame {
     }
 }
 
-// MARK: The running digest (step 12, verification.md proof 1)
+// MARK: The running digest (verification.md proof 1)
 
 #[test]
 fn a_baked_image_digest_is_reported_verbatim_and_is_comparable() {

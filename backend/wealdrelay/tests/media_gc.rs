@@ -9,7 +9,7 @@
 //! threshold-authorized policy or destruction record is due; and "the existing
 //! 30-day grace period remains a floor".
 //!
-//! The negatives the step 9 gate names are here, each as its own test:
+//! The negatives media collection has to survive are here, each as its own test:
 //!
 //! - An object storage outage renders media temporarily unavailable and never
 //!   deleted. Proven against a real `S3Store` pointed at a port nothing is

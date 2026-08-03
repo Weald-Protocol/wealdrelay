@@ -2,15 +2,14 @@
 // Copyright 2026 Dicyanin Labs
 //! One storage contract, run against both backends.
 //!
-//! `specs/backend/build/environments.md` states the rule this file exists to
-//! satisfy: "Where a fake exists in this programme, a shared contract suite
-//! exists beside it. Where one does not, the fake is not permitted." So the
-//! assertions below are written exactly once, over one type parameter, and two
-//! `#[tokio::test]` entry points run the whole set: one over a `FilesystemStore`
-//! in a temporary directory, one over an `S3Store` talking to the MinIO the local
-//! harness runs. A filesystem backend held to its own private set of assertions
-//! would be free to drift from the real one, and the drift would be discovered in
-//! staging rather than here.
+//! The rule this file exists to satisfy: where a fake exists in this programme, a
+//! shared contract suite exists beside it, and where one does not, the fake is not
+//! permitted. So the assertions below are written exactly once, over one type
+//! parameter, and two `#[tokio::test]` entry points run the whole set: one over a
+//! `FilesystemStore` in a temporary directory, one over an `S3Store` talking to
+//! the MinIO the local harness runs. A filesystem backend held to its own private
+//! set of assertions would be free to drift from the real one, and the drift would
+//! be discovered in production rather than here.
 //!
 //! The parameter is a local trait rather than `BlobStore` itself. `BlobStore`
 //! methods return `impl Future` since the `async_trait` macro left this module, so
@@ -616,7 +615,7 @@ async fn the_s3_backend_satisfies_the_storage_contract() {
 // a directory are all properties of a local filesystem; S3 has no equivalent to
 // hold to the same assertion, and inventing one would be inventing a fake.
 
-/// The step 3 negative proof, at the level where it is observable: a reader never
+/// The storage negative proof, at the level where it is observable: a reader never
 /// sees a partial object. The filesystem backend buys that with a temporary file
 /// and a rename, so the temporary name must never appear in a listing and the
 /// object must be whole the moment it appears at all.

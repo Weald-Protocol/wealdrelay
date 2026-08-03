@@ -2,7 +2,7 @@
 // Copyright 2026 Dicyanin Labs
 //! Deterministic CBOR, the relay's half.
 //!
-//! The client's half is `Sources/Sync/DeterministicCBOR.swift` and the two have
+//! The client has a Swift implementation of the same encoding, and the two have
 //! to agree byte for byte, because the envelope's `hash` is a content address the
 //! relay recomputes on accept: two encoders that differ by one byte produce two
 //! addresses for one message and dedupe stops working.

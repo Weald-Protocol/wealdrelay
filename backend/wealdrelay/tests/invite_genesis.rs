@@ -60,7 +60,8 @@ fn sorted(mut items: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 }
 
 /// The genesis access set: version 0, all-zero `prev_hash`, its own sole
-/// authorizer. `wire.md` and `access::judge` have agreed on this shape since step 6.
+/// authorizer. `wire.md` and `access::judge` have agreed on this shape since access
+/// sets were introduced.
 fn genesis_set(salt: &[u8], trust_root: &SigningKey, recovery: &SigningKey) -> AccessSet {
     let mut set = AccessSet {
         workspace: vec![0x77; 32],
@@ -406,7 +407,7 @@ async fn a_set_naming_two_authorizers_consumes_nothing() {
 #[tokio::test]
 async fn a_publication_in_a_workspace_with_no_genesis_row_is_ordinary() {
     // Every workspace that was not bootstrapped through this relay, which is every
-    // workspace in the step 6 suite, publishes exactly as it did before.
+    // workspace in the plain access-set suites, publishes exactly as it did before.
     let (scratch, _blobs, state) = prepared("no_genesis").await;
     let pool = pool_of(&state);
     let salt = access_store::salt(pool, WORKSPACE).await.unwrap();

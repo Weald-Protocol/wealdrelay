@@ -100,8 +100,8 @@ async fn a_subscription_against_a_blind_relay_is_registered_and_acknowledged() {
 
 #[tokio::test]
 async fn a_cursor_beyond_the_head_is_answered_with_the_clients_own_number() {
-    // Unchanged from step 4: a client that names a cursor past the head is not
-    // invited to walk backwards.
+    // Unchanged since the live path first shipped: a client that names a cursor
+    // past the head is not invited to walk backwards.
     let state = blind();
     let (sender, mut receiver) = outbound_channel();
     assert!(sync::subscribe(&sender, &state, CONNECTION, group(2), 99).await);

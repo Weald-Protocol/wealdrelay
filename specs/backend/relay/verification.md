@@ -5,7 +5,7 @@ marketing. This spec is the set of surfaces that let a customer, a security
 reviewer or a journalist check it without taking our word for anything.
 
 Design rule throughout: **proof is a UI surface, not a documentation page.** A
-`/security` page is read once by one person before purchase. A panel in the app
+security write-up is read once by one person before purchase. A panel in the app
 is seen by everyone, every week, and it is what turns a claim into something
 users would notice breaking.
 
@@ -154,8 +154,10 @@ being misled by the lock icon three inches away.
 
 ## Verification runbook
 
-Published at `/docs/verify` and written as a runnable procedure, not prose. A
-reviewer with a terminal should be able to work through it in under an hour:
+Written as a runnable procedure, not prose. A reviewer with a terminal should be
+able to work through it in under an hour. The operator-facing version, with the
+commands and the counterpart each step has in the test suite, is
+`specs/backend/relay/verification-runbook.md`.
 
 1. Clone the relay source at the tag matching your running digest.
 2. Run the reproducible build. Compare the resulting digest.
@@ -181,9 +183,10 @@ reviewer with a terminal should be able to work through it in under an hour:
     the wrap index being a membership graph
     (`specs/backend/relay/groups.md`).
 
-Step 5 is the one that convinces people, and it is the one we should demo. A
-screen recording of `SELECT * FROM envelopes` returning nothing but blobs does
-more than any amount of copy on the landing page.
+If you only run one of these, run step 5. It is the one that convinces people:
+`SELECT * FROM envelopes` against the relay's own database returns nothing but
+blobs, and no amount of prose about encryption carries the same weight as seeing
+that yourself.
 
 ## What we must never ship
 

@@ -46,7 +46,14 @@ jobs:
       - run: scripts/weald-stack up --budget 240
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: ./scripts/spec-check.sh
+      # Strict, and with the CDDL tool actually installed. A release whose schema
+      # check silently skipped is a release that published an unchecked schema.
+      - env:
+          WEALD_SPEC_CHECK_STRICT: "1"
+        run: |
+          set -eux
+          cargo install cddl --locked --quiet
+          ./scripts/spec-check.sh
       - run: cargo test --workspace --locked
       - if: always()
         run: scripts/weald-stack down
@@ -220,6 +227,11 @@ jobs:
              backend/wealdrelay/deploy/compose/.env.example \
              backend/wealdrelay/deploy/compose/README.md \
              "$staging/"
+          # install.sh goes in the bundle and is attached to the release beside
+          # it. It is the only thing that generates the two passwords, and until
+          # it shipped here the compose README's first command was the one route
+          # to it, over a hostname that does not resolve.
+          install -m 0755 backend/wealdrelay/deploy/install.sh "$staging/install.sh"
           # Deterministic: sorted, no owner, and mtimes from the tagged commit,
           # so the bundle's checksum is a property of the tag and not of the
           # runner's clock.
@@ -228,12 +240,16 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@$epoch" -czf weald-relay-compose.tar.gz "$staging"
           sha256sum weald-relay-compose.tar.gz | tee weald-relay-compose.tar.gz.sha256
+          cp backend/wealdrelay/deploy/install.sh install.sh
+          sha256sum install.sh | tee install.sh.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: compose-bundle-${{ github.ref_name }}
           path: |
             weald-relay-compose.tar.gz
             weald-relay-compose.tar.gz.sha256
+            install.sh
+            install.sh.sha256
 
   # Deliberately downstream of `compare`: an image is published only after two
   # runners have agreed on the build. Publishing first and verifying afterwards
@@ -311,10 +327,16 @@ jobs:
           WEALD_REPRO_LABEL: clean-clone
           WEALD_REPRO_VERSION: ${{ github.ref_name }}
         run: scripts/relay-reproduce.sh --out ../repro-clean --label clean-clone
+      # `artifact_digest`, which is the one number relay-reproduce.sh hashes over
+      # `platform_digests` plus `binaries`, and the same field repro-compare.py
+      # returns as the agreed digest. Reading `platform_digests` here instead
+      # would compare a Python dict repr against a `sha256:` string and could
+      # never match, which would leave every release blocked on a job that can
+      # only fail.
       - name: It must equal the digest the other two agreed on
         run: |
           set -eux
-          rebuilt="$(python3 -c 'import json;print(json.load(open("repro-clean/manifest.json"))["platform_digests"])')"
+          rebuilt="$(python3 -c 'import json,sys;print(json.load(open("repro-clean/manifest.json"))["artifact_digest"])')"
           agreed='${{ needs.compare.outputs.digest }}'
           {
             echo "### reproducibility, third build"
@@ -384,7 +406,11 @@ jobs:
             printf '  --certificate-identity-regexp "^https://github.com/%s/" \\\n' "${{ github.repository }}"
             printf '  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n'
             printf '  ghcr.io/%s/weald-relay@%s\n```\n\n' "${{ github.repository_owner }}" "$DIGEST"
-            printf '## Checksums\n\n```\n'
+            printf '## Checksums\n\n'
+            printf 'Every asset below is listed with its SHA-256. `install.sh` is '
+            printf 'attached beside `install.sh.sha256`: check it before you run it, '
+            printf 'because it is the one asset here that executes on your machine.\n\n'
+            printf '```\n'
             cat assets/*.sha256
             printf '```\n\n'
             printf 'What this release does and does not prove is set out in '
@@ -402,6 +428,8 @@ jobs:
             --verify-tag \
             assets/weald-relay-compose.tar.gz \
             assets/weald-relay-compose.tar.gz.sha256 \
+            assets/install.sh \
+            assets/install.sh.sha256 \
             assets/wealdrelay-*.tar.gz \
             assets/wealdrelay-*.tar.gz.sha256 \
             assets/agreed-digest.txt

@@ -60,11 +60,9 @@ An implementation is conformant when it passes the vector corpus. If you are
 writing one and something in the specification is ambiguous, that is a bug in
 the specification and we would like to hear about it.
 
-Two conventions in these documents come from the private monorepo the relay was
-built in and mean nothing to an implementer: "step N" dates a decision against a
-private build ledger, and citations of `specs/backend/build/*`,
-`specs/backend/cloud/*`, `Sources/*` and `Tests/*` name files in the repository
-holding the macOS client. They are provenance, not reading you are missing.
+One convention comes from the private monorepo the relay was built in: a few test
+suites write timing and evidence files under a `build-evidence/` directory that
+lives there rather than here. Those are outputs, not reading you are missing.
 Everything needed to implement, run and verify a relay is here.
 
 ## Layout

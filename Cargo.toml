@@ -17,6 +17,12 @@ unsafe_op_in_unsafe_fn = "deny"
 opt-level = 3
 lto = true
 codegen-units = 1
-# Never panic = "abort": weald-mls relies on catch_unwind at every C ABI entry
-# point per specs/backend/relay/mls-binding.md, and abort would bypass it.
+# There is deliberately no `panic` key here. Leaving it at the default `unwind`
+# is load bearing: weald-mls wraps every C ABI entry point in `catch_unwind` so a
+# panic becomes a status code rather than a dead host process, and panic = "abort"
+# would bypass that boundary. See specs/backend/relay/mls-binding.md.
+#
+# Strip symbols: the release binary is published and independently rebuilt, and
+# symbol tables carry build-machine paths that would make two honest builds of
+# the same source differ.
 strip = true

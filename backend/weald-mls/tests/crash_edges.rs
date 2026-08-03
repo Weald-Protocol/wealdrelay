@@ -37,7 +37,7 @@ use openmls_traits::OpenMlsProvider as _;
 use weald_mls::session::{Config, Device};
 use weald_mls::store::Provider;
 
-/// The group the victim works in. Must match the constant in `src/bin/crash-victim.rs`.
+/// The group the victim works in. Must match the constant in `harness/crash-victim.rs`.
 const GROUP: &[u8] = b"weald-crash-group";
 
 /// The epoch the staged group is at before the commit under test is processed.

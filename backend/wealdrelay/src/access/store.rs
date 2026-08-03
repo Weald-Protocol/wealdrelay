@@ -485,8 +485,8 @@ pub async fn admits(
     // lookup cannot miss, a SQL `exists` is `bool` by the parser regardless of the
     // catalog, and `exists` is never null. A `?` no database state can reach is a line
     // no test can honestly cover, and the coverage floor for this file is 100 percent
-    // with no exclusions permitted anywhere near the access set
-    // (`specs/backend/build/testing.md`). The fix is to not write the branch.
+    // with no coverage-exclusion attribute permitted anywhere near the access set.
+    // The fix is to not write the branch.
     let present: bool = sqlx::query_scalar(
         "select exists ( \
              select 1 from relay_access_entry e \
@@ -645,10 +645,9 @@ pub async fn admission(
 /// not, and carrying that mark into a freshly issued grant would void the new one on
 /// the next publication for something the old one did.
 ///
-/// The
-/// invite machinery that creates these arrives with `specs/backend/relay/invites.md`;
-/// what step 6 owes is that a grant, once it exists, dies exactly when the three
-/// rules say it does.
+/// The invite machinery that creates these lives in
+/// `specs/backend/relay/invites.md`; what this function owes is that a grant, once
+/// it exists, dies exactly when the three rules say it does.
 pub async fn grant(
     pool: &PgPool,
     workspace: &str,

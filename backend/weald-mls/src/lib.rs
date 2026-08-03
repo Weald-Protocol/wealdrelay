@@ -2,18 +2,18 @@
 // Copyright 2026 Dicyanin Labs
 //! The Weald MLS binding.
 //!
-//! Step 0 establishes the build root, the toolchain pin and the coverage gate.
-//! The twelve-function seam in `specs/backend/relay/mls-binding.md` lands in
-//! step 7 and nothing here anticipates it.
+//! OpenMLS behind the twelve-function C ABI seam that
+//! `specs/backend/relay/mls-binding.md` defines.
 //!
-//! What exists now is the one thing the client needs before any MLS function
-//! does: a way to check that the XCFramework it linked against is the one this
-//! source produced. `specs/backend/build/environments.md` pins this component
-//! by checksum, and a checksum is only useful next to a version the running
-//! process can be asked for.
+//! Before any MLS function is called, a caller needs one thing: a way to check
+//! that the binary it linked against is the one this source produced. A build
+//! of this crate is pinned by checksum wherever it is consumed, and a checksum
+//! is only useful next to a version the running process can be asked for, which
+//! is what `ABI_VERSION` and the version accessors below are for.
 //!
-//! This crate has no test double in any environment. See
-//! `specs/backend/build/local-harness.md`.
+//! This crate has no test double in any environment. There is no mock MLS, in
+//! the local harness or anywhere else, because a mock would prove agreement
+//! between two halves of one fiction rather than conformance to RFC 9420.
 
 pub mod boundary;
 pub mod buffer;

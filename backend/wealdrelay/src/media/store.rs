@@ -446,8 +446,8 @@ pub async fn stale_unclaimed(
 }
 
 /// Every claimed blob for one workspace and group, with its reserved byte count
-/// (the size the relay charges it at) — the set the storage-listing collector
-/// checks a bucket key against.
+/// (the size the relay charges it at). This is the set the storage-listing
+/// collector checks a bucket key against.
 pub async fn claimed_hashes(
     pool: &PgPool,
     workspace: &str,

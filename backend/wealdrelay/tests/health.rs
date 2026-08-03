@@ -236,3 +236,53 @@ fn futures_lite_block_on<F: std::future::Future>(future: F) -> F::Output {
         .expect("a current-thread runtime")
         .block_on(future)
 }
+
+#[test]
+fn the_invite_link_the_relay_prints_is_a_route_the_relay_serves() {
+    // The first-run banner prints `https://<hostname>/join/<token>`. For a while
+    // the landing page existed as a function and the router did not mention it, so
+    // every printed invite led to a 404 and the only caller of `landing_page` was a
+    // test. This asserts the two agree: the path in the banner is a path the public
+    // router answers.
+    let state = Arc::new(RelayState::new(
+        config(&[(keys::RELEASE_CHECK, "off")]),
+        None,
+        None,
+    ));
+    let banner = wealdrelay::invite::genesis::banner(
+        &state.config.hostname,
+        &wealdrelay::invite::genesis::FirstRun {
+            public_key: vec![1; 32],
+            fingerprint: vec![2; 32],
+            token: vec![3; 16],
+            code: wealdrelay::invite::code::Code::from_bits(0x0123_4567_89ab_cdef),
+        },
+    );
+    let printed = banner
+        .lines()
+        .find_map(|line| line.split_once("https://"))
+        .map(|(_, rest)| rest.trim().to_string())
+        .expect("the banner prints a link");
+    let path = printed
+        .split_once('/')
+        .map(|(_, rest)| format!("/{rest}"))
+        .expect("the link carries a path");
+
+    let response = futures_lite_block_on(async {
+        use tower::ServiceExt as _;
+        wealdrelay::health::public_router(Arc::clone(&state))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&path)
+                    .body(axum::body::Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("the router answers")
+    });
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "the printed invite path {path} must be served, not 404"
+    );
+}

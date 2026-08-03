@@ -112,8 +112,8 @@ trust root creates:
 | `chan:ws/general` | `parent`, `open`, default | The everybody channel. Where a new joiner's first message lands. |
 | `chan:ws/activity` | `parent`, `open`, default | Agent and CI output, ticket transitions, git status. Muted by default. |
 
-Binding the local project to the workspace
-(`specs/backend/hosted-service.md` step 7) creates no groups. The
+Binding the local project to the workspace, which is part of onboarding rather
+than of the protocol (`specs/backend/hosted-service.md`), creates no groups. The
 workspace root already is the project group, so binding writes the `workspace`
 field into `.weald` and flips the transport, and the default channels above are
 the project's channels.

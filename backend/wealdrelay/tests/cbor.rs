@@ -2,9 +2,9 @@
 // Copyright 2026 Dicyanin Labs
 //! Deterministic CBOR, checked against the client's half byte for byte.
 //!
-//! The Swift side is `Tests/DeterministicCBORTests.swift` over
-//! `Sources/Sync/DeterministicCBOR.swift`, and the vectors below are the same
-//! vectors, deliberately. The envelope's `hash` is a content address the relay
+//! The client has a Swift implementation of the same encoding with its own tests,
+//! and the vectors below are the same vectors, deliberately. The envelope's `hash`
+//! is a content address the relay
 //! recomputes on accept, so the only thing that makes dedupe work is that two
 //! independent encoders produce identical bytes. A test that only round tripped
 //! inside Rust would pass with an encoder that agreed with nothing, so every

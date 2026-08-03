@@ -45,6 +45,8 @@ pub fn guard<T>(on_ok: impl FnOnce(T), body: impl FnOnce() -> Result<T>) -> Stat
 /// `wealdrelay::logging`; this is a library linked into a desktop app, and its errors
 /// belong in the app's own log through the code the caller receives.
 fn log_error(error: &Error) {
+    // stderr, not a logger: nothing guarantees the host installed one, and dropping the
+    // message silently would erase the only record that an unwind was caught here.
     // A single line, prefixed so it is greppable in a crash report.
     eprintln!("weald_mls: {error}");
 }

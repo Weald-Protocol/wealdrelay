@@ -50,9 +50,8 @@ pub async fn serve(config: Config) -> Result<(), ServeError> {
 }
 
 /// Bind both listeners. Separate from ``run`` so a test can bind port zero and
-/// learn the assigned port, which is what
-/// `specs/backend/build/testing.md` means by "no shared ports: the harness assigns
-/// both".
+/// learn the assigned port. No test may hard-code a port: the harness assigns
+/// both, so runs never collide with each other or with a developer's relay.
 pub async fn bind(
     state: &Arc<RelayState>,
 ) -> Result<(tokio::net::TcpListener, tokio::net::TcpListener), ServeError> {
@@ -111,7 +110,7 @@ pub async fn run(
     //
     // The public listener now carries the relay socket as well as `/healthz`, so a
     // client connection is aborted along with the listener when the process stops.
-    // That is the right outcome for this step: a session holds no uncommitted
+    // That is the right outcome: a session holds no uncommitted
     // state, because `accept` commits before it acknowledges, so a client that
     // loses its socket mid-write either sees the acknowledgement or retries and is
     // answered with the same sequence number.
@@ -207,9 +206,21 @@ pub async fn bootstrap(database: &Database, config: &Config) {
         }
         Ok(crate::invite::genesis::Ensured::Existing {
             fingerprint,
+            token,
             redeemed,
-            ..
         }) => {
+            // Reprint the link while the workspace is still empty. The banner is
+            // printed once, at mint, and an operator who lost that scrollback used
+            // to have no way back: the link was recoverable from the database all
+            // along and nothing showed it to them. The code is not reprinted and
+            // cannot be, which `genesis::reminder` says out loud so nobody goes
+            // looking for a reissue flag that must never exist.
+            if !redeemed {
+                println!(
+                    "{}",
+                    crate::invite::genesis::reminder(&config.hostname, &token, &fingerprint)
+                );
+            }
             let fingerprint = crate::invite::genesis::hex(&fingerprint);
             tracing::info!(
                 workspace = %workspace,

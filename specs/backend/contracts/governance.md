@@ -4,13 +4,13 @@ Until this file existed, "the Weald Protocol" meant "whatever our current wire
 format happens to be". The difference between those two things is not the quality
 of the specification. It is whether somebody who is not us can depend on it: know
 what may change, know how much warning they get, know how to object, and know
-what will still be true in two years. That is what this document supplies, and it
-is the last of the two genuine gaps recorded in `PROTOCOL-READINESS.md`, the
-other being the ciphersuite pin now written in `../relay/mls-binding.md`.
+what will still be true in two years. That is what this document supplies. It was
+written alongside the ciphersuite pin in `../relay/mls-binding.md`, and the two
+of them together are what turned a specification into something dependable.
 
-Scope: the protocol surface listed below. Not the macOS client, which is not
-open source and carries no compatibility promise; not the control plane's
-internal schema; not pricing, packaging or the hosted tier's operations.
+Scope: the protocol surface listed below. Not the reference client, which is not
+open source and carries no compatibility promise; not any operator's internal
+schema; not pricing, packaging or the operations of a managed deployment.
 
 ## 1. What is governed
 
@@ -202,4 +202,4 @@ routinely do to their implementers.
 
 | Date | Change |
 | --- | --- |
-| 2026-08-02 | Created. First governance and change control document for the protocol. Closes the second of the two real gaps in `PROTOCOL-READINESS.md`, alongside the cryptographic pin in `../relay/mls-binding.md`. |
+| 2026-08-02 | Created. First governance and change control document for the protocol, written alongside the cryptographic pin in `../relay/mls-binding.md`. |

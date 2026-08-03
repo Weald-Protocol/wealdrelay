@@ -9,15 +9,29 @@
 #      exists or is a declared private reference
 #   4. the licence boundary holds
 #   5. house style
+#
+# `WEALD_SPEC_CHECK_STRICT=1` turns every skip into a failure. Set it in ci.
+# A skip is the right answer on a contributor's laptop, where installing a CDDL
+# compiler to fix a typo is a tax nobody should pay, and the wrong answer in a
+# pipeline, where a check that quietly did not run is reported as a check that
+# passed.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STRICT="${WEALD_SPEC_CHECK_STRICT:-}"
 FAIL=0; SKIP=0
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
 ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 pass() { grn "ok    $*"; }
 fail() { red "FAIL  $*"; FAIL=1; }
-skip() { ylw "skip  $*"; SKIP=1; }
+skip() {
+  if [ -n "$STRICT" ]; then
+    red "FAIL  $* (WEALD_SPEC_CHECK_STRICT is set, so a skip is a failure)"
+    FAIL=1
+  else
+    ylw "skip  $*"; SKIP=1
+  fi
+}
 
 C="$ROOT/specs/backend/contracts"
 
@@ -54,21 +68,20 @@ if [ -n "$DANGLING" ]; then
   for d in $DANGLING; do echo "      $d"; done
 else pass "every spec reference resolves"; fi
 
-# 3b. The same check over the whole tree, against an explicit list of the paths
-#     that live in the private monorepo. Those citations are provenance for a
-#     decision rather than reading anybody is missing, and README.md,
-#     CONTRIBUTING.md and specs/backend/relay/README.md all say so. The point of
-#     naming them here is that the list is closed: a *new* reference to something
-#     that does not ship fails, instead of joining a background of broken links
-#     nobody reads any more.
+# 3b. The same check over the whole tree, and over source as well as prose.
+#
+#     Source is included deliberately. This repository's house style is that a
+#     comment records why, which in practice means comments cite specifications,
+#     and a comment citing a document that does not ship is worse than no comment:
+#     it tells a reader that the reasoning exists somewhere they cannot go. When
+#     the relay was split out of its monorepo, 33 such citations came with it and
+#     this check did not scan `.rs`, so all 33 passed.
+#
+#     PRIVATE_REFS is the escape hatch and it is deliberately empty. Nothing in
+#     this repository may cite a `specs/` or `scripts/` path that does not ship.
+#     If that ever has to change, an entry here is a decision somebody made on
+#     purpose rather than a broken link joining a background of broken links.
 PRIVATE_REFS=$(cat <<'EOF'
-specs/sync-substrate.md
-specs/chat.md
-specs/weald-data-tiers.md
-specs/ticket-format.md
-specs/ticket-write-contract.md
-specs/board-search.md
-scripts/backend-gate.sh
 EOF
 )
 UNKNOWN=""
@@ -79,6 +92,7 @@ while IFS= read -r ref; do
   UNKNOWN="$UNKNOWN $ref"
 done < <(grep -rhoE '`(specs|scripts)/[a-zA-Z0-9/._-]+`' "$ROOT" \
   --include='*.md' --include='*.rb' --include='*.service' --include='*.yml' \
+  --include='*.rs' --include='*.toml' --include='*.py' --include='*.sh' \
   --exclude-dir=target --exclude-dir=.git 2>/dev/null | tr -d '`' | sort -u)
 if [ -n "$UNKNOWN" ]; then
   fail "documentation references a path that does not ship, and is not on the known-private list:"

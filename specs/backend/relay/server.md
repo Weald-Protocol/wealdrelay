@@ -56,13 +56,17 @@ provenance attestation via SLSA level 3.
 `README.md`. Includes Postgres, MinIO, Redis and Caddy for automatic TLS.
 
 ```
-curl -fsSL https://get.weald.team/relay | sh
-cd weald-relay && cp .env.example .env && $EDITOR .env
+sh install.sh
+cd weald-relay && $EDITOR .env
 docker compose up -d
 ```
 
-Three commands to a TLS-terminated relay on a fresh VPS. The `.env` edit is one
-line, the hostname. Everything else has a working default.
+Three commands to a TLS-terminated relay on a fresh VPS, where `install.sh` is
+the script attached to the release and also carried inside the compose bundle.
+It writes a `.env` with generated passwords, so the edit is one line, the
+hostname. Everything else has a working default.
+`backend/wealdrelay/deploy/README.md` is the runbook and is the authority on how
+to obtain the bundle.
 
 **3. One-click templates.** Maintained deploy buttons and templates for
 Railway, Fly.io, Render, DigitalOcean App Platform, and a Hetzner or generic-VPS
@@ -70,13 +74,14 @@ cloud-init script. Each wires the provider's own managed Postgres and object
 storage rather than running our containers for them, because a customer on
 Railway wants Railway's Postgres backed up by Railway.
 
-**4. Homebrew and a raw binary.** `brew install weald/tap/wealdrelay` for local
+**4. Homebrew and a raw binary.** `brew install hunterh37/tap/wealdrelay` for local
 development and for a team that genuinely wants to run this on a Mac mini in a
 cupboard, which at this posture is a legitimate deployment.
 
 A Helm chart and Terraform modules are deliberately not in this list. Nobody at
-a team of 3 to 30 is standing up Kubernetes for a 20 MB binary, and both are
-cheap to add later if a specific deal asks.
+a team of 3 to 30 is standing up Kubernetes for a 20 MB binary. Neither is ruled
+out later: the relay is one stateless process, so both are packaging rather than
+protocol.
 
 ## Configuration surface
 
@@ -282,13 +287,17 @@ source tag is an alarm, and a digest that is genuinely older than the latest
 release is a chore. Rendering the second as the first is how a security banner
 gets trained into background noise.
 
-## Open items
+## Not yet decided
 
-- Browser client key custody. A browser cannot hold a device key the way the
-  Mac app can. Options are a WASM client with an IndexedDB-held key plus a
-  passkey unlock, or treating the browser as a view onto a paired desktop. This
-  gates the `reach` score in `specs/backend/relay/overview.md` and is not yet decided.
+Gaps in this specification that an implementer should know about, and one that
+has since closed.
+
+- Browser client key custody is unspecified. A browser cannot hold a device key
+  the way a native app can. The candidates are a WASM client with an
+  IndexedDB-held key plus a passkey unlock, or treating the browser as a view
+  onto a paired desktop. Nothing here defines which, and the choice bounds the
+  `reach` score in `specs/backend/relay/overview.md`.
 - A Tailscale or WireGuard-only deployment mode for teams that want no public
-  ingress. Now specified as a supported path in
+  ingress was open and is now closed: it is a supported path, specified in
   `specs/backend/relay/deployment.md`, and the only path where
   `WEALD_RELAY_ACCESS_SET=off` is a reasonable setting.

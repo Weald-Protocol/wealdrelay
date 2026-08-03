@@ -11,7 +11,7 @@
 //! end to end: `BLOB put`, a real PUT of ciphertext, a retention manifest that
 //! claims the hash, `BLOB get`, and a real GET that returns the same bytes. On
 //! the local profile the presigned URL points at the relay's own `/blob` route,
-//! which `environments.md` makes the filesystem backend's stand-in for AWS SigV4,
+//! which is the filesystem backend's stand-in for AWS SigV4,
 //! so this file is also the only place that route is exercised as a route.
 
 mod support;
@@ -287,8 +287,8 @@ async fn a_workspace_out_of_storage_still_sends_text() {
 
 // MARK: The local presigned-URL route
 //
-// Reachable only on the filesystem backend, which `environments.md` runs in
-// `local` alone. It stands in for AWS SigV4 there, so it has to refuse everything
+// Reachable only on the filesystem backend, which is for local development
+// alone. It stands in for AWS SigV4 there, so it has to refuse everything
 // SigV4 refuses: a key that could escape the key space, a token for another
 // object, an expired token, and a token nobody signed.
 

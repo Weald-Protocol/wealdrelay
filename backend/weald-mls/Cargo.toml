@@ -9,14 +9,15 @@ description = "OpenMLS behind the narrow C ABI the Weald client links against."
 [lib]
 name = "weald_mls"
 path = "src/lib.rs"
-# rlib for the Rust test tiers, staticlib for the XCFramework step 7 vends.
+# rlib so the Rust test tiers can link the crate directly, staticlib so a native
+# host application can link the C ABI in `ffi.rs`.
 crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "crash-victim"
 path = "harness/crash-victim.rs"
-# Out of `src/` on purpose, and the reason is written up in
-# `specs/backend/build/testing.md`. This binary is a test fixture: it exists only so
+# Out of `src/` on purpose, because `src/` carries a 100 percent coverage floor and
+# this file cannot meet one. This binary is a test fixture: it exists only so
 # `tests/crash.rs` has a process it can have killed by a real SIGABRT, and its own module
 # doc says nothing links it. A process killed by SIGABRT never writes its coverage profile,
 # so the two lines that do the killing cannot be measured by any means: the profile writer
@@ -38,21 +39,21 @@ test = false
 bench = false
 
 [features]
-# The panic injector in `ffi.rs`, and nothing else. Off by default and never enabled for
-# the XCFramework: a panic that a customer's process could raise on purpose would be a
-# denial of service with a friendly name. Enabled for this crate's own test targets by
+# The panic injector in `ffi.rs`, and nothing else. Off by default and never enabled in a
+# shipped build: a panic that a caller's process could raise on purpose would be a denial
+# of service with a friendly name. Enabled for this crate's own test targets by
 # the dev-dependency on itself below, which is the stable way to reach a feature from an
 # integration test without turning it on for the library everybody links.
 test-hooks = []
 
 [dependencies]
 # `pure` rather than the default, and it is not a performance preference. The default
-# backend compiles BLAKE3's C and its NEON assembly, and the app target already vendors
-# the same C at Sources/CBLAKE3 because specs/backend/relay/wire.md makes a BLAKE3 digest
-# the envelope's content address. Linking both produced a duplicate symbol for
-# `_blake3_compress_in_place_portable` and the app would not link. The pure-Rust backend
-# emits no C symbols, so there is exactly one copy of BLAKE3's C in the process and it is
-# the one the envelope code already used. The tag this crate hashes is 64 bytes once per
+# backend compiles BLAKE3's C and its NEON assembly and exports those C symbols from the
+# staticlib. A host that already links its own copy of BLAKE3's C, which is likely given
+# specs/backend/relay/wire.md makes a BLAKE3 digest the envelope's content address, then
+# fails to link on a duplicate `_blake3_compress_in_place_portable`. The pure-Rust backend
+# emits no C symbols, so the host keeps exactly one copy of BLAKE3's C and it is the one
+# its envelope code already used. The tag this crate hashes is 64 bytes once per
 # commit per recovery key, so the throughput difference is not measurable here.
 blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
 openmls = "0.8.1"

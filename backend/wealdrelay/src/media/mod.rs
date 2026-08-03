@@ -94,11 +94,10 @@ fn object_key(workspace: &str, group: &[u8], hash: &[u8]) -> Result<BlobKey, Sto
 /// A presigned URL for `key`, from whichever backend is configured.
 ///
 /// The S3 arm is a real presigned request (`storage::s3::S3Store::presign_put`).
-/// The filesystem arm, reachable only in `local`
-/// (`specs/backend/build/environments.md`: the filesystem backend is `local`'s
-/// only), presigns against the relay's own `/blob` route
-/// (`media::http`) instead, because there is no real bucket on a laptop to
-/// presign a request against.
+/// The filesystem arm, reachable only in local development because the filesystem
+/// backend is never configured in a deployed environment, presigns against the
+/// relay's own `/blob` route (`media::http`) instead, because there is no real
+/// bucket on a laptop to presign a request against.
 async fn presign(
     state: &RelayState,
     key: &BlobKey,

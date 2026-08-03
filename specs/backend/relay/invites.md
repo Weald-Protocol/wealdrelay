@@ -81,8 +81,8 @@ The link goes to email. The code does not.
 
 At invite creation the admin's client displays a one-time **12-character
 Crockford Base32 code**, grouped `ABCD-EFGH-JKLM`, and the admin sends it over
-whatever channel they already use, typically the Slack thread where they said
-"I'm adding you". The email contains only the link. The grouping makes it
+whatever channel they already use, typically the same conversation where they
+said "I'm adding you". The email contains only the link. The grouping makes it
 comfortable to paste or read aloud while the 60-bit value remains safe even
 against distributed guessing.
 
@@ -140,13 +140,17 @@ reservation is what makes it admissible. Everything that would otherwise be a
 session check is a property of the record instead, and the endpoint's single generic
 answer is what keeps it from being an oracle.
 
-Step 5's signature verification is **not yet implemented**, and it is named here
-rather than left to be discovered: the client fetches the sealed bundles and opens
+**A known limitation of the reference client, stated here rather than left to be
+discovered.** The signature verification the fetch step requires is specified
+above but is not yet implemented: the client fetches the sealed bundles and opens
 them, but does not yet fetch the signed record and verify that its issuer chains to
-the workspace trust root. Until it does, a client trusts the relay for which scopes
-an invite covers. A relay can shrink that list, which costs a joiner a channel it
-would have entered, and cannot widen it: a scope it invented has no bundle anybody
-can open, and the commit for it is refused against the record's own scope list.
+the workspace trust root. The security consequence, for as long as that holds, is
+that a client trusts the relay for which scopes an invite covers. A relay can
+shrink that list, which costs a joiner a channel it would have entered, and cannot
+widen it: a scope it invented has no bundle anybody can open, and the commit for it
+is refused against the record's own scope list. An implementation that performs the
+verification does not interoperate any differently; it simply stops extending the
+relay that trust.
 
 4. **Local setup, then reserve.** Before spending an invite seat, the client
    generates its device key, collects a display name, and generates and confirms
@@ -388,27 +392,29 @@ blocking.
    no unlogged prefix.
 
 For self-hosters the genesis key never leaves their machine and this whole
-section is a formality. For hosted it is the crux of the trust-root race in
-`specs/backend/hosted-service.md`, and it should be demoed rather than
-described: a screen recording of the key being destroyed and the log entry being
-written is worth more than the paragraph above.
+section is a formality. Where somebody else provisions the relay it is the crux
+of the trust-root race
+(`specs/backend/contracts/threat-model/bootstrap-handoff.md`), and it is worth
+watching rather than reading: the key being destroyed and the log entry being
+written are both observable, which is more than this paragraph can be.
 
 ### Delivery
 
-The relay prints the link and the code to its own stdout for self-hosters, and
-for the hosted tier the two halves are split across channels:
+The relay prints the link and the code to its own stdout for self-hosters. Where
+somebody else provisions the relay, the two halves are split across channels:
 
-- **Link** on the post-checkout page, in the browser session that paid.
-- **Code** emailed to the verified Clerk email of the owner who initiated
-  Checkout, locked into that Checkout session. A mutable Stripe invoice address
-  is never used for this security factor.
+- **Link** to the browser session that ordered the instance.
+- **Code** to an address the operator verified before provisioning began, and
+  which no later profile or billing edit can move. A mutable address is never
+  used for this security factor.
 
 That split protects against an accidentally forwarded link and against a
 browser-only or inbox-only compromise. It does **not** turn email delivery into
-an independent control-plane security boundary: the service requesting delivery
-handles the code. The hosted trust-root race is instead made visible by the
-client's hard-fail and permanently attributable through the genesis entry; the
-customer can replace the instance without a support ticket. This distinction is
+an independent security boundary against the provisioning operator: the service
+requesting delivery handles the code. The trust-root race is instead made visible
+by the client's hard-fail and permanently attributable through the genesis entry,
+and the customer can have the instance replaced without asking anyone
+(`specs/backend/contracts/threat-model/bootstrap-handoff.md`). This distinction is
 deliberate because a reassuring but false "two independent compromises" claim
 would be worse than naming the remaining risk.
 

@@ -29,11 +29,11 @@ use wealdrelay::ws::{
     try_queue, Outbound, Queued,
 };
 
-/// The relay's clock. Fixed, because `testing.md` forbids a wall-clock read inside
-/// anything under test.
+/// The relay's clock. Fixed, because the harness forbids ambient time inside
+/// anything under test: a wall-clock read makes a failure unreproducible.
 const NOW: u64 = 1_700_000_000_000;
 
-/// The hub identity a connection carries from step 5 onward. Any value: what it is
+/// The hub identity a connection carries. Any value: what it is
 /// for is telling one connection's subscriptions apart from another's, and these
 /// tests drive one connection at a time.
 const CONNECTION: wealdrelay::hub::ConnectionId = 7;

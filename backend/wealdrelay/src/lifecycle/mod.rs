@@ -95,8 +95,8 @@ pub async fn handle(state: &Arc<RelayState>, session: &Session, payload: Vec<u8>
         Err(_) => return Frame::Error(FrameError::new(ErrorCode::Backpressure)),
     }
 
-    // The relay's own clock, not the host's. `testing.md` forbids a wall-clock
-    // read inside anything under test, and every expiry the relay enforces is
+    // The relay's own clock, not the host's. Nothing under test may read a wall
+    // clock, and every expiry the relay enforces is
     // against the clock it was given: a due date read from somewhere else would
     // be a different relay's opinion of now.
     match drop_before(pool, workspace, &record, state.now_ms() / 1000).await {

@@ -3,9 +3,8 @@
 Who a principal is, how a device proves it, and how an agent gets bounded
 authority. Layer 0 of the stack in `specs/backend/relay/overview.md`.
 
-This replaces the trust-on-first-push root described in
-`specs/sync-substrate.md`, which scored `identity` 4 because whoever can push to
-`.weald/keys/` can publish a key under someone else's handle.
+This replaces the trust-on-first-push root the git path relies on, where whoever
+can push to `.weald/keys/` can publish a key under someone else's handle.
 
 ## Principals
 
@@ -241,9 +240,10 @@ header" while that page said the payload alone, and the disagreement was the
 bug.
 
 Canonical encoding is deterministic CBOR. No JSON canonicalisation, because the
-existing `.weald` chat signing already learned that lesson and the
-round-trip-safety requirement in `CLAUDE.md` applies to files on disk, not to
-the wire.
+existing `.weald` chat signing already learned that lesson. The requirement that
+a file on disk survives a read-and-write cycle byte for byte, so that humans and
+agents can both edit it, is a constraint on the on-disk formats, not on the
+wire.
 
 ## Relationship to `.weald/keys`
 
@@ -253,16 +253,21 @@ for git-synced history, the roster for relay-synced history. A device
 participating in both publishes the same public key to both.
 
 Legacy unsigned lines remain unverified forever. There is no migration and there
-cannot be one, per `specs/sync-substrate.md`.
+cannot be one: converting them would mean signing content with keys that never
+signed it.
 
-## Open questions
+## Not yet decided
 
-- Whether a quorum should also be able to authorize a recovery, rather than only
-  to confirm one. The confirm-only recovery quorum in
-  `specs/backend/relay/wire.md` is required for general availability, because
-  without it a one-admin workspace has no way out of probation. Letting a quorum
-  additionally start a recovery, for a team that would rather not hold a phrase
-  at all, is the larger version of the feature and is not scoped.
+Two gaps an implementer should know are open. Neither is specified here, and a
+conformant relay is not expected to implement either.
+
+- Whether a quorum can authorize a recovery, rather than only confirm one. The
+  confirm-only recovery quorum in `specs/backend/relay/wire.md` is the specified
+  behaviour and is required for general availability, because without it a
+  one-admin workspace has no way out of probation. Quorum-initiated recovery,
+  for a team that would rather not hold a phrase at all, is the larger version
+  of the feature and has no wire format.
 - Whether a hardware security key (FIDO2, resident credential) can act as a
-  portable device identity for the browser client. Would materially improve
-  `reach`. Not scoped.
+  portable device identity, for instance in a browser client. It would
+  materially improve `reach`. No binding between a resident credential and a
+  roster entry is defined.

@@ -3,7 +3,8 @@
 //! The access set against real Postgres: the transaction, the chain, and the one
 //! question `AUTH` asks.
 //!
-//! Step 6's integration half. Nothing here is mocked and nothing here is skipped:
+//! The integration half of access-set enforcement. Nothing here is mocked and
+//! nothing here is skipped:
 //! the harness Postgres is the database, the migrations are the ones the binary
 //! embeds, and the compare-and-swap is proven by two writers racing rather than by
 //! reading the SQL.
@@ -622,8 +623,9 @@ async fn a_group_names_its_workspace_and_an_unknown_group_names_none() {
 
 #[tokio::test]
 async fn exactly_the_currently_authorised_principals_are_admitted() {
-    // Step 6's property gate: "for any sequence of grants and revocations, exactly
-    // the currently authorized principals can open a socket". Randomised over both
+    // The property access-set enforcement has to hold: for any sequence of grants
+    // and revocations, exactly the currently authorized principals can open a
+    // socket. Randomised over both
     // mechanisms at once, because the two interact: a grant is voided implicitly by
     // a publication, and a publication's removals are the other half of offboarding.
     //
@@ -758,10 +760,9 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
 
 #[tokio::test]
 async fn the_access_tables_hold_salted_hashes_and_the_keys_they_must_verify_and_nothing_else() {
-    // Step 6's artifact: "the access set table dump showing salted hashes and nothing
-    // else". Written to `build-evidence/step-06/` rather than only asserted, because
-    // what the relay learns from these tables is a claim, and a claim with no dump
-    // behind it is a promise.
+    // The access set table dump, showing salted hashes and nothing else. Written out
+    // as a file rather than only asserted, because what the relay learns from these
+    // tables is a claim, and a claim with no dump behind it is a promise.
     //
     // What is legitimately clear here, and why: `relay_access_principal` holds
     // authorizer, recovery and quorum pubkeys, because the relay verifies signatures
@@ -795,7 +796,7 @@ async fn the_access_tables_hold_salted_hashes_and_the_keys_they_must_verify_and_
     .unwrap();
 
     let mut dump = String::from(
-        "step 6, the access set as the relay holds it\n\
+        "the access set as the relay holds it\n\
          every row of every access table for one workspace, after a genesis publication\n\
          and one provisional grant\n\n",
     );

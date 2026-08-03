@@ -30,7 +30,7 @@ axum = { version = "0.7", default-features = false, features = ["http1", "json",
 # failure a test can actually produce (a retyped column), which is the difference
 # between a handled database fault and one nobody has ever run.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "migrate", "macros", "uuid", "time"] }
-# Reservation and multipart session identifiers (step 9, media blobs).
+# Reservation and multipart session identifiers for media blobs.
 uuid = { version = "1", features = ["v4"] }
 # S3, for the object storage backend that is not the filesystem.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
@@ -61,6 +61,9 @@ proptest = "1"
 tempfile = "3"
 # Only for sending a real SIGTERM to a spawned relay in tests/process.rs.
 libc = "0.2"
+# Only for driving the router directly in tests/health.rs, so a route can be
+# asserted without binding a port. Already in the tree underneath axum.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

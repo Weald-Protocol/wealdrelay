@@ -146,9 +146,9 @@ def compare(manifests: list[dict], expect: str | None = None, allow_dirty: bool 
 
 
 # --- the comparison's own suite ---------------------------------------------
-# specs/backend/build/testing.md: the thing that enforces a gate is itself
-# tested, because a comparison that always returns zero is indistinguishable
-# from a reproducible build right up until it matters.
+# The thing that enforces a gate is itself tested, because a comparison that
+# always returns zero is indistinguishable from a reproducible build right up
+# until it matters. Run it with `--selftest`.
 
 
 def _manifest(label, context="sha256:ctx", epoch=1000, image="sha256:img", binary="sha256:bin",

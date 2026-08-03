@@ -6,7 +6,8 @@
 //! no socket, no clock. That is what makes the convergence property in
 //! `tests/negentropy.rs` a property test rather than an integration test: the same
 //! code the relay runs is driven ten thousand times against randomised set
-//! partitions and randomised arrival order, which is the gate step 5 asks for.
+//! partitions and randomised arrival order, which is what convergence has to be
+//! proven against.
 //!
 //! ## The round, end to end
 //!

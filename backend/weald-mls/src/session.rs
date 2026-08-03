@@ -658,10 +658,10 @@ fn load_or_create_signer(provider: &Provider, identity: &[u8]) -> Result<Signatu
 ///    attacker who can send one malformed byte should not be able to make a client tear
 ///    down a group.
 /// 2. Debug and release disagreed. `debug_assert!` compiles out with assertions off, so
-///    the shipped XCFramework returned `Malformed` and every test ran the other path. A
+///    the shipped library returned `Malformed` and every test ran the other path. A
 ///    suite that never executes production's code path is a suite that proves less than
-///    it claims, and this is exactly the divergence `specs/backend/build/README.md`
-///    refuses between environments.
+///    it claims, which is the one divergence between environments this project does not
+///    accept.
 ///
 /// Catching it here makes the two agree, and the mapping is honest rather than a
 /// convenience: a panic raised by a pure decoder, on bytes it was asked to decode, is

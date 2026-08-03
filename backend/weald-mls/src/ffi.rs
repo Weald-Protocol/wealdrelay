@@ -813,15 +813,15 @@ pub unsafe extern "C" fn weald_mls_open_wrap(
 
 /// Raise a panic inside the guard, so the guard can be proven rather than trusted.
 ///
-/// `specs/backend/build/phases-relay.md` step 7 names this as a negative: "a panic
-/// deliberately raised inside the boundary returns a typed error and does not unwind into
-/// Swift." There is no way to prove that without a panic to catch, and no honest way to
-/// get one out of a correct implementation, so this exists to supply it.
+/// The claim the boundary has to make good on is that a panic deliberately raised inside
+/// it returns a typed error and does not unwind across the C ABI into the caller. There
+/// is no way to prove that without a panic to catch, and no honest way to get one out of
+/// a correct implementation, so this exists to supply it.
 ///
-/// Behind the `test-hooks` feature, which is off by default and is never enabled for the
-/// XCFramework. The symbol's absence from the shipped library is asserted by the build
-/// step of this gate, because a panic injector reachable from a customer's process would
-/// be a denial of service with a friendly name.
+/// Behind the `test-hooks` feature, which is off by default and is never enabled in a
+/// shipped build. The symbol's absence from the shipped library is asserted, because a
+/// panic injector reachable from a caller's process would be a denial of service with a
+/// friendly name.
 ///
 /// `payload` chooses what happens: 0 panics with a string, a positive value panics with a
 /// non-string, and a negative value does not panic at all and reports `Ok`. The first two

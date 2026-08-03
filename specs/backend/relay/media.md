@@ -176,7 +176,8 @@ one.
    advancing. Ed25519 is deterministic in RFC 8032 and is not in every
    implementation of it (CryptoKit randomises `Curve25519.Signing`), so a client
    **stores the signed record it published** and retransmits those bytes rather
-   than signing again. See `Sources/Sync/RetentionKeyStore.swift`. The relay
+   than signing again, which means the retention key store has to keep the
+   signed bytes and not only the key. The relay
    stores it as evidence, refuses every retention-driven deletion for that group
    until the conflict clears, and reports the group as frozen on `/readyz` and in
    the client's encryption panel. Every member's client raises a
@@ -240,8 +241,8 @@ hash. This is the same metadata class already disclosed in
 than folded into "envelope sizes", because a retention set makes the association
 between a group and a blob visible to us in a way individual envelopes do not.
 
-Naming that in `/security` costs us nothing and being caught omitting it would
-cost a great deal.
+An operator's own disclosure has to name it. Saying so costs nothing and being
+caught omitting it would cost a great deal.
 
 ## Client behaviour
 

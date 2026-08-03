@@ -2,12 +2,12 @@
 // Copyright 2026 Dicyanin Labs
 //! Reconciliation and the live path, over real sockets against real Postgres.
 //!
-//! Step 5's integration and negative proofs (`specs/backend/build/phases-relay.md`).
-//! The client half of the exchange is driven by `wealdrelay::negentropy::advance`,
-//! which is the same code the client ships behind its own implementation in
-//! `Sources/Sync`: the two are held to the shared vectors in
-//! `specs/backend/contracts/wire/vectors/recon.json` rather than to each other, so
-//! this suite proving the round trip does not also excuse the Swift half.
+//! The integration and negative proofs for reconciliation. The client half of the
+//! exchange is driven by `wealdrelay::negentropy::advance`, which is the Rust peer
+//! of the client's own implementation of the same protocol: the two are held to the
+//! shared vectors in `specs/backend/contracts/wire/vectors/recon.json` rather than
+//! to each other, so this suite proving the round trip does not also excuse the
+//! client half.
 //!
 //! What is proven here:
 //!
@@ -226,8 +226,8 @@ async fn two_clients_with_disjoint_sets_converge_over_recon() {
         .unwrap();
     assert_eq!(stored, 6);
 
-    // Recorded rather than assumed: the round count against corpus size is step 5's
-    // artifact.
+    // Recorded rather than assumed: the round count against corpus size is the
+    // deliverable this suite owes, so it is written out rather than inferred.
     support::record_recon_rounds("disjoint 3 by 3", 6, rounds);
 
     relay.shutdown().await;

@@ -7,10 +7,11 @@
 # CADDY_TLS is an escape hatch with exactly two intended values:
 #   unset            public hostname, automatic ACME. The normal case.
 #   internal         Caddy's own local CA. For a hostname that is not publicly
-#                    resolvable: a laptop, a private network, or the local
-#                    integration proof in scripts/backend-gate.sh.
-# specs/backend/relay/deployment.md path 4 uses `internal` or a private CA,
-# because there is no ACME without public ingress.
+#                    resolvable: a laptop, a machine behind NAT, or a test run
+#                    against a name that exists only in /etc/hosts. Clients must
+#                    then be told to trust that CA explicitly.
+# The private-network path uses `internal` or a private CA, because there is no
+# ACME without public ingress.
 
 {
 	# No admin API on a published port. The bundle exposes 80 and 443 and

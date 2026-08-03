@@ -23,8 +23,8 @@
 //! **downgraded and told**, never silently skipped: `operations.md` requires that a
 //! dropped envelope is impossible, because a hole in an author chain is a security
 //! alarm on somebody else's screen. The downgrade frame tells the client it is now
-//! responsible for catching up by reconciliation, which is the mechanism step 5
-//! adds and which is why the downgrade only becomes honest in this step.
+//! responsible for catching up by negentropy reconciliation (`RECON`), so the
+//! downgrade is only honest on a relay that answers that frame.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,9 +144,10 @@ impl Hub {
 
     /// Close every open connection held by one principal, now.
     ///
-    /// Returns how many were closed, which is what the disconnect timing in step 6's
-    /// evidence is measured from. A connection that has already gone counts as
-    /// closed: the outcome the caller asked for is that it is not connected.
+    /// Returns how many were closed, which is what the eviction latency of an
+    /// access-set rotation is measured from. A connection that has already gone
+    /// counts as closed: the outcome the caller asked for is that it is not
+    /// connected.
     pub async fn evict(&self, entry_hash: &[u8]) -> usize {
         let taken = {
             let mut principals = self.principals.lock().await;
@@ -228,8 +229,8 @@ impl Hub {
 
     /// Fan one frame out to a group's subscribers.
     ///
-    /// Generalised in step 8, when MLS handshake messages became a frame of their
-    /// own: they are fanned out on exactly the same terms as envelopes, including
+    /// Generalised when MLS handshake messages became a frame of their own: they
+    /// are fanned out on exactly the same terms as envelopes, including
     /// the downgrade owed to a subscriber whose queue is full, and duplicating that
     /// logic for a second frame is how the two would drift apart.
     pub async fn fanout_frame(

@@ -24,7 +24,7 @@
 //! workspace root group in `scopes`. The root has no parent and so cannot use the
 //! self-join mechanism; its per-invite `GroupInfo` is what lets a new device enter
 //! the roster-bearing group at all. ``Invite::check_mandatory_root`` is the relay's
-//! half of that rule and `Sources/Sync/Invite.swift` is the client's, because
+//! half of that rule and the client's Swift implementation is the other, because
 //! invites.md requires both: the relay rejects a record that omits its declared
 //! workspace root, and clients reject one before presenting it to the joiner.
 //!
@@ -65,8 +65,8 @@ pub const DEFAULT_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 ///
 /// Longer than an ordinary invite rather than shorter, because the buyer may not
 /// have installed the app yet and there is nothing of value in an empty workspace
-/// to protect with a tight window. This is the reconciliation recorded in
-/// `specs/backend/README.md` and named again by step 8's config line.
+/// to protect with a tight window. The provisioning configuration names the same
+/// twenty-four hours, so the two agree.
 pub const BOOTSTRAP_EXPIRY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The default seat count.

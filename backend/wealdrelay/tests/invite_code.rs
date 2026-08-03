@@ -183,9 +183,9 @@ fn who_sends_the_mail_is_decided_by_configuration_and_nothing_else() {
 
 #[test]
 fn the_hosted_tier_cannot_reach_the_relay_sends_arm() {
-    // Not because this module checks the profile, which would be exactly the branch
-    // on environment `specs/backend/build/environments.md` forbids, but because a
-    // hosted relay cannot start with an SMTP URL at all. The refusal lives in
+    // Not because this module checks the profile, which would be exactly the kind of
+    // branch on the deployment environment that is forbidden, but because a hosted
+    // relay cannot start with an SMTP URL at all. The refusal lives in
     // `profile::enforce` and this is the proof that the two halves meet: the only
     // input `decide` has is the one the hosted profile makes impossible.
     use wealdrelay::config::{keys, Config, Values};

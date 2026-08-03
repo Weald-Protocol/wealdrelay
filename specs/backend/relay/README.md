@@ -6,20 +6,13 @@ state end-to-end encrypted, alongside the existing git transport.
 One workspace is one project throughout these specs: one `.weald` directory, one
 roster, one recovery phrase, one relay. See `multi-workspace.md`.
 
-**Conventions carried over from where these documents were written.** They are
-development bookkeeping and none of them carries meaning for an implementer.
-
-"Step N" refers to a gated step in Weald's private build ledger, which advances
-only when its unit, property, integration and negative proofs are all recorded.
-A sentence like "corrected in step 7" is dating a decision, not naming anything
-you need. Similarly, `build-evidence/` paths point at recorded artifacts in that
-repository, and citations of `specs/backend/build/*`, `specs/backend/cloud/*`,
-`Sources/*`, `Tests/*` and the `scripts/backend-gate.sh` family name files in
-the private monorepo that holds the macOS client and the build ledger. They are
-provenance for a decision, not reading you are missing: where such a reference
-matters to you, the claim it supports is restated in `verification.md` in terms
-you can check yourself. Everything needed to implement, run and verify a relay
-is in this repository.
+**One convention carried over from where these documents were written.** A few
+test suites write timing and evidence files under a `build-evidence/` directory,
+which is a path in the private monorepo that holds the reference client and its
+build ledger rather than anything in this tree. Those are outputs, not reading
+you are missing. Everything needed to implement, run and verify a relay is in
+this repository, and `verification.md` restates in checkable terms any claim
+that would otherwise rest on evidence you cannot see.
 
 Read in this order.
 
@@ -27,14 +20,14 @@ Read in this order.
 
 | Spec | Covers |
 | --- | --- |
-| `overview.md` | Goals, layering, competitive position, rubric delta, what we give up. |
+| `overview.md` | Goals, layering, the problem this solves, rubric delta, what we give up. |
 | `identity.md` | Device keys, principals, roster, agent certificates, agent leaf lifecycle. |
 | `auth.md` | Signup, admin, mandatory recovery phrase, pairing, recovery. |
 | `invites.md` | Invites, one-time codes, external commits, the genesis key, admin controls. |
 | `groups.md` | MLS groups, epochs, derived keys, history policy, deletion, threat model. |
 | `channels.md` | Default channels, admission policy, self-join, pending adds, creation order. |
 | `wire.md` | Envelope, author chains, head attestation, the access set, event kinds, sync, transport. |
-| `mls-binding.md` | OpenMLS behind a twelve-function Rust FFI. Highest-risk engineering in the programme. |
+| `mls-binding.md` | OpenMLS behind a fourteen-function Rust FFI. Highest-risk engineering in the programme. |
 
 **Running it.**
 
@@ -58,18 +51,19 @@ Read in this order.
 | `verification.md` | The proofs, as UI surfaces rather than a docs page. |
 | `migration.md` | Phased rollout from git, dual transport, rollback, risk register. |
 
-Background cited but not shipped here: `specs/sync-substrate.md` for why git was
-chosen and how the eight-dimension rubric works, `specs/chat.md` for the current
-on-disk chat format, `specs/weald-data-tiers.md` for the durable and live split,
-`specs/ticket-format.md` and `specs/ticket-write-contract.md` for the round-trip
-guarantees the relay must not break. Those describe the client's on-disk formats
-and live in the private client repository. Nothing in this folder depends on
-reading them: the relay carries opaque payloads, and what it does with them is
-specified in `wire.md`.
+Some background is not shipped here: why git was chosen as the first substrate
+and how the eight-dimension rubric behind it works, the client's on-disk chat
+format, the split between durable and live client data, and the round-trip
+guarantees a ticket file on disk gives its human editors. Those describe a
+client's local formats rather than the protocol. Nothing in this folder depends
+on reading them: the relay carries opaque payloads, and what it does with them
+is specified in `wire.md`. Where one of those guarantees constrains the
+protocol, it is stated inline where it applies.
 
-Status: pre-1.0, and implemented. The relay in `backend/wealdrelay` and the MLS
-binding in `backend/weald-mls` are the running code these documents describe.
-Where a document and the code disagree, `verification.md` says which proof
+Status: pre-1.0. The relay in `backend/wealdrelay` and the MLS binding in
+`backend/weald-mls` are the reference implementation these documents describe,
+and are running code rather than a sketch. No independent implementation exists
+yet. Where a document and the code disagree, `verification.md` says which proof
 settles it.
 
 Nothing in Weald's hosted service (`specs/backend/hosted-service.md`) is a

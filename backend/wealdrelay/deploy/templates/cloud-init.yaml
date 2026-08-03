@@ -3,13 +3,19 @@
 # the no-provider-template case.
 #
 # Paste this into the user-data box when creating the server, having replaced
-# RELAY_HOSTNAME below. Point DNS at the machine first, or the certificate
-# cannot be issued on first boot.
+# RELAY_HOSTNAME below. It refuses to install if you have not: an unedited
+# template would ask a public CA for a certificate for relay.example.com. Point
+# DNS at the machine first, or the certificate cannot be issued on first boot.
 #
-# What it does: installs Docker, fetches the compose bundle, generates the two
-# passwords, writes .env, and starts the stack. It then writes the one-time
-# enrollment URL to /root/weald-enrollment.txt as well as the log, because on
-# this path there is no provider log viewer to read it out of.
+# What it does: installs Docker, downloads install.sh from the release named by
+# RELAY_VERSION, which fetches and checksums the compose bundle and generates
+# the two passwords, then edits the hostname into .env and starts the stack. It
+# writes the one-time enrollment URL to /root/weald-enrollment.txt as well as to
+# the log, because on this path there is no provider log viewer to read it out
+# of.
+#
+# Status: this template downloads release assets, so it works from the first
+# signed release onwards and not before.
 
 package_update: true
 package_upgrade: true
@@ -27,8 +33,36 @@ write_files:
       #!/bin/sh
       set -eu
 
-      # Edit this. Everything else on this page has a working default.
+      # Edit these two. Everything else on this page has a working default.
       RELAY_HOSTNAME="relay.example.com"
+      # RELEASE PIN. The one line in this file to update per release.
+      RELAY_VERSION="wealdrelay-v0.1.0"
+
+      REPO="hunterh37/WealdRelay"
+
+      # An unedited template must not reach ACME. Issuing a certificate for
+      # relay.example.com is somebody else's problem being made into a request,
+      # so this stops first and says why, in a file the operator will find.
+      if [ "$RELAY_HOSTNAME" = "relay.example.com" ]; then
+        cat > /root/weald-relay-NOT-INSTALLED.txt <<'MSG'
+      The Weald relay was not installed.
+
+      RELAY_HOSTNAME in /etc/weald-relay-install.sh is still the placeholder
+      relay.example.com. Nothing was started, because an unedited hostname would
+      have asked Let us Encrypt for a certificate for a name that is not yours.
+
+      Fix it, then run the script again:
+
+        $EDITOR /etc/weald-relay-install.sh    set RELAY_HOSTNAME
+        /etc/weald-relay-install.sh
+
+      Point an A or AAAA record for that hostname at this machine first, or the
+      certificate cannot be issued.
+      MSG
+        echo "weald: RELAY_HOSTNAME is still relay.example.com. Refusing to continue." >&2
+        echo "weald: see /root/weald-relay-NOT-INSTALLED.txt" >&2
+        exit 1
+      fi
 
       # Docker, from the official convenience script. Pinned to the repository
       # rather than to a version because Docker does not publish a stable
@@ -38,9 +72,16 @@ write_files:
       fi
       systemctl enable --now docker
 
+      # install.sh is a release asset. It fetches the compose bundle for the
+      # same tag, verifies its SHA-256 and refuses to install without one, then
+      # writes .env with both passwords generated. It does not start anything,
+      # which is why the compose command below is separate.
       cd /opt
-      WEALD_RELAY_DIR=weald-relay
-      curl -fsSL https://get.weald.team/relay | sh
+      curl -fsSL -o /opt/weald-install.sh \
+        "https://github.com/${REPO}/releases/download/${RELAY_VERSION}/install.sh"
+      chmod 0700 /opt/weald-install.sh
+      WEALD_RELAY_DIR=weald-relay WEALD_RELAY_VERSION="$RELAY_VERSION" \
+        /opt/weald-install.sh
 
       cd /opt/weald-relay
       sed -i "s|^WEALD_RELAY_HOSTNAME=.*|WEALD_RELAY_HOSTNAME=${RELAY_HOSTNAME}|" .env
@@ -67,4 +108,9 @@ runcmd:
 final_message: |
   The Weald relay is starting. The one-time enrollment URL is in
   /root/weald-enrollment.txt and in `docker compose logs relay` under
-  /opt/weald-relay. It expires in 24 hours or on first use.
+  /opt/weald-relay. It expires in 24 hours or on first use, and the one-time
+  code printed with it cannot be reprinted.
+
+  If /root/weald-relay-NOT-INSTALLED.txt exists instead, the hostname in
+  /etc/weald-relay-install.sh was never edited and nothing was started. That
+  file says what to do.

@@ -71,11 +71,18 @@ Consequences, all of which the docs must state together:
   every client's encryption panel.
 - **Our support cannot reach it**, which is true of every self-host path but is
   most visible here.
+- **It is a self-contained compose file**, not an overlay on the public one.
+  `backend/wealdrelay/deploy/private-network/docker-compose.tailscale.yml` brings
+  up the whole stack itself and drops Caddy, because a relay behind a tailnet
+  terminates TLS on the tailnet rather than through ACME. An overlay cannot work
+  here: Compose merges rather than replaces, so the base file's `networks:` on
+  the relay service would survive alongside this path's `network_mode:` and
+  Compose refuses a service carrying both.
 
 ## The local case
 
 A team running the relay on a Mac mini in a cupboard is a legitimate deployment
-at this posture, served by `brew install weald/tap/wealdrelay`. The client can
+at this posture, served by `brew install hunterh37/tap/wealdrelay`. The client can
 also run a relay locally for a solo user who wants sub-second sync across their
 own devices with no server anywhere, which is the smallest useful configuration
 of this entire system and is worth having in the docs as the first example

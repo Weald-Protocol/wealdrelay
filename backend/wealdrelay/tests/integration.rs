@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! Step 3's integration proof, against real dependencies.
+//! The relay binary's integration proof, against real dependencies.
 //!
-//! `specs/backend/build/phases-relay.md`: "the binary against real Postgres and
-//! real MinIO, migrations from zero, `/readyz` truthful, restart with state
-//! intact". Every one of those words is load-bearing and none of them is
-//! satisfiable with a mock, so nothing here is mocked.
+//! What has to hold: the binary against real Postgres and real MinIO, migrations
+//! from zero, `/readyz` truthful, restart with state intact. Every one of those
+//! words is load-bearing and none of them is satisfiable with a mock, so nothing
+//! here is mocked.
 //!
 //! The dependencies come from the local harness (`scripts/weald-stack up`). If
 //! they are not there these tests **fail** rather than skip. A skipped integration
 //! proof that reports success is the exact failure mode this programme exists to
-//! prevent: `specs/backend/build/testing.md` puts real Postgres and real object
-//! storage in tier 3 and says "no mock of anything the customer runs".
+//! prevent, and nothing the customer runs may be mocked in its place.
 //!
-//! Each test gets its own database, created and dropped here, because
-//! `testing.md` requires that no test share a port or a database name with
-//! another.
+//! Each test gets its own database, created and dropped here, because no test may
+//! share a port or a database name with another.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -109,7 +107,7 @@ fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
         (keys::DATABASE_URL, scratch.url.clone()),
         (keys::STORAGE_URL, format!("file://{}", blobs.display())),
         // Port zero: the operating system assigns, so no test shares a port with
-        // another. `testing.md` requires exactly this.
+        // another. No test in this repository may hard-code a port.
         (keys::LISTEN, "127.0.0.1:0".to_string()),
         (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
         // The one thing every environment agrees on, including local.
@@ -445,8 +443,8 @@ async fn the_per_group_counter_hands_out_sequence_numbers_without_touching_other
     // `operations.md`: sequence assignment is a single UPDATE ... RETURNING against
     // a per-group counter row inside the same transaction as the insert, so the
     // lock is per group and unrelated groups never contend. This asserts the shape
-    // the accept path in step 4 will use, against the real database, before there
-    // is an accept path to get it wrong.
+    // the accept path will use, against the real database, before there is an
+    // accept path to get it wrong.
     let scratch = Scratch::new("counter").await;
     let blobs = tempfile::tempdir().unwrap();
     let state = serve::prepare(config_for(&scratch, blobs.path()))
@@ -499,7 +497,9 @@ async fn readyz_reports_both_dependencies_and_the_security_posture() {
     assert!(readiness.database.ok, "{:?}", readiness.database);
     assert!(readiness.storage.ok, "{:?}", readiness.storage);
     assert!(readiness.ready);
-    // The field step 3's artifact must contain.
+    // The field that says whether the relay is checking access sets at all. It has
+    // to be on the readiness document, because an operator otherwise cannot tell an
+    // enforcing relay from one that admits anyone.
     assert_eq!(readiness.access_set, "enforce");
     assert_eq!(readiness.min_enc, "none");
     assert_eq!(readiness.write_mode, "full");
@@ -615,10 +615,10 @@ async fn a_relay_running_access_set_off_says_so_on_readyz() {
 #[tokio::test]
 async fn a_frozen_group_is_named_on_readyz_and_stops_readiness() {
     // `media.md`: a group whose retention control chain has a contested successor
-    // is reported as frozen on `/readyz`. Nothing can freeze a group until step 10,
-    // so the column is set directly here: the point is that the document reports
-    // it, and a poller that learned the field later would have to learn a new
-    // document shape.
+    // is reported as frozen on `/readyz`. Nothing in this suite drives a retention
+    // chain into contention, so the column is set directly here: the point is that
+    // the document reports it, and a poller that learned the field later would have
+    // to learn a new document shape.
     let scratch = Scratch::new("frozen").await;
     let blobs = tempfile::tempdir().unwrap();
     let state = serve::prepare(config_for(&scratch, blobs.path()))

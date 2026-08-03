@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! Tier 2. Invariants over randomised input, per
-//! `specs/backend/build/testing.md`. The seed is printed by proptest on
-//! failure and is recorded in the ledger when one is found.
+//! Tier 2. Invariants over randomised input, which every parser or state rule in
+//! this crate is required to carry alongside its unit tests. The seed is printed
+//! by proptest on failure, so a counterexample can be replayed exactly.
 
 use proptest::prelude::*;
 use wealdrelay::config::{keys, Values};
 use wealdrelay::{run, startup, Invocation, Startup};
 
 /// Case count comes from the environment so ci can run reduced counts on push
-/// and full counts on a pull request, per `specs/backend/build/testing.md`, and
-/// so the number lives in one place rather than in every suite.
+/// and full counts on a pull request, and so the number lives in one place
+/// rather than in every suite.
 fn config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()

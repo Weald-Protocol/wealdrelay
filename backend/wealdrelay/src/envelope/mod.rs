@@ -2,15 +2,15 @@
 // Copyright 2026 Dicyanin Labs
 //! The envelope, and every check the relay makes on accept.
 //!
-//! This is the trust boundary. `backend/build-coverage-exclusions.md` names
-//! `backend/wealdrelay/src/envelope/**` as a path where no coverage exclusion is
-//! ever permitted and `scripts/backend-coverage.sh --exclusion-grep` fails on one,
-//! because envelope validation is what makes a forged author chain fail.
+//! This is the trust boundary. This module carries a 100 percent coverage floor
+//! and no coverage-exclusion attribute is permitted anywhere in it, because
+//! envelope validation is what makes a forged author chain fail.
 //!
-//! The client's half is `Sources/Sync/Envelope.swift`. The two compute the same
-//! content address over the same canonical encoding, and step 4's gate compares
-//! them against the same vectors, because "the relay recomputes the hash on
-//! accept" is only a real check if both sides mean the same function by it.
+//! The client's Swift implementation is the other half. The two compute the same
+//! content address over the same canonical encoding, and both are compared against
+//! the shared vectors in `specs/backend/contracts/wire/vectors/`, because "the
+//! relay recomputes the hash on accept" is only a real check if both sides mean the
+//! same function by it.
 //!
 //! ## What the relay can check, and what it deliberately cannot
 //!
@@ -76,8 +76,8 @@ pub struct Envelope {
 ///
 /// Deliberately excluding `seq` and `ts`: the relay assigns them, so an address
 /// covering them would change when the relay touched it and a retry would not
-/// deduplicate. This is the function `Sources/Sync/Envelope.swift` computes, over
-/// the same bytes.
+/// deduplicate. This is the function the client's Swift implementation computes,
+/// over the same bytes.
 pub fn content_hash(v: u8, enc: Encryption, group: &[u8], epoch: u64, ct: &[u8]) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&cbor::uint(u64::from(v)));

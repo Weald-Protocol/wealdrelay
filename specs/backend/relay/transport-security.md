@@ -18,12 +18,13 @@ operator, or anyone who can obtain a certificate for a relay's name.
 
 ## The scheme rule
 
-`RelayEndpoint.validate` is the gate and it is a pure function.
+Endpoint validation is the gate, and it has to be a pure function of the
+configured URL, decided before a socket is opened.
 
 - `wss` everywhere.
 - `ws` only to a host that is *literally* loopback, and only outside a shipped
-  build. Never to a resolved address: a name that resolves to loopback today
-  resolves wherever its zone says tomorrow.
+  build. Never to a resolved address: a name that resolves to loopback on one
+  lookup resolves wherever its zone says on the next.
 - A shipped build refuses plaintext outright, including to loopback, and ignores
   `WEALD_RELAY_URL` entirely so a variable in a customer's shell cannot aim their
   client anywhere.
@@ -34,7 +35,7 @@ relay and nothing else. There is no per-domain exception.
 
 ## The TLS floor
 
-`URLSessionRelaySocket` states the floor rather than inheriting it. ATS already
+The client states the floor in code rather than inheriting it. ATS already
 refuses worse than TLS 1.2 for a host it governs, but a floor that lives only in
 a plist is one that a later exception silently lowers, and this is the connection
 carrying the workspace.
@@ -59,7 +60,7 @@ So the pin is trust-on-first-use, with a stronger configured mode on top.
 
 ### Precedence
 
-Four sources can have an opinion. `RelayPinStore.policy` resolves them in this
+Four sources can have an opinion. A client resolves them in this
 order, and the order is the whole design:
 
 1. **A loopback host.** System trust only, and nothing is learned or stored.
@@ -73,19 +74,20 @@ write to the repository. Without it, "point them at my relay and pin my key"
 would be two lines of JSON. Outside a shipped build the order of 2 and 3 is
 reversed, which is how a staging key gets tested against a debug build.
 
-### Zones we operate
+### Zones the client's vendor operates
 
-Weald's own hosted relays all sit under `weald.team`:
-`<slug>.weald.team` for a customer's instance, `api.weald.team` for the control
-plane. We hold that zone and its certificates, so for those hosts the client can
-make the stronger claim: not "the same relay as yesterday" but "the key we
-published". There is no first-use window, and a certificate mis-issued for
-`weald.team` by any of the CAs in the system trust store does not get traffic.
+A managed offering typically holds one DNS zone and issues a subdomain per
+customer instance under it. Where the party that builds the client is also the
+party that holds the zone and its certificates, the client can make the stronger
+claim for those hosts: not "the same relay as yesterday" but "the key we
+published". There is no first-use window, and a certificate mis-issued for one
+of those names by any of the CAs in the system trust store does not get traffic.
 
-`RelayKnownHosts.entries` carries them. Matching is on a label boundary, so
-`notweald.team` and `weald.team.attacker.example` are not ours. Those hosts also
-get a TLS 1.3 floor, since the reason the general default is 1.2 (a customer's
-reverse proxy) does not apply to a terminator we run.
+The client carries a table of such zones and their pins. Matching is on a label
+boundary, so a zone `example.net` does not match `notexample.net` or
+`example.net.attacker.example`. Those hosts also get a TLS 1.3 floor, since the
+reason the general default is 1.2 (a customer's reverse proxy) does not apply to
+a terminator the vendor runs.
 
 None of this touches a self-hosted relay. A customer's own host keeps
 trust-on-first-use and their own configured pin.
@@ -95,7 +97,7 @@ That is the state a zone is in between owning the name and shipping a digest,
 and it must not be the state that takes the product down.
 
 **Rotation.** `scripts/relay-pin.sh <host>` prints the `sha256/…` line for a live
-host. The operational rule is that `entries` always carries the key in service
+host. The operational rule is that the table always carries the key in service
 *and* the next one, published in a build *before* the rotation. A build that
 ships only the key in service bricks every client the moment that key is
 replaced, and those clients are on other people's Macs.
@@ -106,8 +108,8 @@ never rescues an expired, revoked, or wrongly-named certificate.
 The digest is over the DER `SubjectPublicKeyInfo` (RFC 7469), so renewing a
 certificate with the same key pair keeps the pin valid. That is deliberate: a
 relay behind a 90-day ACME certificate would otherwise warn four times a year and
-teach its operator to click through. Where the key type is outside the table in
-`RelaySPKI.headers`, the fallback pins the whole certificate under a distinct
+teach its operator to click through. Where the key type is one for which the
+client holds no SPKI algorithm header, the fallback pins the whole certificate under a distinct
 `cert-sha256/` label, so the two can never be confused and the weaker case is
 visible rather than silent.
 
@@ -146,9 +148,9 @@ Nothing about pinning changes how a local relay behaves. Specifically:
   of a developer's diff.
 - The TLS 1.3 floor applies to our zones, not to loopback.
 
-A held pin is never overwritten by learning. Rotation is an explicit
-`RelayPinStore.forget`, not a prompt attached to a failure: a person shown "trust
-this new key?" while trying to work will say yes.
+A held pin is never overwritten by learning. Rotation is an explicit, deliberate
+act of forgetting the stored pin, never a prompt attached to a failure: a person
+shown "trust this new key?" while trying to work will say yes.
 
 A corrupt store degrades to first-use, not to a client that cannot connect.
 
@@ -167,15 +169,15 @@ relay is not ours, that is a live path and not a theoretical one.
 
 The current bound is a shape check. `session.rs::challenge_bytes` finalises a
 BLAKE3 hash, so an honest challenge is exactly 32 bytes; every signing input
-listed above is a CBOR array or JSON object and is longer. `RelayHandshake`
-requires the exact length before the key is touched, which costs nothing on the
+listed above is a CBOR array or JSON object and is longer. A client must require
+that exact length before the key is touched, which costs nothing on the
 wire and removes every known collision by construction.
 
 That is a bound, not a proof, and it should not be the end state.
 
 **Open, for the next protocol version:** sign a domain-separated transcript,
 `H("weald/relay-auth/v1" ‖ challenge)`, rather than the challenge. Both halves
-have to move together, so it belongs to a `RelayFrame.protocolVersion` bump. The
+have to move together, so it belongs to a protocol version bump. The
 same bump should add domain-separation labels to the other signing inputs above,
 which would make the class of attack impossible rather than merely unreachable.
 
@@ -190,6 +192,6 @@ Binding the challenge to the exporter is the fix and it belongs to the same bump
   ids, sizes and rates. That is inherent to the design; `overview.md` says so.
 - **A compromised device.** Pinning says which server; it says nothing about a
   key already stolen from a Mac.
-- **Group identities.** Members verify each other with safety numbers
-  (`SafetyNumber.swift`), which is a separate mechanism and the one that actually
+- **Group identities.** Members verify each other with safety numbers, which are
+  a separate mechanism and the one that actually
   answers "am I talking to my teammate". Nothing on this page substitutes for it.

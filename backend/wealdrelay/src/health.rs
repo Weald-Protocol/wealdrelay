@@ -91,9 +91,9 @@ pub struct Readiness {
     pub version: String,
     pub database: DependencyState,
     pub storage: DependencyState,
-    /// The field step 3's artifact must contain. `enforce` or `off`, and a relay
-    /// running `off` says so here because a customer should not have to read their
-    /// operator's environment file to learn it.
+    /// `enforce` or `off`. Always present, and a relay running `off` says so here,
+    /// because a customer should not have to read their operator's environment
+    /// file to learn which posture they are talking to.
     pub access_set: &'static str,
     /// `none` or `mls`. Under `none` the client surfaces an explicit "this relay
     /// accepts unencrypted envelopes" state, so the setting has to be reported
@@ -125,10 +125,10 @@ pub struct RelayState {
     pub database: Option<Database>,
     pub storage: Option<Arc<Store>>,
     pub build: crate::BuildInfo,
-    /// The clock, injected. `specs/backend/build/testing.md` forbids a wall-clock
-    /// read inside anything under test, and every expiry the relay owns is
-    /// evaluated against its own observed time, so there is exactly one place that
-    /// reads it and everything else is a function of what it returned.
+    /// The clock, injected. Nothing under test may read a wall clock, and every
+    /// expiry the relay owns is evaluated against its own observed time, so there
+    /// is exactly one place that reads it and everything else is a function of
+    /// what it returned.
     pub clock: Clock,
     /// Set by the release-check timer. Read here, never written here: this module
     /// makes no outbound request.
@@ -138,8 +138,8 @@ pub struct RelayState {
     /// handles only: see `crate::hub` for why nothing else may go in it.
     pub hub: crate::hub::Hub,
     /// Signs the local presigned-URL tokens `media::http` issues when storage is
-    /// the filesystem backend. `environments.md` runs the filesystem backend only
-    /// in `local`, where there is no real object storage to presign a request
+    /// the filesystem backend, which is for local development only, where there is
+    /// no real object storage to presign a request
     /// against, so the relay stands in for one over its own public listener; this
     /// is the process secret that makes those tokens unforgeable. Unused, and
     /// never read, when storage is S3-compatible.
@@ -230,8 +230,8 @@ impl RelayState {
         }
     }
 
-    /// Groups with a contested retention control chain. Empty until step 10 gives
-    /// something the power to freeze one; the field exists now because `/readyz`
+    /// Groups with a contested retention control chain. Empty until the relay has
+    /// a mechanism that can freeze one; the field exists now because `/readyz`
     /// is specified to report it and a poller that learned the field later would
     /// have to learn a new document shape.
     async fn frozen_groups(&self) -> Vec<String> {
@@ -306,12 +306,32 @@ pub fn public_router(state: Arc<RelayState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/relay", get(relay_socket))
+        .route("/join/:token", get(join_page))
         .merge(crate::media::http::routes())
         .with_state(state)
 }
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
+}
+
+/// The invite landing page, at the path the first-run banner prints.
+///
+/// Routed on the public listener because the whole point of the printed link is
+/// that somebody who is not the operator can open it. The relay used to print a
+/// URL it did not serve, so every invite ended on a 404.
+///
+/// The token is not read, not looked up and not interpolated: the response is
+/// byte-identical for every token, including tokens that never existed. A page
+/// that varied would tell anyone who could fetch it which tokens are live, which
+/// is the oracle the flat response exists to close. `invite::delivery` carries the
+/// longer argument.
+async fn join_page() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        crate::invite::delivery::landing_page(),
+    )
 }
 
 /// The socket the client actually talks on.

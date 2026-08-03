@@ -84,7 +84,8 @@ pub enum State {
     /// set is signed by its trust root and published over a socket, so the first
     /// connection a workspace ever takes has no set to be checked against. Refusing
     /// it would make a workspace unreachable forever; admitting it to everything
-    /// would make the access set optional, which is the hole step 6 exists to close.
+    /// would make the access set optional, which is exactly what enforcing it is
+    /// supposed to prevent.
     /// So the session is admitted to exactly one frame, `ACCESS`, until a set exists.
     /// `SEND`, `SUB` and `RECON` are refused with the same code a stranger gets.
     Bootstrapping,
@@ -127,19 +128,20 @@ pub enum Work {
     Accept { envelope: Vec<u8> },
     /// Subscribe and backfill from this cursor.
     Subscribe { group: Vec<u8>, from_seq: u64 },
-    /// A negentropy round trip, which arrives in step 5.
+    /// A negentropy round trip, the set reconciliation half of sync.
     Reconcile { group: Vec<u8>, payload: Vec<u8> },
-    /// An access-set rotation, accepted transactionally in step 6.
+    /// An access-set rotation, accepted transactionally so a partly applied set
+    /// can never be the one enforced.
     RotateAccessSet { body: Vec<u8> },
-    /// A blob ticket, which arrives in step 9.
+    /// A blob ticket, the media upload and download path.
     BlobTicket { payload: Vec<u8> },
-    /// One signed `drop_before` compaction instruction (step 10).
+    /// One signed `drop_before` compaction instruction.
     DropBefore { payload: Vec<u8> },
-    /// One recovery wrap, stored under its blinded tag (step 8).
+    /// One recovery wrap, stored under its blinded tag.
     PublishWrap { body: Vec<u8> },
-    /// One step of an invite redemption (step 8).
+    /// One step of an invite redemption.
     Redeem { body: Vec<u8> },
-    /// One MLS handshake message, stored in order and fanned out (step 8).
+    /// One MLS handshake message, stored in order and fanned out.
     PublishHandshake { group: Vec<u8>, message: Vec<u8> },
 }
 
@@ -276,8 +278,8 @@ impl Session {
     /// which is what makes the ordering rule a property of this function rather
     /// than of the guards inside it.
     ///
-    /// `now_ms` is injected because `testing.md` forbids a wall-clock read inside
-    /// anything under test, and because the clock-skew rule is only checkable if
+    /// `now_ms` is injected because nothing under test may read a wall clock, and
+    /// because the clock-skew rule is only checkable if
     /// the test controls both clocks.
     pub fn handle(&mut self, frame: Frame, now_ms: u64) -> Reaction {
         match (self.state, frame) {

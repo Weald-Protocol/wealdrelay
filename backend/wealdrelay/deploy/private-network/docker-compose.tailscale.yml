@@ -1,27 +1,108 @@
 # Path 4: private network, no public ingress.
 # specs/backend/relay/deployment.md path 4.
 #
-# An overlay on the compose bundle, not a replacement for it:
+# A complete stack, not an overlay on ../compose/docker-compose.yml:
 #
-#   docker compose -f ../compose/docker-compose.yml \
-#                  -f docker-compose.tailscale.yml up -d
+#   cp .env.example .env && $EDITOR .env
+#   docker compose -f docker-compose.tailscale.yml up -d
 #
-# What it changes. Caddy is removed, because there is no ACME without public
-# ingress and nothing to terminate on the internet side. A Tailscale sidecar
-# joins the tailnet and the relay shares its network namespace, so the relay is
+# This was an overlay once and could not work. The relay here needs
+# `network_mode: service:tailscale`, the base file gives the same service
+# `networks: [weald]`, and compose overlays merge keys rather than removing
+# them, so the merged relay carried both and compose rejected the file outright
+# before starting anything. There is no overlay syntax that deletes a key, so
+# the file is self-contained instead. The cost is that the four services it has
+# in common with the compose bundle are written out twice; the benefit is that
+# the documented command starts.
+#
+# What differs from path 2. There is no Caddy, because there is no ACME without
+# public ingress and nothing to terminate on the internet side. A Tailscale
+# sidecar joins the tailnet, terminates TLS with Tailscale's own certificate for
+# the tailnet name, and the relay shares its network namespace, so the relay is
 # reachable at the tailnet name and at no other address. Nothing is published to
 # the host.
 #
 # The relay itself is unchanged: same image, same digest, same binary. This is
 # configuration, which is the rule the whole audit claim rests on.
+#
+# The project name is shared with the compose bundle on purpose. An operator who
+# moves between path 2 and path 4 on one machine keeps the same volumes and
+# therefore the same workspace.
+
+name: weald-relay
 
 services:
-  # `scale: 0` rather than deleting the service, because compose overlays merge
-  # and cannot remove. Caddy has no work to do here.
-  caddy:
-    deploy:
-      replicas: 0
-    ports: []
+  # Envelope log, group heads, key packages, quotas. Not optional.
+  postgres:
+    image: postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wealdrelay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: wealdrelay
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wealdrelay -d wealdrelay"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
+
+  # Encrypted media blobs. Replaceable with any S3-compatible endpoint, or with
+  # a plain directory: point WEALD_RELAY_STORAGE_URL at a file:// path instead.
+  minio:
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
+
+  # One shot. Creates the bucket and exits. The relay does not create buckets:
+  # a service that can create a bucket is a service with a credential that can
+  # delete one.
+  minio-init:
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/"$$BUCKET"
+        mc anonymous set none local/"$$BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      BUCKET: ${MINIO_BUCKET:-weald-blobs}
+    restart: "no"
+    networks: [weald]
+
+  # Fanout across relay processes, presence, ephemeral kinds. Optional: a
+  # single-process install can delete this service and unset
+  # WEALD_RELAY_REDIS_URL below, and the binary uses in-process channels.
+  redis:
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [weald]
 
   tailscale:
     image: tailscale/tailscale:stable@sha256:cdf5612ded5be1344f1a704b8c5e53496db97376bb533e5e15f141e48bf60cc0
@@ -48,14 +129,31 @@ services:
     networks: [weald]
 
   relay:
+    # RELEASE PIN. The one line in this file to update per release, and
+    # ../README.md lists the others. Set WEALD_RELAY_IMAGE in .env to the digest
+    # you verified from the release notes.
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/hunterh37/weald-relay:wealdrelay-v0.1.0}
+    restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
       tailscale:
         condition: service_started
     # The relay has no network identity of its own on this path. It is reachable
-    # only through the tailnet, at the sidecar's name.
+    # only through the tailnet, at the sidecar's name. This is the key that
+    # cannot coexist with `networks:`, and the reason this file is not an
+    # overlay. Postgres, MinIO and Redis still resolve by name, because the
+    # namespace the relay joins is the sidecar's and the sidecar is on `weald`.
     network_mode: service:tailscale
     environment:
       WEALD_RELAY_HOSTNAME: ${TS_HOSTNAME:-weald-relay}.${TS_TAILNET:?set TS_TAILNET in .env}
+      WEALD_RELAY_DATABASE_URL: postgres://wealdrelay:${POSTGRES_PASSWORD}@postgres:5432/wealdrelay
+      WEALD_RELAY_STORAGE_URL: s3://${MINIO_BUCKET:-weald-blobs}
+      WEALD_RELAY_REDIS_URL: redis://redis:6379
       # Tailscale terminates TLS in the sidecar via serve.json.
       WEALD_RELAY_TLS: "off"
       WEALD_RELAY_LISTEN: 127.0.0.1:8443
@@ -65,6 +163,17 @@ services:
       # the operator's decision to make and every client's encryption panel will
       # show it (specs/backend/relay/deployment.md path 4).
       WEALD_RELAY_ACCESS_SET: ${WEALD_RELAY_ACCESS_SET:-enforce}
+      WEALD_RELAY_MAX_STORAGE_GB: ${WEALD_RELAY_MAX_STORAGE_GB:-unlimited}
+      WEALD_RELAY_RETENTION_DAYS: ${WEALD_RELAY_RETENTION_DAYS:-unlimited}
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-wealdrelay}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
 
 volumes:
+  postgres:
+  minio:
   tailscale-state:
+
+networks:
+  weald:

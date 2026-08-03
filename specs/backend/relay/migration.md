@@ -2,18 +2,18 @@
 
 How the relay lands without breaking the git path, and how to back out.
 
-Governing rule: git is not being replaced. `specs/sync-substrate.md` scores it
-5 on `durability`, `infra`, `offline` and `maturity`, and those four fives are
-the existing bet. The relay is a second transport over the same event model, not
-a rewrite.
+Governing rule: git is not being replaced. On the rubric in
+`specs/backend/relay/overview.md` a git-backed transport scores 5 on
+`durability`, `infra`, `offline` and `maturity`, and those four fives are the
+existing bet. The relay is a second transport over the same event model, not a
+rewrite.
 
 ## Sequencing
 
 Five phases. Each is shippable and each leaves the product working if the next
 one never happens.
 
-**Phase 0: extract the transport seam.** Standing conclusion 5 in
-`specs/sync-substrate.md` already calls for this. Define `SyncTransport` with
+**Phase 0: extract the transport seam.** Define `SyncTransport` with
 publish, subscribe and reconcile, put the existing git behaviour behind it as
 `GitTransport`, and change nothing else. No user-visible change. This is the
 only phase that is unambiguously worth doing regardless of everything else in
@@ -22,9 +22,9 @@ this spec family.
 **Phase 1: event model, git-backed.** Introduce the envelope and payload from
 `specs/backend/relay/wire.md`, but with the relay's role played by files. Envelopes pack
 into `.weald/log/<group>/<utc-day>.bin`, append-only, `merge=union` friendly.
-Signing is already in place per WEALD-159. Encryption is off in this phase.
-Existing JSONL chat and `.wealdticket` files remain the human-editable surface;
-the log is derived. Still no server.
+Signing is already in place. Encryption is off in this phase. Existing JSONL
+chat and the ticket files on disk remain the human-editable surface; the log is
+derived. Still no server.
 
 **Phase 2: relay as an accelerator.** Ship `wealdrelay`. Clients that can reach
 it get sub-second sync; clients that cannot fall back to git and converge later.
@@ -108,15 +108,14 @@ During Phases 2 and 3 both transports are live. Rules:
 
 There is none, and that is deliberate.
 
-Existing `.weald/chat` JSONL and `.wealdticket` files are not converted. They
+Existing `.weald/chat` JSONL and the ticket files on disk are not converted. They
 remain readable and remain the archive of everything written before the cutover.
 New envelopes start at sequence 0 in a new log. A client renders both, sorted by
 timestamp, with a visible boundary marker.
 
 Rationale: converting history means re-signing content with keys that did not
 sign it, which manufactures attribution that never existed. The same reasoning
-that made legacy unsigned lines permanently unverified in
-`specs/sync-substrate.md` applies here.
+that leaves legacy unsigned lines permanently unverified applies here.
 
 ## Rollback
 
@@ -136,12 +135,12 @@ Per phase.
 | Risk | Severity | Mitigation |
 | --- | --- | --- |
 | MLS plus CRDT history replay is subtly wrong and members silently lose data. | High | Property-based tests over random membership churn interleaved with concurrent edits, asserting convergence and that removed members cannot decrypt post-removal epochs. Specified as a gate in `specs/backend/relay/mls-binding.md`. Gate Phase 3 on it. |
-| The Rust FFI holding every key is where the memory-safety bug lands. | High | Twelve-function seam, no callbacks, no panics across the boundary, fuzzing on the one function that eats untrusted bytes, and audit scope that includes the binding (`specs/backend/relay/mls-binding.md`). |
+| The Rust FFI holding every key is where the memory-safety bug lands. | High | Fourteen-function seam, no callbacks, no panics across the boundary, fuzzing on the one function that eats untrusted bytes, and audit scope that includes the binding (`specs/backend/relay/mls-binding.md`). |
 | Cold-start decrypt and index makes a new device feel broken. | High | Four-phase staged index with published gates: skeleton under 5s, 30-day window under 60s, full backfill under 20 minutes on the fixture workspace (`specs/backend/relay/search.md`). |
 | Relay storage grows without bound on a storage-priced plan. | High | Checkpoint-anchored compaction, automated by the epoch steward, with an admin-visible lever before the plan limit (`specs/backend/relay/lifecycle.md`). Gate the hosted tier on it. |
 | Offboarding leaves a revoked person connected or their recovery phrase live. | High | One removal action performing all of roster, epochs, recovery wraps and access set, with a receipt (`specs/backend/relay/lifecycle.md`). |
 | `infra` regression loses the zero-service selling point. | Medium | Git path stays fully supported and remains the default for new workspaces until Phase 4 lands. |
-| Search quality drops when it moves client-side. | Medium | Local index built at decrypt time, not at query time. Benchmark against `specs/board-search.md` current latency before shipping. |
+| Search quality drops when it moves client-side. | Medium | Local index built at decrypt time, not at query time. Benchmark against the existing client-side search latency before shipping. |
 | We become the maintainers of a bespoke protocol. | Medium | Every layer that can be a standard is one: MLS, WebSocket, Automerge, Negentropy. The only novel part is the envelope, which is 8 fields. |
 | Notification previews break on iOS. | Low | v1 has no push service at all, so this is deferred rather than mitigated. Rules for when it ships are pre-decided in `specs/backend/relay/notifications.md`. |
 | A contractor's second workspace leaks key material into the first. | Medium | Per-workspace device keys, key stores and indexes, with no cross-workspace references anywhere (`specs/backend/relay/multi-workspace.md`). |

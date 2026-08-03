@@ -53,10 +53,11 @@ decrypts with keys from a shared Keychain access group, and rewrites the
 notification with real content. If it cannot, the fallback text is the app name
 and nothing else. It is never a preview generated anywhere but on device.
 
-**Disclosure.** Apple Push Notification service joins the subprocessor table the
-day this ships, with the data column reading "opaque wake hints and rotating
-group aliases, no content". `/security` gets the same sentence. Adding a
-subprocessor quietly would be worse than the feature is worth.
+**Disclosure.** An operator who turns this on has added a subprocessor and must
+say so. Apple Push Notification service belongs in the operator's subprocessor
+list from the day push is enabled, with the data described as opaque wake hints
+and rotating group aliases, no content. Adding a subprocessor quietly would be
+worse than the feature is worth.
 
 **Opt-out.** A workspace admin can disable push entirely for the workspace, and
 an individual can disable it for themselves. Both are one toggle, and the
