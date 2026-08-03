@@ -5,7 +5,8 @@
 #
 #   1. every relay error code has a conformance vector
 #   2. wire.cddl compiles
-#   3. every spec cross-reference resolves
+#   3. every spec cross-reference resolves, and every documented path either
+#      exists or is a declared private reference
 #   4. the licence boundary holds
 #   5. house style
 set -uo pipefail
@@ -53,6 +54,37 @@ if [ -n "$DANGLING" ]; then
   for d in $DANGLING; do echo "      $d"; done
 else pass "every spec reference resolves"; fi
 
+# 3b. The same check over the whole tree, against an explicit list of the paths
+#     that live in the private monorepo. Those citations are provenance for a
+#     decision rather than reading anybody is missing, and README.md,
+#     CONTRIBUTING.md and specs/backend/relay/README.md all say so. The point of
+#     naming them here is that the list is closed: a *new* reference to something
+#     that does not ship fails, instead of joining a background of broken links
+#     nobody reads any more.
+PRIVATE_REFS=$(cat <<'EOF'
+specs/sync-substrate.md
+specs/chat.md
+specs/weald-data-tiers.md
+specs/ticket-format.md
+specs/ticket-write-contract.md
+specs/board-search.md
+scripts/backend-gate.sh
+EOF
+)
+UNKNOWN=""
+while IFS= read -r ref; do
+  [ -n "$ref" ] || continue
+  [ -e "$ROOT/$ref" ] && continue
+  printf '%s\n' "$PRIVATE_REFS" | grep -qxF "$ref" && continue
+  UNKNOWN="$UNKNOWN $ref"
+done < <(grep -rhoE '`(specs|scripts)/[a-zA-Z0-9/._-]+`' "$ROOT" \
+  --include='*.md' --include='*.rb' --include='*.service' --include='*.yml' \
+  --exclude-dir=target --exclude-dir=.git 2>/dev/null | tr -d '`' | sort -u)
+if [ -n "$UNKNOWN" ]; then
+  fail "documentation references a path that does not ship, and is not on the known-private list:"
+  for u in $UNKNOWN; do echo "      $u"; done
+else pass "every documented path either exists or is a declared private reference"; fi
+
 # 4. The licence boundary. This repository is wholly Apache 2.0, so every crate
 #    carries the licence and every source file says so.
 LIC_FAIL=""
@@ -70,8 +102,11 @@ elif [ -n "$MISSING_SPDX" ]; then
   fail "Rust sources with no SPDX header:"; echo "$MISSING_SPDX" | sed 's/^/      /'
 else pass "Apache 2.0, NOTICE and SPDX headers all present"; fi
 
-# 5. House style.
-EM=$(grep -rln $'—' "$ROOT/specs" 2>/dev/null)
+# 5. House style, over the specs and over the documents a reader meets first.
+#    This file is excluded for the obvious reason that the character it looks for
+#    has to appear in it.
+EM=$(grep -rln $'—' "$ROOT/specs" "$ROOT/README.md" "$ROOT/CONTRIBUTING.md" \
+  "$ROOT/SECURITY.md" "$ROOT/HISTORY.md" "$ROOT/NOTICE" 2>/dev/null)
 if [ -n "$EM" ]; then fail "em dash found in:"; echo "$EM" | sed "s|$ROOT/||; s/^/      /"
 else pass "no em dashes"; fi
 

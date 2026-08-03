@@ -159,29 +159,30 @@ are calm rather than a discovery made on the worst day:
 Two screens. Faster than any email-and-password signup, and the recovery step is
 the only reason it is two rather than one.
 
-## Flow: first user, hosted
+## Flow: first user, managed
 
-Identical from step 2 onward. The difference is upstream and is deliberately
-quarantined.
+Where somebody else provisions the relay, the flow is identical from step 2
+onward. The difference is upstream and is deliberately quarantined.
 
-1. `weald.team/start` signs the buyer into Clerk, creates or selects a **billing
-   account**, then opens Stripe Checkout for payment. The account is not a
-   workspace user identity.
-2. We provision a relay instance. The bootstrap invite link renders on the
-   post-checkout page; the 12-character code is emailed to the verified Clerk email
-   of the owner who started Checkout, rather than a mutable invoice address.
-   The split protects a forwarded link but is not an independent defense against
-   a compromised control plane; the client hard-fail and genesis evidence carry
-   that threat model. The link is valid for 24 hours, because the buyer has a
-   notarized DMG to download first and a 15-minute window created the exact
-   failure it was meant to prevent.
+1. The operator authenticates the buyer and creates an **account** for them. An
+   account is a billing and support identity. It is not a workspace user
+   identity, and the relay has no concept of it.
+2. The operator provisions a relay instance. The bootstrap invite link is
+   returned to the browser that ordered it; the 12-character code goes to an
+   address verified before provisioning began, rather than one a later profile
+   or billing edit can move. The split protects a forwarded link but is not an
+   independent defense against a compromised provisioning system; the client
+   hard-fail and the genesis evidence carry that threat model
+   (`specs/backend/contracts/threat-model/bootstrap-handoff.md`). The link is
+   valid for 24 hours, because the buyer has an application to download first and
+   a 15-minute window created the exact failure it was meant to prevent.
 3. Everything after this is the self-host flow, including the client's hard
    check that it became the trust root
    (`specs/backend/hosted-service.md`).
 
-The billing record knows an email address and an instance. It never learns a
-device key, never joins a group, and never appears in the roster. We cannot
-enumerate the humans in a workspace we host from the billing record alone.
+The account record knows an email address and an instance. It never learns a
+device key, never joins a group, and never appears in the roster. The humans in a
+managed workspace cannot be enumerated from the account record alone.
 
 ## Flow: additional device for an existing user
 
@@ -236,18 +237,17 @@ admin was already sending. Both are covered in `specs/backend/relay/invites.md`.
    exported workspace card. Three sources, in the order the restore screen
    offers them: the hostname typed directly, if they know it; a previously
    exported workspace card or recovery card
-   (`specs/backend/relay/multi-workspace.md`); or, on the hosted tier, the
-   control-plane dashboard, which lists every instance on the billing account
-   against a Clerk login that is recoverable by ordinary email means
-   (`specs/backend/hosted-service.md`).
+   (`specs/backend/relay/multi-workspace.md`); or, on a managed deployment, the
+   operator's own instance list, reachable with an account login that is
+   recoverable by ordinary email means (`specs/backend/hosted-service.md`).
 
-   The third source is why the hosted tier is not worse than self-host here, and
-   it costs nothing against the trust model: an instance hostname is control
-   plane data we already hold and have always held, it is public in DNS, and it
-   grants nothing on its own. Knowing where a relay lives has never been the
-   secret. The restore screen says which of the three the user is using, and the
-   dashboard's instance list is labelled as the answer to "I lost the laptop"
-   rather than left to be inferred from a billing page.
+   The third source is why a managed deployment is not worse than self-host here,
+   and it costs nothing against the trust model: an instance hostname is operator
+   data already held, it is public in DNS, and it grants nothing on its own.
+   Knowing where a relay lives has never been the secret. The restore screen says
+   which of the three the user is using, and an operator's instance list should be
+   labelled as the answer to "I lost the laptop" rather than left to be inferred
+   from a billing page.
 3. Recovery key decrypts the workspace root group, reads the roster, and
    enumerates group membership. That group's wrap also carries the **tag
    directory**, naming every group the user belongs to and the blinded tag its

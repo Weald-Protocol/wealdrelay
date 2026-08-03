@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# The local test harness: real Postgres, real MinIO, real Redis, on loopback.
+#
+# The integration tiers in this repository do not skip. A suite that cannot reach
+# a database fails and prints `run scripts/weald-stack up`, because a skipped
+# integration proof reports success for something nobody checked. This script is
+# the other half of that sentence.
+#
+#   scripts/weald-stack up [--budget SECONDS]   bring it up, wait until healthy
+#   scripts/weald-stack down [--keep-data]      stop it, and remove its volumes
+#   scripts/weald-stack status                  what is listening, and is it ready
+#   scripts/weald-stack reset                   drop every leftover scratch database
+#   scripts/weald-stack psql [ARGS...]          a shell on the harness Postgres
+#   scripts/weald-stack prove-blind SENTINEL    no plaintext survives in the store
+#
+# Ports and credentials are in backend/compose/weald-stack.yml and are fixed,
+# weak and public on purpose: every test hard-codes them so that a contract run
+# cannot silently point somewhere else. Override a port, for a machine that is
+# already using one, by exporting the same variable the tests read:
+# WEALD_STACK_PG_PORT, WEALD_STACK_MINIO_PORT, WEALD_STACK_REDIS_PORT.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="$ROOT/backend/compose/weald-stack.yml"
+PROJECT="weald-stack"
+
+PG_PORT="${WEALD_STACK_PG_PORT:-54032}"
+MINIO_PORT="${WEALD_STACK_MINIO_PORT:-54090}"
+REDIS_PORT="${WEALD_STACK_REDIS_PORT:-54079}"
+PG_USER="weald"
+PG_PASSWORD="weald"
+PG_DB="weald_relay"
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf 'weald-stack: %s\n' "$*" >&2; exit 1; }
+ok()   { printf '\033[32mok\033[0m    %s\n' "$*"; }
+bad()  { printf '\033[31mdown\033[0m  %s\n' "$*"; }
+
+compose() {
+  docker compose --project-name "$PROJECT" --file "$COMPOSE_FILE" "$@"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 \
+    || die "docker is not installed. Docker Desktop, OrbStack, Colima or a Linux docker daemon all work."
+  docker compose version >/dev/null 2>&1 \
+    || die "the docker compose plugin is not installed."
+  docker info >/dev/null 2>&1 \
+    || die "the docker daemon is not running. Start it and try again."
+}
+
+listening() {
+  # No nc, no lsof, no assumption about which one a machine has: bash's own
+  # /dev/tcp is present wherever bash is, which is the only dependency here.
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}
+
+# MARK: up
+
+cmd_up() {
+  local budget=180
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --budget) budget="${2:-}"; [ -n "$budget" ] || die "--budget needs a number of seconds"; shift 2 ;;
+      *) die "unknown option for up: $1" ;;
+    esac
+  done
+  require_docker
+
+  for port in "$PG_PORT" "$MINIO_PORT" "$REDIS_PORT"; do
+    if listening "$port" && [ -z "$(compose ps --quiet 2>/dev/null)" ]; then
+      die "something already listens on 127.0.0.1:$port and it is not this harness. Stop it, or export WEALD_STACK_PG_PORT, WEALD_STACK_MINIO_PORT or WEALD_STACK_REDIS_PORT and use the same value when running the tests."
+    fi
+  done
+
+  say "Bringing up Postgres, MinIO and Redis."
+  compose up --detach --wait --wait-timeout "$budget" \
+    || die "the stack did not become healthy within ${budget}s. \`scripts/weald-stack status\` and \`docker compose --project-name $PROJECT --file $COMPOSE_FILE logs\` say why."
+
+  cmd_status
+  say ""
+  say "Ready. The real-boundary suites will find it:"
+  say "  cargo test --workspace --locked"
+}
+
+# MARK: down
+
+cmd_down() {
+  local keep=no
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --keep-data) keep=yes; shift ;;
+      *) die "unknown option for down: $1" ;;
+    esac
+  done
+  require_docker
+  if [ "$keep" = yes ]; then
+    compose down
+    say "Stopped. Volumes kept."
+  else
+    # Volumes go by default. A suite that passes only because of state left by
+    # the previous run is a suite that passes once.
+    compose down --volumes
+    say "Stopped, and the fixture data is gone."
+  fi
+}
+
+# MARK: status
+
+cmd_status() {
+  local failed=0
+  if listening "$PG_PORT"; then ok "Postgres    127.0.0.1:$PG_PORT   ($PG_USER/$PG_DB)"
+  else bad "Postgres    127.0.0.1:$PG_PORT"; failed=1; fi
+  if listening "$MINIO_PORT"; then ok "MinIO       127.0.0.1:$MINIO_PORT   (weald/weald-local-only)"
+  else bad "MinIO       127.0.0.1:$MINIO_PORT"; failed=1; fi
+  if listening "$REDIS_PORT"; then ok "Redis       127.0.0.1:$REDIS_PORT   (multi-process fan-out only)"
+  else bad "Redis       127.0.0.1:$REDIS_PORT"; failed=1; fi
+  [ "$failed" -eq 0 ] || return 1
+}
+
+# MARK: reset
+
+# A run killed with ctrl-c leaves its scratch databases behind. They are harmless
+# and they accumulate, so this removes every database the suites name and nothing
+# else: the pattern is theirs, not a wildcard over the server.
+cmd_reset() {
+  require_docker
+  local sql
+  sql="select datname from pg_database where datname like 'weald\\_step%' or datname like 'weald\\_relay\\_test%'"
+  local names
+  names="$(psql_quiet -tAc "$sql")"
+  if [ -z "$names" ]; then say "No leftover scratch databases."; return 0; fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    psql_quiet -c "drop database if exists \"$name\" with (force)" >/dev/null
+    say "dropped $name"
+  done <<< "$names"
+}
+
+psql_quiet() {
+  compose exec -T -e PGPASSWORD="$PG_PASSWORD" postgres \
+    psql --username "$PG_USER" --dbname "$PG_DB" "$@"
+}
+
+cmd_psql() {
+  require_docker
+  compose exec -e PGPASSWORD="$PG_PASSWORD" postgres \
+    psql --username "$PG_USER" --dbname "$PG_DB" "$@"
+}
+
+# MARK: prove-blind
+
+# Step 5 of the verification runbook, mechanised: dump every table of every
+# database the harness holds and prove a known plaintext is not in any of them.
+#
+# The sentinel is supplied rather than guessed. A reviewer's version of this is
+# to send a message through their own relay containing a phrase only they know,
+# then run this and watch it not be found. That is a stronger check than any
+# assertion inside our own test suite, because the phrase never touched our code.
+cmd_prove_blind() {
+  local sentinel="${1:-}"
+  [ -n "$sentinel" ] || die "prove-blind needs the plaintext to look for: scripts/weald-stack prove-blind 'some phrase you sent'"
+  require_docker
+  listening "$PG_PORT" || die "the harness is not up. Run \`scripts/weald-stack up\` first."
+
+  local databases
+  databases="$(psql_quiet -tAc "select datname from pg_database where not datistemplate and datname <> 'postgres'")"
+  local found=0
+  while IFS= read -r database; do
+    [ -n "$database" ] || continue
+    local dump
+    # --inserts so values appear as literal text rather than in COPY's escaped
+    # stream, because a grep over an escaped stream can miss what is in it.
+    dump="$(compose exec -T -e PGPASSWORD="$PG_PASSWORD" postgres \
+      pg_dump --username "$PG_USER" --inserts --dbname "$database" 2>/dev/null || true)"
+    if printf '%s' "$dump" | grep -qF -- "$sentinel"; then
+      printf '\033[31mFOUND\033[0m in database %s\n' "$database"
+      found=1
+    fi
+  done <<< "$databases"
+
+  if [ "$found" -ne 0 ]; then
+    printf '\033[31mprove-blind FAILED: the plaintext is in the relay store.\033[0m\n'
+    exit 1
+  fi
+  ok "the sentinel appears in no table of any database the relay holds"
+  say ""
+  say "What this does and does not show. It shows that this exact plaintext is"
+  say "not in the relay's own store. It does not show that the relay could not"
+  say "read it, which is a property of the keys and is argued in"
+  say "specs/backend/relay/verification.md."
+}
+
+# MARK: dispatch
+
+usage() {
+  sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  up)          shift; cmd_up "$@" ;;
+  down)        shift; cmd_down "$@" ;;
+  status)      shift; cmd_status "$@" ;;
+  reset)       shift; cmd_reset "$@" ;;
+  psql)        shift; cmd_psql "$@" ;;
+  prove-blind) shift; cmd_prove_blind "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1. Run \`scripts/weald-stack --help\`." ;;
+esac

@@ -15,6 +15,13 @@ the counterpart guarantees is narrower and still worth having: that the procedur
 still works, that the thing it checks is still true, and that nobody has to
 discover otherwise while a customer watches.
 
+**Reading the right-hand column from outside.** `scripts/backend-gate.sh` is the
+private build repository's gate runner and the suites named in CamelCase are the
+macOS client's, so neither is a command you can run from this repository. The
+`cargo test` counterparts are, and so is `scripts/weald-stack prove-blind`. That
+asymmetry is the reason `verification.md` exists: what a reviewer can check
+themselves is deliberately the part that needs no gate of ours.
+
 ## The table
 
 | # | Runbook step | Automated counterpart | Where it runs |
@@ -32,10 +39,10 @@ discover otherwise while a customer watches.
 
 ## What the mapping is checked by
 
-`scripts/verify-runbook-map.py` reads this file, refuses a row with a blank cell,
-refuses a counterpart naming a test file or suite that does not exist, and emits
-a checked-in map in Weald's private build repository. The gate runs it, so a row that
-degrades into a promise fails the step rather than sitting here looking green.
+A script in Weald's private build repository reads this file, refuses a row with a
+blank cell, refuses a counterpart naming a test file or suite that does not exist,
+and emits a checked-in map there. The gate runs it, so a row that degrades into a
+promise fails the step rather than sitting here looking green.
 
 The check is deliberately about existence and shape rather than about outcome.
 Whether each counterpart passes is decided by running it, which the gates in the

@@ -1,0 +1,52 @@
+# Every push and every pull request, and it is the same commands a contributor
+# runs locally. Nothing here takes a secret, so it runs on a fork's pull request
+# too: a contributor gets the same answer we do before anyone reviews the diff.
+#
+# The heavy half of the gate (coverage floors, miri, the fuzz budget, and the
+# client-side steps) runs in Weald's private build repository, because most of it
+# exercises surfaces that are not in this repository. What is here is what a third
+# party can run against this source, which is the part that matters for a claim
+# anybody is asked to believe.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt, clippy, specs and the real-boundary suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: sed -n 's/^channel = "\(.*\)"/channel=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Postgres, MinIO and Redis, on the ports and credentials the integration
+      # tiers hard-code. They fail rather than skip without these, which is the
+      # reason this step is first.
+      - run: scripts/weald-stack up --budget 240
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: The spec checks an outside contributor can run
+        run: |
+          cargo install cddl --locked --quiet || true
+          ./scripts/spec-check.sh
+      - run: cargo test --workspace --locked
+      - name: What the harness held, on failure
+        if: failure()
+        run: docker compose --project-name weald-stack --file backend/compose/weald-stack.yml logs --tail 200
+      - if: always()
+        run: scripts/weald-stack down

@@ -4,12 +4,11 @@ members = ["backend/wealdrelay", "backend/weald-mls"]
 
 [workspace.package]
 edition = "2021"
-# Apache 2.0, per the decision recorded in specs/backend/README.md (Relay license)
-# and specs/backend/cloud/onboarding-flows.md. Verification requires public source,
-# so the relay and the MLS binding are the two crates that ship under it. The macOS
-# client is not in this workspace and stays proprietary: see LICENSE.md at the root.
+# Apache 2.0. Verification requires public source, so the relay and the MLS
+# binding are the two crates that ship under it. The macOS client is not in this
+# workspace and stays proprietary: see LICENSE and the licence note in README.md.
 license = "Apache-2.0"
-repository = "https://github.com/hunterh37/Weald"
+repository = "https://github.com/hunterh37/WealdRelay"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -16,7 +16,10 @@ have to think about it again.
 
 - No runtime dependencies. No Node, no Python, no JVM.
 - Targets: `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`,
-  `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
+  `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`. The release pipeline
+  builds and publishes the first three, each natively and each with its SHA-256.
+  Windows is specified and not built yet; when it is, it joins the same matrix
+  rather than shipping from anybody's laptop.
 - Configuration by environment variables, with an optional `relay.toml`.
 - Roughly 20 MB, single process, no sidecars.
 

@@ -2,8 +2,9 @@
 # existing Postgres and existing configuration management.
 #
 # Backups come before the start command in the docs for this path, because this
-# is the path where an operator is most likely to skip them. See
-# deploy/systemd/README.md.
+# is the path where an operator is most likely to skip them. The cron lines are in
+# wealdrelay.env.example beside this file, above the optional settings rather than
+# below them, and path 3 of ../README.md is the full sequence.
 #
 #   install -m 0755 wealdrelay /usr/local/bin/wealdrelay
 #   useradd --system --home /var/lib/wealdrelay --shell /usr/sbin/nologin wealdrelay
@@ -13,7 +14,7 @@
 
 [Unit]
 Description=Weald blind relay
-Documentation=https://github.com/hunterh37/Weald/blob/main/specs/backend/relay/server.md
+Documentation=https://github.com/hunterh37/WealdRelay/blob/main/specs/backend/relay/server.md
 After=network-online.target
 Wants=network-online.target
 

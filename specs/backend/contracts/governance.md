@@ -31,7 +31,8 @@ Everything else is ordinary engineering.
 Explicitly not governed: the relay's database schema (an implementation detail
 of one implementation, documented for operators, free to change on any release),
 log formats, metric names, the control plane's HTTP API (versioned separately by
-`api/openapi.yaml`), and anything under `../build/`.
+its own OpenAPI document, which is not part of this repository), and the build
+programme's own bookkeeping.
 
 ## 2. Versioning
 

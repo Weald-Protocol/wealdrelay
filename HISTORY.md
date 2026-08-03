@@ -16,7 +16,11 @@ it: the full specifications, the conformance vectors, the reproducible build
 tooling, and the release pipeline that signs a digest two independent runners
 and a clean clone all agree on.
 
-The build context is byte-identical to the monorepo's at the point of the split,
-verified with `scripts/repro-context-digest.py` against both trees. Images built
-from this repository and from the monorepo at the same commit produce the same
-digest, so the move did not silently change what ships.
+At the split commit the build context was byte-identical to the monorepo's,
+verified with `scripts/repro-context-digest.py` against both trees: an image
+built from either tree produced the same digest, so the move did not silently
+change what ships. That was a check on the move rather than a promise about the
+future, and the two trees diverge from here. What replaces it is stronger and is
+not about us: every release digest is one that two independent runners and a
+clean clone of the tag all produced, and `scripts/relay-reproduce.sh` lets you be
+a fourth.

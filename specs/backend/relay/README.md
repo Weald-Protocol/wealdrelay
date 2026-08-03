@@ -6,15 +6,20 @@ state end-to-end encrypted, alongside the existing git transport.
 One workspace is one project throughout these specs: one `.weald` directory, one
 roster, one recovery phrase, one relay. See `multi-workspace.md`.
 
-**Two conventions carried over from where these documents were written.** They
-are development bookkeeping and neither carries meaning for an implementer.
+**Conventions carried over from where these documents were written.** They are
+development bookkeeping and none of them carries meaning for an implementer.
 
 "Step N" refers to a gated step in Weald's private build ledger, which advances
 only when its unit, property, integration and negative proofs are all recorded.
 A sentence like "corrected in step 7" is dating a decision, not naming anything
 you need. Similarly, `build-evidence/` paths point at recorded artifacts in that
-repository. Where such a reference matters to you, the claim it supports is
-restated in `verification.md` in terms you can check yourself.
+repository, and citations of `specs/backend/build/*`, `specs/backend/cloud/*`,
+`Sources/*`, `Tests/*` and the `scripts/backend-gate.sh` family name files in
+the private monorepo that holds the macOS client and the build ledger. They are
+provenance for a decision, not reading you are missing: where such a reference
+matters to you, the claim it supports is restated in `verification.md` in terms
+you can check yourself. Everything needed to implement, run and verify a relay
+is in this repository.
 
 Read in this order.
 
@@ -53,14 +58,19 @@ Read in this order.
 | `verification.md` | The proofs, as UI surfaces rather than a docs page. |
 | `migration.md` | Phased rollout from git, dual transport, rollback, risk register. |
 
-Prerequisite reading, outside this folder: `specs/sync-substrate.md` for why git
-was chosen and how the eight-dimension rubric works, `specs/chat.md` for the
-current on-disk chat format, `specs/weald-data-tiers.md` for the durable and
-live split, `specs/ticket-format.md` and `specs/ticket-write-contract.md` for
-the round-trip guarantees the relay must not break.
+Background cited but not shipped here: `specs/sync-substrate.md` for why git was
+chosen and how the eight-dimension rubric works, `specs/chat.md` for the current
+on-disk chat format, `specs/weald-data-tiers.md` for the durable and live split,
+`specs/ticket-format.md` and `specs/ticket-write-contract.md` for the round-trip
+guarantees the relay must not break. Those describe the client's on-disk formats
+and live in the private client repository. Nothing in this folder depends on
+reading them: the relay carries opaque payloads, and what it does with them is
+specified in `wire.md`.
 
-Status: specification only. Nothing here is implemented. Phase 0 in
-`migration.md` is the only part cleared to start.
+Status: pre-1.0, and implemented. The relay in `backend/wealdrelay` and the MLS
+binding in `backend/weald-mls` are the running code these documents describe.
+Where a document and the code disagree, `verification.md` says which proof
+settles it.
 
 Nothing in Weald's hosted service (`specs/backend/hosted-service.md`) is a
 dependency of anything in this folder. The

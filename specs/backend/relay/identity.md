@@ -61,7 +61,7 @@ A roster entry is:
   "pubkey":    "<32 bytes, base64url>",
   "kind":      "device" | "agent" | "recovery",
   "owner":     "<user id>",
-  "label":     "Hunter's MacBook Pro",
+  "label":     "work laptop",
   "added_at":  "<RFC3339>",
   "added_by":  "<pubkey of the admitting device>",
   "revoked_at": "<RFC3339 | null>"

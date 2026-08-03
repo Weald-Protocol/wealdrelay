@@ -15,4 +15,4 @@ Clerk, no Stripe, no control plane client, no account concept, no license check
 and no callback. Running it requires the binary, a Postgres database and a disk.
 
 The Weald macOS client is a separate work and is NOT covered by this license.
-See LICENSE.md at the repository root for the boundary.
+See LICENSE at the repository root, and the licence note in README.md, for the boundary.

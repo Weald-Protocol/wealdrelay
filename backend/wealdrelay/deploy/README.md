@@ -31,14 +31,15 @@ Every path below starts from an artifact we published. This one does not, and it
 is the one that makes the others checkable: a relay you built from source is a
 relay whose behaviour you can read.
 
-**Status, and read this before you follow any command here.** No relay release
-has been published yet. Until the first one is, the repository below is private,
-the Homebrew tap does not exist, `get.weald.team` does not resolve, and the
-image tag in `compose/docker-compose.yml` cannot be pulled. The configuration,
-operations and networking halves of this guide are accurate and stable; the
-acquire-and-verify half describes artifacts that are not out yet. This notice
-comes down with the first published, signed, digest-pinned release, and not
-before.
+**Status, and read this before you follow any command here.** Source is
+published and building from it works today. Until the first signed release is
+tagged, the Homebrew tap does not exist, `get.weald.team` does not resolve, and
+the image tag in `compose/docker-compose.yml` cannot be pulled, so paths 1, 2
+and 4 need an image you built yourself with `scripts/relay-reproduce.sh`. The
+configuration, operations and networking halves of this guide are accurate and
+stable; the download-a-published-artifact half describes artifacts that are not
+out yet. This notice comes down with the first published, signed, digest-pinned
+release, and not before.
 
 ```sh
 git clone https://github.com/hunterh37/WealdRelay.git
@@ -111,6 +112,25 @@ which one it is in words.
 `systemd/`. For a team with existing Postgres and existing configuration
 management. A unit file, an environment file, a documented user and directory
 layout.
+
+The binary comes from the release, with its checksum published beside it. Verify
+before you install it, because this is the path with no container digest doing
+that for you:
+
+```sh
+tag=wealdrelay-v0.1.0
+target=x86_64-unknown-linux-musl        # or aarch64-unknown-linux-musl
+base=https://github.com/hunterh37/WealdRelay/releases/download/$tag
+curl -fLO "$base/wealdrelay-$target.tar.gz"
+curl -fLO "$base/wealdrelay-$target.tar.gz.sha256"
+sha256sum --check "wealdrelay-$target.tar.gz.sha256"
+tar -xzf "wealdrelay-$target.tar.gz"
+sudo install -m 0755 "wealdrelay-$target/wealdrelay" /usr/local/bin/wealdrelay
+wealdrelay --version
+```
+
+Or build it yourself from Path 0, which is the same binary and one fewer thing to
+trust.
 
 TLS is yours to terminate on this path.
 

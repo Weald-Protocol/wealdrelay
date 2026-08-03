@@ -21,6 +21,15 @@ are optional. There is no account to create, no license key, and no service of
 ours to call: `backend/wealdrelay/deploy/README.md` has four paths, from a
 provider one-click to a private network with no public ingress.
 
+To run the tests, bring up the dependencies first. They are real, and the suites
+fail rather than skip without them.
+
+```sh
+scripts/weald-stack up
+cargo test --workspace --locked
+scripts/weald-stack down
+```
+
 ## Verify it
 
 Reproducible builds are the reason this repository is public.
@@ -51,15 +60,26 @@ An implementation is conformant when it passes the vector corpus. If you are
 writing one and something in the specification is ambiguous, that is a bug in
 the specification and we would like to hear about it.
 
+Two conventions in these documents come from the private monorepo the relay was
+built in and mean nothing to an implementer: "step N" dates a decision against a
+private build ledger, and citations of `specs/backend/build/*`,
+`specs/backend/cloud/*`, `Sources/*` and `Tests/*` name files in the repository
+holding the macOS client. They are provenance, not reading you are missing.
+Everything needed to implement, run and verify a relay is here.
+
 ## Layout
 
 ```
 backend/wealdrelay/     the relay: server, storage, migrations, deploy bundle
 backend/weald-mls/      the MLS binding, a C ABI over OpenMLS
+backend/compose/        the local test harness: Postgres, MinIO, Redis
 specs/backend/relay/    the protocol and operational specifications
 specs/backend/contracts/ formal wire schema, vectors, error registry
-scripts/                reproducible build and digest comparison
+scripts/                the harness, the reproducible build, the spec checks
 ```
+
+`CONTRIBUTING.md` is how to work on it. `SECURITY.md` is what to do instead of
+opening an issue.
 
 ## License
 
