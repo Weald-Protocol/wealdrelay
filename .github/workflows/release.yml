@@ -95,7 +95,11 @@ jobs:
     name: reproducible build, runner ${{ matrix.runner }}
     needs: test
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # 180 rather than 90: the Dockerfile now pins its builder to linux/amd64 so
+    # that the toolchain is a property of the file rather than of the host, which
+    # means runner b builds under QEMU. That is the trade v0.1.2 bought with a
+    # failed compare, and an emulated Rust build of this crate is slow.
+    timeout-minutes: 180
     strategy:
       matrix:
         include:
