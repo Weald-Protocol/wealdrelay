@@ -436,9 +436,30 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Named patterns rather than everything, and this is not tidiness. v0.1.5
+      # failed here twice: `merge-multiple` with no pattern downloads every
+      # artifact in the run, which includes the `*.dockerbuild` build record
+      # docker/build-push-action uploads by itself, and that one fails to extract
+      # after five retries. Six of nine artifacts downloaded, then the job died
+      # with the image already pushed and verified.
+      #
+      # These three are what a release is made of. The reproducible-build
+      # manifests and logs stay artifacts: they are evidence about the release,
+      # not part of it.
       - uses: actions/download-artifact@v4
         with:
           path: assets
+          pattern: binary-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: compose-bundle-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: agreed-digest-*
           merge-multiple: true
       - name: Assemble the notes
         env:
