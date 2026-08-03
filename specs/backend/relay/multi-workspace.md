@@ -49,6 +49,15 @@ into another through a mis-set channel policy, and a compromised relay for one
 customer is a compromised relay for one project. The cost is repeated setup and a
 switcher, and both are UI problems rather than protocol ones.
 
+**Workspace resolution is a scan-time value, never a render-time one.**
+`WorkspaceID.resolve` reads `.weald/project.json` and, for a project with no
+`workspace` key (the default), forks `git remote get-url origin`. That is a
+process spawn per project, so no SwiftUI `body` may call it: the settings
+switcher resolves every watched project's workspace off the main actor, keyed on
+`AppState.projectsGeneration`, and the render path reads the resolved map. A
+changed `origin` or a newly written `workspace` key therefore appears after the
+next scan, which is the same cadence every other project fact follows.
+
 ## Key isolation
 
 This is the part that has to be right, because getting it wrong means one
