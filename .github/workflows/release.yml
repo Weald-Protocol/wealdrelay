@@ -299,8 +299,14 @@ jobs:
   image:
     name: publish the image
     needs: [compare, bundle]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # arm64, and not for speed alone. The Dockerfile's builder is pinned to
+    # linux/arm64 so that the toolchain cannot vary with the host, which makes
+    # this build native here and a three hour QEMU crawl on an x86_64 runner.
+    # The digest it pushes is the one the `reproducible` matrix already agreed
+    # on across both architectures, so nothing about the claim depends on which
+    # machine performs the push.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -356,8 +362,12 @@ jobs:
   verify-published:
     name: a clean clone at the tag matches the published digest
     needs: [compare, image]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # arm64 for the same reason as `image`: the pinned builder is native here.
+    # What this job is for is unchanged, and it is not the architecture: a clone
+    # made fresh at the tag, on a machine holding none of the pipeline's cache,
+    # must rebuild the digest that was actually published.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
