@@ -15,6 +15,7 @@
 //! This crate has no test double in any environment. See
 //! `specs/backend/build/local-harness.md`.
 
+pub mod agent_corpus;
 pub mod boundary;
 pub mod buffer;
 pub mod ffi;

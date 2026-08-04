@@ -149,10 +149,17 @@ relay_start() {
     docker exec -i "$(dc ps -q postgres)" \
       createdb -U weald weald_relay_stack >/dev/null 2>&1 || true
 
+  # No WEALD_RELAY_REDIS_URL. The harness runs exactly one relay process, and
+  # server.md makes that variable the way a deployment declares it runs more than
+  # one ("omit for single-process installs"), which is why config.rs refuses a
+  # process-local live fanout when it is set. Declaring it here was the harness
+  # saying something untrue about itself: it kept the relay from starting at all
+  # once the ephemeral path landed, and the alternative fix, WEALD_RELAY_LIVE=off,
+  # would have turned presence off in the one place the suites exercise it. Redis
+  # is still up in the compose file; the control plane's queue is what wants it.
   WEALD_RELAY_HOSTNAME=localhost \
   WEALD_RELAY_DATABASE_URL="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack" \
   WEALD_RELAY_STORAGE_URL="file://$STACK_STATE/blobs" \
-  WEALD_RELAY_REDIS_URL="redis://127.0.0.1:$WEALD_STACK_REDIS_PORT" \
   WEALD_RELAY_LISTEN="127.0.0.1:$WEALD_STACK_RELAY_PORT" \
   WEALD_RELAY_OBSERVABILITY_LISTEN="127.0.0.1:$RELAY_OBSERVABILITY_PORT" \
   WEALD_RELAY_TLS=off \

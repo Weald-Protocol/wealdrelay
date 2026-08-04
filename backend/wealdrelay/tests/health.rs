@@ -317,3 +317,24 @@ fn the_landing_page_does_not_offer_a_download_the_relay_cannot_serve() {
         "the landing page must still hand the invite to a client"
     );
 }
+
+/// The page a stranger lands on has somewhere to go.
+///
+/// WEALD-L067: the relay-hosted link is the default form an admin sends, and the
+/// most common invitee has never heard of Weald. Naming no client at all made that
+/// page a dead end. The destination is absolute, on the marketing site, because a
+/// relay path would 404 again; and the token is not carried to it, because the
+/// invitee still holds this link and returning to it is the shorter path than
+/// handing a third-party host a token.
+#[test]
+fn the_landing_page_offers_a_download_that_resolves_off_the_relay() {
+    let page = wealdrelay::invite::delivery::landing_page();
+    assert!(
+        page.contains("https://getweald.com/download"),
+        "a person without a client must be told where to get one"
+    );
+    assert!(
+        page.contains("open this same link again"),
+        "the way back after installing must be stated, or the download is another dead end"
+    );
+}

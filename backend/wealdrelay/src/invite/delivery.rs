@@ -94,8 +94,11 @@ person who invited you sent separately, which is not in this link.</p>\
 <p id=\"missing-secret\" hidden>This link is missing the part after the \
 <code>#</code>, which is the half that unlocks the workspace. Chat clients and link \
 previews sometimes cut it off. Ask for the link again, pasted as plain text.</p>\
-<p>No client yet? Ask the person who invited you which one this workspace uses. \
-The relay serving this page does not host client downloads.</p>\
+<p>No client yet? Get the Weald app from \
+<a href=\"https://getweald.com/download\">getweald.com/download</a>, then open this \
+same link again: the invite stays valid, and the part after the <code>#</code> \
+never leaves this page. This relay does not host client downloads itself, and if \
+this workspace uses a different client, ask the person who invited you.</p>\
 <script>\
 var open = document.getElementById('open');\
 open.href = 'weald://join/' + location.pathname.split('/').pop() + location.hash;\
