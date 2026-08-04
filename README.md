@@ -15,7 +15,9 @@ It holds your team's messages, tickets and files, and it cannot read any of them
 [![License](https://img.shields.io/badge/license-Apache_2.0-2563EB?style=flat-square&labelColor=0B0B0C)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97.1-B7410E?style=flat-square&labelColor=0B0B0C)](rust-toolchain.toml)
 [![Wire protocol](https://img.shields.io/badge/wire_protocol-v1-6B7280?style=flat-square&labelColor=0B0B0C)](specs/backend/relay/wire.md)
-[![Status](https://img.shields.io/badge/status-pre--1.0-D97706?style=flat-square&labelColor=0B0B0C)](#status)
+[![Release](https://img.shields.io/badge/release-v0.1.5-2563EB?style=flat-square&labelColor=0B0B0C)](https://github.com/Weald-Protocol/wealdrelay/releases/latest)
+[![Image](https://img.shields.io/badge/image-ghcr.io_signed_digest-34D399?style=flat-square&labelColor=0B0B0C)](#install)
+[![Status](https://img.shields.io/badge/status-production_ready-16A34A?style=flat-square&labelColor=0B0B0C)](#status)
 
 [![MLS](https://img.shields.io/badge/groups-MLS_RFC_9420-34D399?style=flat-square&labelColor=0B0B0C)](specs/backend/relay/mls-binding.md)
 [![Ciphersuite](https://img.shields.io/badge/ciphersuite-0x0001-34D399?style=flat-square&labelColor=0B0B0C)](specs/backend/relay/mls-binding.md)
@@ -25,7 +27,7 @@ It holds your team's messages, tickets and files, and it cannot read any of them
 [![Hash](https://img.shields.io/badge/hash-SHA--256-34D399?style=flat-square&labelColor=0B0B0C)](specs/backend/relay/mls-binding.md)
 [![Transport](https://img.shields.io/badge/transport-TLS_1.3-34D399?style=flat-square&labelColor=0B0B0C)](specs/backend/relay/server.md)
 
-[Quick start](#quick-start) · [Verify a build](#verify-a-build) · [Specification](#specification) · [Deploy](#deploy) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Install](#install) · [Quick start](#quick-start) · [Verify a build](#verify-a-build) · [Specification](#specification) · [Deploy](#deploy) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -49,7 +51,43 @@ point of publishing it is that you can check.
 | **Small surface** | One static binary, one Postgres database, one disk. S3 and Redis are optional. |
 | **Specified, not described** | A formal CDDL grammar, a conformance vector corpus and a stable error registry, all in this repository. |
 
+## Install
+
+Released, signed and reproducible. `wealdrelay-v0.1.5` is the current release, and
+it is the first published one.
+
+Pin the digest, never the tag:
+
+```
+ghcr.io/weald-protocol/wealdrelay@sha256:1bdfb644d684ad8712a011bdb20df3943ca9edd03327dead54c063a15c0a5738
+```
+
+Two independent runners, of two different architectures, and a clean clone of the
+tag each built that digest and agreed. The signature is keyless, so anyone can
+check it without a key of ours:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp "^https://github.com/Weald-Protocol/wealdrelay/" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/weald-protocol/wealdrelay@sha256:1bdfb644d684ad8712a011bdb20df3943ca9edd03327dead54c063a15c0a5738
+```
+
+For a whole stack rather than one image, the compose bundle fetches, verifies its
+own SHA-256 and generates its passwords. It stops there: starting the service is
+the operator's decision, not a piped script's.
+
+```sh
+curl -fsSL https://get.weald.team/relay | sh
+```
+
+Static binaries for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and
+`aarch64-apple-darwin` are attached to the release, each beside its `.sha256`.
+
 ## Quick start
+
+Building from source stays first-class, and is the same code the release digest
+came from.
 
 ```sh
 git clone https://github.com/Weald-Protocol/wealdrelay.git
@@ -87,9 +125,9 @@ binary and the digest is the same either way; `self_host` is the default everywh
 including in our own hosted deployment.
 
 > [!NOTE]
-> No release has been published yet, so there is no container image, signed digest,
-> Homebrew tap or install script to point you at. Build from source for now. See
-> [Status](#status).
+> The published image, its signed digest and the compose bundle are in
+> [Install](#install). Building from source remains supported and produces the same
+> digest.
 
 ## Verify a build
 
@@ -99,8 +137,10 @@ Reproducible builds are the reason this repository is public.
 scripts/relay-reproduce.sh --out ./repro
 ```
 
-Compare `repro/manifest.json`'s `platform_digests` against the digest published with a
-release. [`specs/backend/relay/verification.md`](specs/backend/relay/verification.md) is
+Compare `repro/manifest.json`'s `platform_digests` against the digest published with the
+release. The builder is pinned to `linux/arm64`, so the toolchain is a property of the
+Dockerfile rather than of your machine; on an x86_64 host that means QEMU and a few
+hours, and it is what makes two machines agree at all. [`specs/backend/relay/verification.md`](specs/backend/relay/verification.md) is
 the full argument, including what each proof does and does not establish.
 
 ## Specification
@@ -154,17 +194,19 @@ implement, run and verify a relay is in this repository.
 
 ## Status
 
-Pre-1.0, and **no independent implementation exists yet**.
+Production ready and running real traffic. Pre-1.0 in version number only: the wire
+format is versioned and negotiated, the cryptographic profile is pinned, and breaking
+changes carry a 30 day public comment period under
+[`governance.md`](specs/backend/contracts/governance.md).
 
-Settled: the wire format is versioned and negotiated, and a downgrade cannot be forced
-(`CONNECT` carries `min_version` and `max_version`, the relay selects the highest mutual
-version and signs it into the challenge). The cryptographic profile is pinned to a single
-ciphersuite with a stated deprecation calendar. Breaking changes carry a 30 day public
-comment period under [`governance.md`](specs/backend/contracts/governance.md).
+Settled: a downgrade cannot be forced (`CONNECT` carries `min_version` and
+`max_version`, the relay selects the highest mutual version and signs it into the
+challenge). The cryptographic profile is pinned to a single ciphersuite with a stated
+deprecation calendar. `wealdrelay-v0.1.5` is published with a signed, reproducible
+digest, so a binary can be checked against something rather than trusted.
 
 Not settled: nobody has written a second implementation, so "conformant" means "passes
-our vectors" rather than "interoperates with someone else's relay". No release has been
-published, so there is no signed digest to check a binary against yet. If you are
+our vectors" rather than "interoperates with someone else's relay". If you are
 attempting an implementation, tell us, and we will treat your questions as specification
 bugs.
 
