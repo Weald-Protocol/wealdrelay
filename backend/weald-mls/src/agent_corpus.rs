@@ -96,6 +96,69 @@ pub fn adversarial_root() -> PathBuf {
     golden_root().join("adversarial")
 }
 
+/// Which of the two trees this crate is being compiled in.
+///
+/// This crate is published byte for byte to
+/// `github.com/Weald-Protocol/wealdrelay` (`specs/backend/build/relay-publication.md`)
+/// and the corpus is not: it lives beside the client's tests under `Tests/`, which
+/// the published tree does not carry. So the monorepo asserts the corpus is present
+/// and loads, and the published tree asserts it is consistently absent.
+///
+/// A predicate rather than an `if` inside a test, because a branch that only runs
+/// in the other tree is a branch this tree's coverage floor can never reach, and
+/// the honest fix is to make the decision testable rather than to exclude it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeKind {
+    /// `~/Dev/Jax`: the client, its tests and the corpus are all here.
+    Monorepo,
+    /// The Apache 2.0 publication of the relay and this binding, and nothing else.
+    PublishedMirror,
+}
+
+pub fn tree_kind(root: &Path) -> TreeKind {
+    if root.join("Weald.xcodeproj").exists() {
+        TreeKind::Monorepo
+    } else {
+        TreeKind::PublishedMirror
+    }
+}
+
+/// A tree carries the client and the corpus, or neither. Never one.
+///
+/// Written against an arbitrary `root` rather than against `repository_root()` so
+/// both arms are reachable from one checkout. A branch that can only run in the
+/// other tree is a branch this tree's 100 percent floor can never reach, and the
+/// honest answer is to make the decision testable, not to exclude it. What must
+/// never happen is a loader pointed somewhere nothing is, and a test that shrugged.
+pub fn check_tree(root: &Path) -> Result<(), String> {
+    let golden = root.join("Tests/Fixtures/agents");
+    match tree_kind(root) {
+        TreeKind::Monorepo => {
+            if !golden.join("manifest.json").is_file() {
+                return Err(format!(
+                    "{} carries the client but no corpus",
+                    root.display()
+                ));
+            }
+            if !golden.join("adversarial/manifest.json").is_file() {
+                return Err(format!("{} carries no adversarial corpus", root.display()));
+            }
+            load(&golden).map_err(|e| e.to_string())?;
+            load(&golden.join("adversarial")).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        TreeKind::PublishedMirror => {
+            if golden.exists() {
+                return Err(format!(
+                    "{} has no client but carries a corpus",
+                    root.display()
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Read a corpus rooted at `root`.
 ///
 /// A root with no `manifest.json` is an error rather than an empty corpus. The
@@ -198,9 +261,15 @@ fn assert_no_orphans(root: &Path, named: &BTreeSet<PathBuf>) -> Result<(), Corpu
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|_| CorpusError::Unwalkable(dir.clone()))?;
+        // Opening the directory and reading every entry out of it are one failure
+        // for this purpose: either way the walk did not see what is in there, and
+        // reporting that as an empty directory is how an orphaned vector survives.
+        // Collapsed into one fallible expression so there is one error path rather
+        // than two, the second of which nothing could ever reach to prove.
+        let entries = std::fs::read_dir(&dir)
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .map_err(|_| CorpusError::Unwalkable(dir.clone()))?;
         for entry in entries {
-            let entry = entry.map_err(|_| CorpusError::Unwalkable(dir.clone()))?;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -592,35 +661,113 @@ mod tests {
     /// the fact worth holding: what must never happen is a loader pointed
     /// somewhere nothing is and a test that shrugged.
     #[test]
-    fn the_repository_root_holds_the_checked_in_corpus() {
-        let root = repository_root();
-        assert_eq!(golden_root(), root.join("Tests/Fixtures/agents"));
-        assert_eq!(adversarial_root(), golden_root().join("adversarial"));
-        if root.join("Weald.xcodeproj").exists() {
-            assert!(golden_root().join("manifest.json").is_file());
-            assert!(adversarial_root().join("manifest.json").is_file());
-        } else {
-            assert!(
-                !golden_root().exists(),
-                "a tree with no client carries no corpus"
-            );
-        }
+    fn a_tree_carrying_the_client_must_carry_the_corpus() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(scratch.path().join("Weald.xcodeproj")).expect("mkdir");
+        assert_eq!(tree_kind(scratch.path()), TreeKind::Monorepo);
     }
 
     #[test]
-    fn the_checked_in_corpora_load() {
-        if !repository_root().join("Weald.xcodeproj").exists() {
-            return; // The published tree, asserted above to carry no corpus.
-        }
-        load(&golden_root()).expect("golden corpus loads");
-        load(&adversarial_root()).expect("adversarial corpus loads");
+    fn a_tree_without_the_client_is_the_published_mirror() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        assert_eq!(tree_kind(scratch.path()), TreeKind::PublishedMirror);
     }
 
+    #[test]
+    fn the_corpus_roots_are_derived_from_the_repository_root() {
+        let root = repository_root();
+        assert_eq!(golden_root(), root.join("Tests/Fixtures/agents"));
+        assert_eq!(adversarial_root(), golden_root().join("adversarial"));
+    }
+
+    #[test]
+    fn a_mirror_carrying_a_corpus_is_inconsistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(scratch.path().join("Tests/Fixtures/agents")).expect("mkdir");
+        assert!(check_tree(scratch.path()).is_err());
+    }
+
+    #[test]
+    fn a_monorepo_missing_its_corpus_is_inconsistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(scratch.path().join("Weald.xcodeproj")).expect("mkdir");
+        assert!(check_tree(scratch.path()).is_err());
+    }
+
+    /// The half that is easy to lose: somebody adds the golden corpus, forgets the
+    /// adversarial one, and every adversarial gate part then runs against nothing.
+    #[test]
+    fn a_monorepo_missing_only_the_adversarial_corpus_is_inconsistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let golden = scratch.path().join("Tests/Fixtures/agents");
+        std::fs::create_dir(scratch.path().join("Weald.xcodeproj")).expect("mkdir");
+        std::fs::create_dir_all(&golden).expect("mkdir");
+        std::fs::write(
+            golden.join("manifest.json"),
+            r#"{"corpus":"golden","protocolVersion":1,"vectors":[]}"#,
+        )
+        .expect("write");
+        assert!(check_tree(scratch.path()).is_err());
+    }
+
+    /// `check_tree` loads both corpora rather than only looking for their
+    /// manifests, so a tree carrying a corpus that does not load is inconsistent
+    /// too. Both halves are asserted because they are separate call sites and a
+    /// broken adversarial corpus is the one nothing else would notice.
+    #[test]
+    fn a_monorepo_whose_golden_corpus_does_not_load_is_inconsistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let golden = scratch.path().join("Tests/Fixtures/agents");
+        std::fs::create_dir(scratch.path().join("Weald.xcodeproj")).expect("mkdir");
+        std::fs::create_dir_all(golden.join("adversarial")).expect("mkdir");
+        std::fs::write(golden.join("manifest.json"), "{not json").expect("write");
+        std::fs::write(
+            golden.join("adversarial/manifest.json"),
+            r#"{"corpus":"adversarial","protocolVersion":1,"vectors":[]}"#,
+        )
+        .expect("write");
+        assert!(check_tree(scratch.path()).is_err());
+    }
+
+    #[test]
+    fn a_monorepo_whose_adversarial_corpus_does_not_load_is_inconsistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let golden = scratch.path().join("Tests/Fixtures/agents");
+        std::fs::create_dir(scratch.path().join("Weald.xcodeproj")).expect("mkdir");
+        std::fs::create_dir_all(golden.join("adversarial")).expect("mkdir");
+        std::fs::write(
+            golden.join("manifest.json"),
+            r#"{"corpus":"golden","protocolVersion":1,"vectors":[]}"#,
+        )
+        .expect("write");
+        std::fs::write(golden.join("adversarial/manifest.json"), "{not json").expect("write");
+        assert!(check_tree(scratch.path()).is_err());
+    }
+
+    #[test]
+    fn a_bare_mirror_is_consistent() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        check_tree(scratch.path()).expect("no client, no corpus");
+    }
+
+    #[test]
+    fn this_tree_is_consistent_about_whether_it_has_a_corpus() {
+        check_tree(&repository_root()).expect("this checkout");
+    }
+
+    /// `Path::components` normalizes an interior `.` away by itself but keeps a
+    /// leading one, so the `CurDir` arm is only reachable through a relative path.
+    /// Both spellings are asserted because dropping the arm would make a relative
+    /// corpus path compare unequal to the absolute one it names.
     #[test]
     fn normalize_drops_curdir_and_resolves_parentdir() {
         assert_eq!(
             normalize(Path::new("/a/./b/../c/d.cbor")),
             PathBuf::from("/a/c/d.cbor")
+        );
+        assert_eq!(
+            normalize(Path::new("./vectors/../vectors/d.cbor")),
+            PathBuf::from("vectors/d.cbor")
         );
     }
 

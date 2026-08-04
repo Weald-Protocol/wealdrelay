@@ -363,18 +363,33 @@ psql_relay() {
   docker exec "$(dc ps -q postgres)" psql -U weald -d weald_relay_stack "$@"
 }
 
-# Register a workspace's groups with the relay.
+# Register a workspace's groups with the relay, where the harness can reach its
+# database, and otherwise leave it to the relay.
 #
 # `accept.rs` answers `denied/group_unknown` for a group with no row, and it is
 # right to: a relay that created a group on first write would let anyone with a
-# socket allocate storage on somebody else's plan. Provisioning belongs to the
-# control plane, which is step 14 onward and has no HTTP surface yet, so locally it
-# belongs here. The ids come from the client itself (`relay-client groups`) rather
-# than from a bash reimplementation of GroupID.derive, because two implementations
-# of a hash is two implementations to disagree.
+# socket allocate storage on somebody else's plan. This function pre-dates
+# `access::store::ensure_groups` and pre-dates any hosted instance, so it reached
+# into Postgres with `psql`, which a fixture can do and a customer cannot.
+#
+# Now the relay writes the row itself, bounded to a device the workspace's current
+# access set carries, so a workspace whose founding publication lands needs nothing
+# here at all. This stays for the case that motivated it, which
+# `ensure_groups` deliberately does not cover: a fixture that names groups **before**
+# any device has been admitted, where there is no access set to bound the write by.
+#
+# `WEALD_STACK_RELAY_HOSTED=1` says the relay is somewhere this machine has no
+# database credential for, which is the ordinary case for a provisioned instance,
+# and it is skipped rather than attempted. The ids come from the client itself
+# (`relay-client groups`) rather than from a bash reimplementation of
+# GroupID.derive, because two implementations of a hash is two to disagree.
 clients_register_groups() {
   local bin="$1" workspace_dir="$2"
   local id scope
+  if [ "${WEALD_STACK_RELAY_HOSTED:-0}" = 1 ] && [ -z "${WEALD_STACK_RELAY_PSQL_URL:-}" ]; then
+    note "group" "not registered here: the relay writes its own rows on the founding publication"
+    return 0
+  fi
   while read -r id scope; do
     [ -n "$id" ] || continue
     psql_relay -v ON_ERROR_STOP=1 -q -c \

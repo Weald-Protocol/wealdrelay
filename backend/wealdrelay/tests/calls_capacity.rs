@@ -150,7 +150,14 @@ async fn the_relay_refuses_a_connection_past_its_cap_and_takes_it_back_when_one_
     // And the slot comes back when a socket ends, however it ends: this one is
     // dropped without a close, which is what a lost network looks like.
     drop(second);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Thirty seconds rather than five. The assertion is unchanged and a genuine
+    // leak still fails it, because a leaked slot never comes back however long
+    // this waits; what the shorter deadline was actually measuring was how
+    // quickly a loaded machine schedules the reader task that notices a dropped
+    // peer. It failed once on a shared runner at exactly five seconds, having
+    // passed every local run, which is the signature of a timeout standing in for
+    // an assertion rather than of the thing under test.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while relay.state.open_connections() > 1 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
