@@ -1,7 +1,7 @@
 # Weald Relay Protocol
 
 **Protocol identifier:** `weald-relay`  
-**Current protocol version:** `1`  
+**Current protocol version:** `2`, and version 1 is still served  
 **Status:** Production specification  
 **Normative language:** The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **NOT RECOMMENDED**, **MAY**, and **OPTIONAL** in this document are to be interpreted as described in RFC 2119 and RFC 8174.
 
@@ -344,7 +344,18 @@ The relay MUST apply bounded per-IP and per-connection admission limits,
 bounded inbound and outbound queues, maximum frame and ciphertext sizes, and
 explicit backpressure. A slow consumer MAY be downgraded from live push to
 reconciliation. The relay MUST NOT silently drop durable envelopes; only
-explicitly designated ephemeral events may be shed.
+explicitly designated ephemeral frames may be shed.
+
+Ephemeral traffic is a frame and MUST NOT be an event kind. Under `enc: 1` an
+envelope's kind is inside the ciphertext, so a relay instructed to shed one kind
+and retain every other cannot distinguish them; the kind `0x00F0 ephemeral` is
+therefore RESERVED and MUST NOT be implemented. Version 2 carries presence and
+typing in the `LIVE` frame, whose body the relay MUST NOT store, sequence,
+reconcile, attest or name in a compaction manifest, and which it MAY shed under
+backpressure without downgrading the subscriber. Version 2 additionally carries
+MLS key packages in the `KEYS` frame, which the relay MUST index by device key,
+MUST serve at most once per stored package, and MUST refuse for a device outside
+the requesting session's workspace access set.
 
 Errors MUST use stable classes:
 
@@ -522,6 +533,18 @@ Every protocol-affecting change MUST declare one of:
   capability negotiation and a published minimum client version; or
 - **new major protocol version:** incompatible envelope, cryptographic, or
   authorization semantics.
+
+A client offers its maximum supported version in `CONNECT`; its minimum is a
+build constant. The relay MUST select `min(offered, its own maximum)`, MUST state
+the selection in `CONNECT_ACK`, and MUST refuse an offer below its own minimum
+with `version/protocol_unsupported`. A client MUST abort when the selection falls
+outside its own range.
+
+Adding a frame tag is a compatible extension, and a relay MUST NOT send a frame
+introduced after the negotiated version: an unrecognized tag is a decode failure
+rather than something a conforming client can ignore. Version 2 adds two frames
+and one event kind and changes no envelope field, so a version 1 client
+interoperates with a version 2 relay unchanged.
 
 Clients MUST fail closed on unknown required protocol capabilities. Relays MUST
 report their supported versions and encryption floor during session setup. A

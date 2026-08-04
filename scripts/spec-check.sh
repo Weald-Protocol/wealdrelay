@@ -48,14 +48,35 @@ pass() { grn "ok    $*"; }
 skip() { ylw "skip  $*"; SKIP=1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Which tree is this. `github.com/Weald-Protocol/wealdrelay` runs this same file
+# byte for byte over a subset of this one (specs/backend/build/relay-publication.md),
+# so three of the checks below are about files that subset deliberately excludes:
+# the hosted control plane's OpenAPI document, every citation that points into an
+# unpublished specification, and the proprietary client's licence note. None of
+# those is a defect there, and asserting them there is what has kept that
+# repository's ci red on every push since the mirror became a byte-exact copy.
+#
+# They are not weakened, they are located. Every published file is byte-identical
+# to a file in this tree, so a check that holds here holds for the whole published
+# subset too, and the published tree gets a counted note rather than a failure.
+# `specs/backend/build/` is never published, which is how the two are told apart.
+PUBLISHED_TREE=0
+[ -d "$ROOT/specs/backend/build" ] || PUBLISHED_TREE=1
+note() { ylw "note  $*"; }
+
 echo "spec-check: $C"
+[ "$PUBLISHED_TREE" -eq 1 ] && echo "spec-check: the published tree; three checks are the monorepo's to make"
 echo
 
 # --------------------------------------------------------------------------
 # 1. OpenAPI lints clean
 # --------------------------------------------------------------------------
 OAS="$C/api/openapi.yaml"
-if [ ! -f "$OAS" ]; then
+if [ ! -f "$OAS" ] && [ "$PUBLISHED_TREE" -eq 1 ]; then
+  # The document describes the hosted control plane's HTTP surface, which is not
+  # part of the protocol and is not published.
+  note "openapi.yaml is not published; the monorepo lints it"
+elif [ ! -f "$OAS" ]; then
   fail "openapi.yaml missing"
 elif have spectral; then
   # The ruleset is named explicitly rather than discovered. Spectral searches from
@@ -196,6 +217,7 @@ fi
 # 6. Every relative link across specs/backend resolves
 # --------------------------------------------------------------------------
 BROKEN=0
+UNPUBLISHED=0
 while IFS= read -r f; do
   d="$(dirname "$f")"
   while read -r link; do
@@ -207,10 +229,21 @@ while IFS= read -r f; do
   done < <(grep -oE '\]\([^)]+\)' "$f" | sed 's/](//; s/)$//')
   # Backtick-quoted spec paths are the dominant convention in this tree.
   while read -r p; do
-    [ -e "$ROOT/$p" ] || { fail "dangling spec reference in ${f#$ROOT/}: $p"; BROKEN=1; }
+    [ -e "$ROOT/$p" ] && continue
+    if [ "$PUBLISHED_TREE" -eq 1 ]; then UNPUBLISHED=$((UNPUBLISHED + 1)); continue; fi
+    fail "dangling spec reference in ${f#$ROOT/}: $p"; BROKEN=1
   done < <(grep -oE '`specs/[A-Za-z0-9._/-]+\.(md|yaml|cddl|json|mmd)`' "$f" | tr -d '`' | sort -u)
 done < <(find "$ROOT/specs/backend" -name '*.md')
-[ "$BROKEN" -eq 0 ] && pass "every spec reference resolves"
+if [ "$PUBLISHED_TREE" -eq 1 ]; then
+  # A citation into an unpublished document is copied rather than rewritten, on
+  # purpose: relay-publication.md records both alternatives being tried and being
+  # worse, and specs/backend/hosted-service.md tells a reader who follows one why
+  # it goes nowhere. A broken link between two published files is still a failure.
+  [ "$BROKEN" -eq 0 ] && pass "every link between published specs resolves"
+  note "$UNPUBLISHED citation(s) into specifications this repository does not publish"
+elif [ "$BROKEN" -eq 0 ]; then
+  pass "every spec reference resolves"
+fi
 
 # --------------------------------------------------------------------------
 # 7. State machine tables: every `To` state is a declared state
@@ -268,7 +301,15 @@ for crate in backend/wealdrelay backend/weald-mls; do
   [ -f "$ROOT/$crate/LICENSE" ] || LICENSE_FAIL="$LICENSE_FAIL $crate/LICENSE"
   [ -f "$ROOT/$crate/NOTICE" ] || LICENSE_FAIL="$LICENSE_FAIL $crate/NOTICE"
 done
-[ -f "$ROOT/LICENSE.md" ] || LICENSE_FAIL="$LICENSE_FAIL LICENSE.md"
+# The root licence file differs by tree and both are load bearing. Here it is
+# `LICENSE.md`, the note saying the macOS client is proprietary and outside this
+# workspace. There it is `LICENSE`, the Apache 2.0 text itself, because that
+# repository is the licensed artifact rather than a note about one.
+if [ "$PUBLISHED_TREE" -eq 1 ]; then
+  [ -f "$ROOT/LICENSE" ] || LICENSE_FAIL="$LICENSE_FAIL LICENSE"
+else
+  [ -f "$ROOT/LICENSE.md" ] || LICENSE_FAIL="$LICENSE_FAIL LICENSE.md"
+fi
 grep -q '^license = "Apache-2.0"' "$ROOT/Cargo.toml" \
   || LICENSE_FAIL="$LICENSE_FAIL Cargo.toml:workspace.package.license"
 

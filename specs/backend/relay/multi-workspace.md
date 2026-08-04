@@ -57,6 +57,9 @@ switcher resolves every watched project's workspace off the main actor, keyed on
 `AppState.projectsGeneration`, and the render path reads the resolved map. A
 changed `origin` or a newly written `workspace` key therefore appears after the
 next scan, which is the same cadence every other project fact follows.
+`Tests/ProjectsGenerationTests.swift` pins it: no file under `Sources/UI` other
+than the switcher may name `WorkspaceID.resolve`, and the switcher's `body` may
+not.
 
 ## Key isolation
 

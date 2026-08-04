@@ -86,7 +86,17 @@ async fn a_subscription_against_a_blind_relay_is_registered_and_acknowledged() {
     // reports the outage; this is what the client in flight is told.
     let state = blind();
     let (sender, mut receiver) = outbound_channel();
-    assert!(sync::subscribe(&sender, &state, CONNECTION, group(2), 0).await);
+    assert!(
+        sync::subscribe(
+            &sender,
+            &state,
+            CONNECTION,
+            group(2),
+            0,
+            wealdrelay::frame::PROTOCOL_VERSION
+        )
+        .await
+    );
     match frame(&mut receiver) {
         Frame::SubAck { group: g, head_seq } => {
             assert_eq!(g, group(2));
@@ -104,7 +114,17 @@ async fn a_cursor_beyond_the_head_is_answered_with_the_clients_own_number() {
     // invited to walk backwards.
     let state = blind();
     let (sender, mut receiver) = outbound_channel();
-    assert!(sync::subscribe(&sender, &state, CONNECTION, group(2), 99).await);
+    assert!(
+        sync::subscribe(
+            &sender,
+            &state,
+            CONNECTION,
+            group(2),
+            99,
+            wealdrelay::frame::PROTOCOL_VERSION
+        )
+        .await
+    );
     match frame(&mut receiver) {
         Frame::SubAck { head_seq, .. } => assert_eq!(head_seq, 99),
         other => panic!("expected a SubAck, got {other:?}"),
@@ -119,7 +139,15 @@ async fn a_subscription_whose_acknowledgement_cannot_be_queued_ends_the_connecti
         let _ = wealdrelay::ws::try_queue(&sender, Frame::Bye { reason: Vec::new() });
     }
     assert!(
-        !sync::subscribe(&sender, &state, CONNECTION, group(2), 0).await,
+        !sync::subscribe(
+            &sender,
+            &state,
+            CONNECTION,
+            group(2),
+            0,
+            wealdrelay::frame::PROTOCOL_VERSION
+        )
+        .await,
         "a client that is not reading its acknowledgement is not being served"
     );
     drop(receiver);

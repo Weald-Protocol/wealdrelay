@@ -101,6 +101,31 @@ pub fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
     .expect("the integration configuration resolves")
 }
 
+/// The same, with the call path on and sized.
+///
+/// A separate helper rather than a flag on `config_for`, because
+/// `WEALD_RELAY_CALLS` is off by default and every suite that is not about calls
+/// should be running against the default posture. A shared helper that quietly
+/// turned the feature on would mean thirty suites exercising a path none of them
+/// is testing.
+///
+/// `max_calls` is a parameter because the ceiling is what several of the refusals
+/// are about, and a test that wanted to prove one would otherwise have to open
+/// the configured number of calls first.
+pub fn config_for_calls(scratch: &Scratch, blobs: &std::path::Path, max_calls: u32) -> Config {
+    Config::resolve(&Values::from_pairs([
+        (keys::HOSTNAME, "localhost".to_string()),
+        (keys::DATABASE_URL, scratch.url.clone()),
+        (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+        (keys::LISTEN, "127.0.0.1:0".to_string()),
+        (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+        (keys::RELEASE_CHECK, "off".to_string()),
+        (keys::CALLS, "on".to_string()),
+        (keys::MAX_CONCURRENT_CALLS, max_calls.to_string()),
+    ]))
+    .expect("the call configuration resolves")
+}
+
 /// A relay, running, with the address a client connects to.
 pub struct Running {
     pub address: std::net::SocketAddr,
@@ -358,7 +383,25 @@ impl Client {
         groups: Vec<Vec<u8>>,
         client_clock: u64,
     ) -> Vec<u8> {
-        let challenge = self.handshake_to_challenge(groups, client_clock).await;
+        self.handshake_as_version(key, groups, client_clock, PROTOCOL_VERSION)
+            .await
+    }
+
+    /// The same, offering a stated maximum version.
+    ///
+    /// The whole of the version 1 client's side of the compatibility claim: it
+    /// offers 1, the relay selects 1, and it never receives a frame version 2
+    /// added.
+    pub async fn handshake_as_version(
+        &mut self,
+        key: &SigningKey,
+        groups: Vec<Vec<u8>>,
+        client_clock: u64,
+        offered: u16,
+    ) -> Vec<u8> {
+        let challenge = self
+            .handshake_to_challenge_offering(groups, client_clock, offered)
+            .await;
         self.send_frame(&Frame::Auth {
             device_key: key.verifying_key().to_bytes().to_vec(),
             signature: Signer::sign(key, &challenge).to_bytes().to_vec(),
@@ -378,14 +421,30 @@ impl Client {
         groups: Vec<Vec<u8>>,
         client_clock: u64,
     ) -> Vec<u8> {
+        self.handshake_to_challenge_offering(groups, client_clock, PROTOCOL_VERSION)
+            .await
+    }
+
+    /// The same, offering a stated maximum version and asserting the selection.
+    pub async fn handshake_to_challenge_offering(
+        &mut self,
+        groups: Vec<Vec<u8>>,
+        client_clock: u64,
+        offered: u16,
+    ) -> Vec<u8> {
         self.send_frame(&Frame::Connect {
-            version: PROTOCOL_VERSION,
+            version: offered,
             groups,
             sent_at: client_clock,
         })
         .await;
         match self.recv_frame().await {
-            Frame::ConnectAck { version, .. } => assert_eq!(version, PROTOCOL_VERSION),
+            // `min(offered, the relay's maximum)`. A client that offers less is
+            // served at what it offered, which is what makes a version 1 client keep
+            // working against this build.
+            Frame::ConnectAck { version, .. } => {
+                assert_eq!(version, offered.min(PROTOCOL_VERSION))
+            }
             other => panic!("expected a ConnectAck, got {other:?}"),
         }
         match self.recv_frame().await {
@@ -425,6 +484,19 @@ pub fn device_from(seed: u8) -> SigningKey {
 /// access set the subject of every one of them.
 pub async fn seed_access_set(state: &Arc<RelayState>, workspace: &str, devices: &[SigningKey]) {
     let pool = state.database.as_ref().expect("a database").pool();
+    seed_access_set_directly(pool, workspace, devices).await;
+}
+
+/// The same, against a pool rather than a running relay's state.
+///
+/// The load harness needs it: its relay is a separate operating-system process,
+/// so there is no `RelayState` to reach through, and seeding through a second
+/// connection to the same database is exactly what an enrolment would do anyway.
+pub async fn seed_access_set_directly(
+    pool: &sqlx::PgPool,
+    workspace: &str,
+    devices: &[SigningKey],
+) {
     let salt = wealdrelay::access::store::salt(pool, workspace)
         .await
         .expect("a workspace salt");
@@ -599,6 +671,27 @@ pub fn record_recon_rounds(label: &str, corpus: usize, rounds: usize) {
         directory.join(format!("recon-rounds-{slug}.txt")),
         format!("{label}\tcorpus {corpus}\trounds {rounds}\n"),
     );
+}
+
+/// Write one evidence file for a gate, under the directory that gate reads.
+///
+/// `WEALD_GATE_EVIDENCE_DIR` when the harness set it, which is what `--out`
+/// redirects, and the checked-in default otherwise. The default matters: a suite
+/// that hard-coded `build-evidence/step-NN` wrote into the wrong place under
+/// `--out` and the artifact part then asserted on whatever an earlier local run
+/// had left there, which is a false green that survives a clean checkout only by
+/// accident.
+pub fn record_evidence(step: &str, name: &str, contents: &str) {
+    let directory = match std::env::var("WEALD_GATE_EVIDENCE_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("build-evidence")
+            .join(step),
+    };
+    let _ = std::fs::create_dir_all(&directory);
+    let _ = std::fs::write(directory.join(name), contents);
 }
 
 // MARK: Step 9, media blobs

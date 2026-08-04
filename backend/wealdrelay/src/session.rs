@@ -26,8 +26,10 @@
 //! trusted: the answer is a warning to the client, never an adjustment to the
 //! relay's clock.
 
-use crate::config::{Config, WriteMode};
-use crate::frame::{ErrorCode, Frame, FrameError, PROTOCOL_VERSION};
+use crate::config::{CallMode, Config, LiveMode, WriteMode};
+use crate::frame::{
+    ErrorCode, Frame, FrameError, KeysBody, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     OnceLock,
@@ -67,6 +69,68 @@ pub const SEND_QUEUE_BOUND: usize = 256;
 
 /// How many groups one connection may subscribe to.
 pub const MAX_GROUPS_PER_CONNECTION: usize = 256;
+
+/// The largest sealed ``LiveBody`` the relay will carry.
+///
+/// Four KiB. A beat is a signed struct rather than a payload
+/// (`specs/backend/relay/presence.md`), so a larger one is a client using the
+/// ephemeral path for something durable.
+pub const MAX_LIVE_BYTES: usize = 4096;
+
+/// `LIVE` frames one connection may send per minute.
+///
+/// Budgeted separately from the 600-envelope allowance, so presence can never
+/// starve a durable write, and refused on the frame only: the connection stays up
+/// and the next beat is 20 seconds away.
+pub const LIVE_FRAMES_PER_MINUTE: u32 = 60;
+
+/// `KEYS` frames one connection may send per minute. A roster prefetch is a
+/// startup burst rather than a stream.
+pub const KEYS_FRAMES_PER_MINUTE: u32 = 30;
+
+/// The window both per-connection frame budgets are counted over.
+pub const FRAME_BUDGET_WINDOW_MS: u64 = 60_000;
+
+/// The most key packages a `KEYS::Fetch` may ask for at once. Higher is
+/// enumeration (`specs/backend/relay/private-messaging.md`).
+pub const MAX_KEY_PACKAGE_FETCH: u8 = 8;
+
+/// A fixed-window frame budget for one connection.
+///
+/// Deliberately not a token bucket. What is being bounded is a client that beats
+/// on a timer, so a window that resets is both sufficient and exactly what the
+/// limits table states; a bucket would need a refill rate nothing in the spec
+/// names.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FrameBudget {
+    window_started_ms: u64,
+    spent: u32,
+}
+
+impl FrameBudget {
+    /// Charge one frame. `false` means the budget is exhausted for this window.
+    ///
+    /// A window that started in the future is a new window. `health::Clock::System`
+    /// is a wall clock, so an ordinary NTP correction moves `now_ms` backwards, and
+    /// a comparison that only asked whether enough time had passed would answer
+    /// "no" for as long as the step lasted plus the whole window after it. That
+    /// would turn a one second clock correction into a minute of refusals on a
+    /// connection doing nothing wrong, which is a fixed window failing open in the
+    /// one direction it must not.
+    fn charge(&mut self, now_ms: u64, allowance: u32) -> bool {
+        if now_ms < self.window_started_ms
+            || now_ms.saturating_sub(self.window_started_ms) >= FRAME_BUDGET_WINDOW_MS
+        {
+            self.window_started_ms = now_ms;
+            self.spent = 0;
+        }
+        if self.spent >= allowance {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+}
 
 /// Where a session is. A `CONNECT` before anything, then a challenge, then a
 /// signature, then it may work.
@@ -145,6 +209,45 @@ pub enum Work {
     AdministerInvite { body: Vec<u8> },
     /// One MLS handshake message, stored in order and fanned out (step 8).
     PublishHandshake { group: Vec<u8>, message: Vec<u8> },
+    /// One ephemeral beat, fanned out to a group's version 2 subscribers and then
+    /// forgotten (step 30). Nothing is stored, so there is no answer to the
+    /// publisher and no sequence number to assign.
+    PublishLive {
+        group: Vec<u8>,
+        epoch: u64,
+        ct: Vec<u8>,
+    },
+    /// One key-package publication or fetch (step 33).
+    KeyPackages { body: KeysBody },
+    /// One call signalling frame: access-set checked, applied to the call
+    /// registry, then fanned out to the group's version 3 subscribers and
+    /// forgotten (step 35). Nothing is stored and the publisher is not answered.
+    PublishCall {
+        /// Narrowed to its fixed width here rather than at the socket. The codec
+        /// already fixes it at sixteen bytes, so the conversion cannot fail on a
+        /// decoded frame; doing it in this layer means the one place it *can*
+        /// fail (a hand-built `Frame`, which is possible because `Frame` is
+        /// public) is the one place that answers it, and the socket layer carries
+        /// no arm that nothing can reach.
+        call_id: [u8; crate::calls::CALL_ID_BYTES],
+        group: Vec<u8>,
+        epoch: u64,
+        kind: crate::calls::CallKind,
+        body: Vec<u8>,
+    },
+    /// One media frame, routed at the participants of a call this connection was
+    /// already admitted to (step 36).
+    ///
+    /// No group on the work item, because there is none on the frame and there is
+    /// deliberately none to look up: the group was checked when the `CALL` that
+    /// opened this call id was accepted, and repeating the check here would put a
+    /// database read on a path carrying fifty frames a second.
+    PublishMedia {
+        call_id: [u8; crate::calls::CALL_ID_BYTES],
+        stream: [u8; crate::calls::STREAM_BYTES],
+        seq: u64,
+        ct: Vec<u8>,
+    },
 }
 
 /// One connection's protocol state.
@@ -195,6 +298,26 @@ pub struct Session {
     build_digest: Vec<u8>,
     access_set_enforced: bool,
     refuses_plaintext: bool,
+    /// The version this session settled on: `min(offered, PROTOCOL_VERSION)`.
+    ///
+    /// Held because fanout filters on it. A version 1 subscriber is never sent a
+    /// `LIVE`, and the only place that fact can be known is the connection that
+    /// negotiated it.
+    negotiated_version: u16,
+    /// Whether the ephemeral path is on at all, from `WEALD_RELAY_LIVE`.
+    live: LiveMode,
+    live_budget: FrameBudget,
+    keys_budget: FrameBudget,
+    /// Whether the call path is on at all, from `WEALD_RELAY_CALLS`.
+    calls: CallMode,
+    /// `CALL` signalling frames per minute, budgeted separately from `LIVE`,
+    /// `KEYS` and the envelope allowance for the same reason those are separate
+    /// from each other: no one path may starve another.
+    call_budget: FrameBudget,
+    /// The media budget: frames per stream per second and bytes per minute.
+    /// `crate::calls::MediaBudget` rather than a `FrameBudget`, because a media
+    /// limit is two limits over two windows and one of them is per stream.
+    media_budget: crate::calls::MediaBudget,
 }
 
 impl Session {
@@ -214,6 +337,17 @@ impl Session {
             build_digest: crate::RunningDigest::resolve().line().into_bytes(),
             access_set_enforced: matches!(config.access_set, crate::config::AccessSetMode::Enforce),
             refuses_plaintext: matches!(config.min_encryption, crate::config::MinEncryption::Mls),
+            // Until `CONNECT` is answered there is no selection. The floor rather
+            // than the ceiling, so a session that somehow reached fanout without a
+            // handshake would be treated as the oldest client rather than the
+            // newest.
+            negotiated_version: MIN_PROTOCOL_VERSION,
+            live: config.live,
+            live_budget: FrameBudget::default(),
+            keys_budget: FrameBudget::default(),
+            calls: config.calls,
+            call_budget: FrameBudget::default(),
+            media_budget: crate::calls::MediaBudget::default(),
         }
     }
 
@@ -272,6 +406,11 @@ impl Session {
         self.authorized_workspace.as_deref()
     }
 
+    /// The protocol version this session settled on. Read by the fanout filter.
+    pub fn negotiated_version(&self) -> u16 {
+        self.negotiated_version
+    }
+
     /// Decide about one frame.
     ///
     /// The match is on the state and the frame together: one table, so what may be
@@ -283,6 +422,22 @@ impl Session {
     /// `now_ms` is injected because `testing.md` forbids a wall-clock read inside
     /// anything under test, and because the clock-skew rule is only checkable if
     /// the test controls both clocks.
+    /// The one answer both call frames give when the operator has turned the path
+    /// off, or `None` when it is on.
+    ///
+    /// A version answer rather than a denial, exactly as `LIVE` gives: the frame
+    /// is well formed and the client's correct response is to stop sending it and
+    /// report calls unavailable, not to retry against a relay that will never say
+    /// yes. Written once because two copies of it would be two things to keep in
+    /// step.
+    fn calls_unavailable(&self) -> Option<Reaction> {
+        matches!(self.calls, CallMode::Off).then(|| {
+            Reaction::Reply(vec![Frame::Error(FrameError::new(
+                ErrorCode::ProtocolUnsupported,
+            ))])
+        })
+    }
+
     pub fn handle(&mut self, frame: Frame, now_ms: u64) -> Reaction {
         match (self.state, frame) {
             (
@@ -293,7 +448,13 @@ impl Session {
                     sent_at,
                 },
             ) => {
-                if version != PROTOCOL_VERSION {
+                // One field, which is the client's maximum offer, and the
+                // selection is the lower of the two ceilings. Refused only when the
+                // offer is below this build's floor, which is a client this relay
+                // genuinely cannot serve; a client offering more than this build
+                // speaks is served at this build's maximum and told so in
+                // `CONNECT_ACK`.
+                if version < MIN_PROTOCOL_VERSION {
                     // Aborts the connection. `operations.md`: a version failure
                     // never silently continues.
                     self.state = State::Closed;
@@ -302,6 +463,7 @@ impl Session {
                             .detail(PROTOCOL_VERSION.to_be_bytes()),
                     )]);
                 }
+                self.negotiated_version = version.min(PROTOCOL_VERSION);
                 if groups.len() > MAX_GROUPS_PER_CONNECTION {
                     self.state = State::Closed;
                     return Reaction::ReplyAndClose(vec![Frame::Error(
@@ -320,7 +482,7 @@ impl Session {
                 self.state = State::Challenged;
                 Reaction::Reply(vec![
                     Frame::ConnectAck {
-                        version: PROTOCOL_VERSION,
+                        version: self.negotiated_version,
                         server_time: now_ms,
                         min_enc: self.min_enc,
                     },
@@ -412,6 +574,197 @@ impl Session {
             }
             (State::Ready, Frame::Handshake { group, message, .. }) => {
                 Reaction::Defer(Work::PublishHandshake { group, message })
+            }
+            // Ready only. There is no pre-auth case: `JOIN` remains the one frame
+            // a session may send before it has authenticated, and a beat from an
+            // unauthenticated peer is a peer claiming presence in a workspace it has
+            // not proved it belongs to.
+            (State::Ready, Frame::Live { group, epoch, ct }) => {
+                if matches!(self.live, LiveMode::Off) {
+                    // The operator turned the ephemeral path off. A version answer
+                    // rather than a denial: the frame is well formed and the client's
+                    // correct response is to stop sending it, not to retry.
+                    return Reaction::Reply(vec![Frame::Error(FrameError::new(
+                        ErrorCode::ProtocolUnsupported,
+                    ))]);
+                }
+                if ct.len() > MAX_LIVE_BYTES {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::EnvelopeTooLarge)
+                            .detail((MAX_LIVE_BYTES as u64).to_be_bytes()),
+                    )]);
+                }
+                if !self.live_budget.charge(now_ms, LIVE_FRAMES_PER_MINUTE) {
+                    // The frame only. The connection stays up and durable traffic
+                    // is unaffected, which is the whole point of budgeting presence
+                    // separately.
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(LIVE_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
+                Reaction::Defer(Work::PublishLive { group, epoch, ct })
+            }
+            // Ready only, like every other authenticated frame. A key package is
+            // stored against the authenticated device key, so a session that has not
+            // authenticated has no shelf to publish onto.
+            (State::Ready, Frame::Keys(body)) => {
+                // The relay-to-client forms are refused on the way in. A client
+                // sending one is a client that is wrong about the protocol, and the
+                // catch-all's answer is the right one.
+                if !matches!(body, KeysBody::Publish { .. } | KeysBody::Fetch { .. }) {
+                    self.state = State::Closed;
+                    return Reaction::ReplyAndClose(vec![Frame::Error(FrameError::new(
+                        ErrorCode::MalformedHeader,
+                    ))]);
+                }
+                if let KeysBody::Fetch { count, .. } = &body {
+                    if *count == 0 || *count > MAX_KEY_PACKAGE_FETCH {
+                        return Reaction::Reply(vec![Frame::Error(
+                            FrameError::new(ErrorCode::EnvelopeTooLarge)
+                                .detail(u64::from(MAX_KEY_PACKAGE_FETCH).to_be_bytes()),
+                        )]);
+                    }
+                }
+                if !self.keys_budget.charge(now_ms, KEYS_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(KEYS_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
+                Reaction::Defer(Work::KeyPackages { body })
+            }
+            // `Ready` only, like every other group-addressed frame. A call frame
+            // names a group and claims a place in a conversation inside it, which
+            // is a stronger claim than a beat, not a weaker one: a bootstrapping
+            // session has no group it has been admitted to and so has nobody to
+            // call.
+            (
+                State::Ready,
+                Frame::Call {
+                    call_id,
+                    group,
+                    epoch,
+                    kind,
+                    body,
+                },
+            ) => {
+                if let Some(refusal) = self.calls_unavailable() {
+                    return refusal;
+                }
+                // The kind is read before anything else is charged, because an
+                // unrecognised kind is a client that is wrong about the protocol
+                // rather than one that is over a limit, and charging a budget for a
+                // frame that was never going to be routed would let a peer spend
+                // somebody's allowance with garbage.
+                let Some(kind) = crate::calls::CallKind::from_u8(kind) else {
+                    return Reaction::Reply(vec![Frame::Error(FrameError::new(
+                        ErrorCode::MalformedHeader,
+                    ))]);
+                };
+                // Fixed width by the codec, so this cannot fail on a decoded
+                // frame. It is a refusal rather than an unwrap because `Frame` is
+                // public and a caller constructing one by hand is a caller this
+                // must not panic for, and it lives here so the socket layer has no
+                // copy of it that no sequence of bytes could reach.
+                let Ok(call_id) = <[u8; crate::calls::CALL_ID_BYTES]>::try_from(call_id.as_slice())
+                else {
+                    return Reaction::Reply(vec![Frame::Error(FrameError::new(
+                        ErrorCode::MalformedHeader,
+                    ))]);
+                };
+                if body.len() > crate::calls::MAX_CALL_BODY_BYTES {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::EnvelopeTooLarge)
+                            .detail((crate::calls::MAX_CALL_BODY_BYTES as u64).to_be_bytes()),
+                    )]);
+                }
+                if !self
+                    .call_budget
+                    .charge(now_ms, crate::calls::CALL_FRAMES_PER_MINUTE)
+                {
+                    // The frame only. Signalling being refused must not take down
+                    // a call that is already running on the same socket.
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(crate::calls::CALL_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
+                Reaction::Defer(Work::PublishCall {
+                    call_id,
+                    group,
+                    epoch,
+                    kind,
+                    body,
+                })
+            }
+            // `Ready` only, and unlike every other frame here it names no group.
+            // The group was checked when this connection was admitted to the call,
+            // which is the whole design: see ``Work::PublishMedia``.
+            (
+                State::Ready,
+                Frame::Media {
+                    call_id,
+                    stream,
+                    seq,
+                    ct,
+                },
+            ) => {
+                if let Some(refusal) = self.calls_unavailable() {
+                    return refusal;
+                }
+                if ct.len() > crate::calls::MAX_MEDIA_CT_BYTES {
+                    // Refused on the declared length, before the payload is copied
+                    // anywhere or charged against anything. The frame's bytes were
+                    // already read off the socket under `MAX_FRAME_BYTES`; what is
+                    // avoided here is every allocation after that.
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::EnvelopeTooLarge)
+                            .detail((crate::calls::MAX_MEDIA_CT_BYTES as u64).to_be_bytes()),
+                    )]);
+                }
+                // Both ids are fixed width by the codec, so these conversions
+                // cannot fail on a decoded frame. They are written as a refusal
+                // rather than an unwrap because `Frame` is a public type and a
+                // caller constructing one by hand is a caller this must not panic
+                // for, and the narrowed values are what the work item carries, so
+                // the socket layer has nothing left to convert.
+                let (Ok(call_id), Ok(stream)) = (
+                    <[u8; crate::calls::CALL_ID_BYTES]>::try_from(call_id.as_slice()),
+                    <[u8; crate::calls::STREAM_BYTES]>::try_from(stream.as_slice()),
+                ) else {
+                    return Reaction::Reply(vec![Frame::Error(FrameError::new(
+                        ErrorCode::MalformedHeader,
+                    ))]);
+                };
+                if let Err(refusal) = self
+                    .media_budget
+                    .charge(now_ms, &call_id, &stream, ct.len())
+                {
+                    // Refused either way. What `should_report` decides is whether
+                    // to say so, and it says so at most once a second: answering
+                    // every frame of a flood is an amplifier, and the answers would
+                    // fill the flooder's own bounded outbound queue and turn a rate
+                    // limit into a disconnect.
+                    return Reaction::Reply(if self.media_budget.should_report(now_ms) {
+                        vec![Frame::Error(
+                            FrameError::new(refusal.code())
+                                .retry_after(refusal.retry_after())
+                                .detail(refusal.detail().to_be_bytes()),
+                        )]
+                    } else {
+                        Vec::new()
+                    });
+                }
+                Reaction::Defer(Work::PublishMedia {
+                    call_id,
+                    stream,
+                    seq,
+                    ct,
+                })
             }
             (State::Ready, Frame::Blob { payload }) => {
                 Reaction::Defer(Work::BlobTicket { payload })

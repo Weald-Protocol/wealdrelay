@@ -11,8 +11,9 @@
 //! `FrameTag::ALL` so that a frame added later without a rule fails here.
 
 use proptest::prelude::*;
+use wealdrelay::calls::CallKind;
 use wealdrelay::config::{keys, Config, Values};
-use wealdrelay::frame::{ErrorCode, Frame, FrameError, FrameTag, PROTOCOL_VERSION};
+use wealdrelay::frame::{ErrorCode, Frame, FrameError, FrameTag, KeysBody, PROTOCOL_VERSION};
 use wealdrelay::session::{
     Reaction, Session, State, Work, CLOCK_SKEW_LIMIT_MS, MAX_GROUPS_PER_CONNECTION,
 };
@@ -33,6 +34,15 @@ const BLOB_PAYLOAD: &[u8] = &[8];
 const DROP_PAYLOAD: &[u8] = &[10];
 const WRAP_BODY: &[u8] = &[9];
 const HANDSHAKE_MESSAGE: &[u8] = &[10, 11];
+const LIVE_CT: &[u8] = &[12, 13];
+const LIVE_EPOCH: u64 = 7;
+const CALL_ID: [u8; 16] = [0xC1; 16];
+const CALL_BODY: &[u8] = &[16, 17];
+const CALL_EPOCH: u64 = 11;
+const STREAM: [u8; 4] = [0, 0, 0, 1];
+const MEDIA_CT: &[u8] = &[18, 19];
+const MEDIA_SEQ: u64 = 42;
+const KEY_PACKAGE: &[u8] = &[14, 15];
 const JOIN_BODY: &[u8] = &[12];
 const INVITE_BODY: &[u8] = &[13];
 const FROM_SEQ: u64 = 5;
@@ -64,12 +74,29 @@ fn config(extra: &[(&'static str, &'static str)]) -> Config {
     Config::resolve(&Values::from_pairs(pairs)).expect("configuration resolves")
 }
 
+/// The ordinary configuration for the ordering walk, with the call path on.
+///
+/// `WEALD_RELAY_CALLS` defaults to `off`, so the walk would otherwise assert that
+/// `CALL` and `MEDIA` in `Ready` are answered `protocol_unsupported`, which is
+/// true of a relay with calls off and says nothing about the ordering rule the
+/// walk exists to prove. The off posture is proved on its own, below, where it is
+/// the subject rather than an accident of a default.
 fn full() -> Config {
-    config(&[])
+    config(&[(keys::CALLS, "on"), (keys::MAX_CONCURRENT_CALLS, "3")])
 }
 
 fn read_only() -> Config {
-    config(&[(keys::WRITE_MODE, "read_only")])
+    config(&[
+        (keys::WRITE_MODE, "read_only"),
+        (keys::CALLS, "on"),
+        (keys::MAX_CONCURRENT_CALLS, "3"),
+    ])
+}
+
+/// A relay whose operator has not turned calls on, which is every relay that has
+/// not been sized for them.
+fn calls_off() -> Config {
+    config(&[])
 }
 
 /// A `CONNECT` that will be accepted: the version this build speaks, one group,
@@ -183,6 +210,27 @@ fn sample(tag: FrameTag) -> Frame {
             seq: 0,
             message: HANDSHAKE_MESSAGE.to_vec(),
         },
+        FrameTag::Live => Frame::Live {
+            group: group(5),
+            epoch: LIVE_EPOCH,
+            ct: LIVE_CT.to_vec(),
+        },
+        FrameTag::Keys => Frame::Keys(KeysBody::Publish {
+            packages: vec![KEY_PACKAGE.to_vec()],
+        }),
+        FrameTag::Call => Frame::Call {
+            call_id: CALL_ID.to_vec(),
+            group: group(6),
+            epoch: CALL_EPOCH,
+            kind: CallKind::Offer as u8,
+            body: CALL_BODY.to_vec(),
+        },
+        FrameTag::Media => Frame::Media {
+            call_id: CALL_ID.to_vec(),
+            stream: STREAM.to_vec(),
+            seq: MEDIA_SEQ,
+            ct: MEDIA_CT.to_vec(),
+        },
     }
 }
 
@@ -256,6 +304,39 @@ fn expected(tag: FrameTag, state: State) -> Expected {
         (State::Ready, FrameTag::Handshake) => Expected::Deferred(Work::PublishHandshake {
             group: group(4),
             message: HANDSHAKE_MESSAGE.to_vec(),
+        }),
+        // Ready only, and there is deliberately no pre-auth case: a beat from an
+        // unauthenticated peer is a peer claiming presence in a workspace it has
+        // not proved it belongs to.
+        (State::Ready, FrameTag::Live) => Expected::Deferred(Work::PublishLive {
+            group: group(5),
+            epoch: LIVE_EPOCH,
+            ct: LIVE_CT.to_vec(),
+        }),
+        // Ready only. A key package is stored against the authenticated device key,
+        // so a session with no device key has no shelf to publish onto.
+        (State::Ready, FrameTag::Keys) => Expected::Deferred(Work::KeyPackages {
+            body: KeysBody::Publish {
+                packages: vec![KEY_PACKAGE.to_vec()],
+            },
+        }),
+        // Ready only, like every other group-addressed frame. A call frame claims a
+        // place in a conversation inside a group, which is a stronger claim than a
+        // beat rather than a weaker one.
+        (State::Ready, FrameTag::Call) => Expected::Deferred(Work::PublishCall {
+            call_id: CALL_ID,
+            group: group(6),
+            epoch: CALL_EPOCH,
+            kind: CallKind::Offer,
+            body: CALL_BODY.to_vec(),
+        }),
+        // Ready only, and it names no group at all: the group was checked when the
+        // `CALL` that opened this call id was accepted.
+        (State::Ready, FrameTag::Media) => Expected::Deferred(Work::PublishMedia {
+            call_id: CALL_ID,
+            stream: STREAM,
+            seq: MEDIA_SEQ,
+            ct: MEDIA_CT.to_vec(),
         }),
         (State::Ready, FrameTag::Blob) => Expected::Deferred(Work::BlobTicket {
             payload: BLOB_PAYLOAD.to_vec(),
@@ -530,11 +611,28 @@ fn every_frame_in_every_state_follows_the_documented_rule() {
     // `JOIN`, which reserves the seat that set is published by. Both are steps of
     // the same enrolment and neither reads anything. A third would move this number
     // and fail here, which is the point.
+    //
+    // Twenty-four, and the arithmetic is written out because the number is the
+    // assertion: `CONNECT` in `Fresh` (1), `AUTH` in `Challenged` (1), the thirteen
+    // content frames in `Ready` (`SEND`, `SUB`, `RECON`, `ACCESS`, `WRAP`,
+    // `INVITE`, `HANDSHAKE`, `LIVE`, `KEYS`, `CALL`, `MEDIA`, `BLOB`, `DROP`),
+    // `ACCESS` again in `Bootstrapping` (1), `JOIN` in each of the four live states
+    // (4), and `BYE` in each of the four live states (4).
+    //
+    // Protocol version 3 contributed two of them. `CALL` and `MEDIA` are the twelfth
+    // and thirteenth content frames and both are `Ready` only, like every other
+    // group-addressed frame. `MEDIA` names no group and is still `Ready` only,
+    // because the call it names was only ever reachable through a `CALL` that was
+    // access-set checked, and a session that never authenticated has none.
+    //
+    // The bootstrap hole is unmoved at two frames wide, `ACCESS` and `JOIN`, which
+    // is the number this assertion is really guarding. A third would move it and
+    // fail here, which is the point.
     assert_eq!(
-        permitted, 20,
-        "CONNECT, AUTH, the nine content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
+        permitted, 24,
+        "CONNECT, AUTH, the thirteen content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
     );
-    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 20);
+    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 24);
 }
 
 #[test]
@@ -553,13 +651,29 @@ fn a_closed_session_accepts_nothing_at_all() {
 // MARK: CONNECT
 
 #[test]
-fn a_connect_with_another_version_aborts_the_connection() {
+fn a_connect_below_the_floor_aborts_the_connection() {
     // `operations.md`: a version failure aborts the connection and never silently
-    // continues. Both directions are offered, because a client one version behind
-    // and a client one version ahead are both wrong here and a comparison written
-    // as a `<` would only catch one of them.
+    // continues.
+    //
+    // Only *below* the floor, and the asymmetry is the rule rather than an
+    // oversight. `CONNECT` carries one field and it is the client's **maximum**
+    // offer, so the relay selects `min(offered, PROTOCOL_VERSION)` and states the
+    // selection in `CONNECT_ACK`. A client offering more than this build speaks is
+    // a newer client, which is served at this build's ceiling and told so; a client
+    // offering less than `MIN_PROTOCOL_VERSION` is one this relay genuinely cannot
+    // serve.
+    //
+    // This test previously asserted that a high offer aborted too, and asserted it
+    // in both directions on the reasoning that "a comparison written as a `<` would
+    // only catch one of them". That reasoning was right about the comparison and
+    // wrong about the requirement: step 30 widened negotiation to a range precisely
+    // so a version 1 client keeps working against a version 2 relay, and the same
+    // sentence one version up is what lets a version 3 client connect to a version
+    // 2 one and report calls unavailable rather than fail. The high-offer case is
+    // asserted below as the acceptance it is.
     let config = full();
-    for version in [0, PROTOCOL_VERSION + 1, u16::MAX] {
+    {
+        let version = 0;
         let mut session = Session::new(&config);
         let reaction = session.handle(
             Frame::Connect {
@@ -582,6 +696,41 @@ fn a_connect_with_another_version_aborts_the_connection() {
             session.challenge().is_none(),
             "a refused CONNECT issues no challenge"
         );
+    }
+}
+
+#[test]
+fn a_connect_above_this_builds_ceiling_is_served_at_the_ceiling() {
+    // The other half, and the one that makes an upgrade survivable in either
+    // order. A client that speaks a version this relay has never heard of is a
+    // newer client, not a broken one: it is answered with this build's maximum and
+    // decides for itself whether that is enough. It is the client, not the relay,
+    // that knows which features it needs.
+    let config = full();
+    for version in [PROTOCOL_VERSION + 1, u16::MAX] {
+        let mut session = Session::new(&config);
+        let reaction = session.handle(
+            Frame::Connect {
+                version,
+                groups: Vec::new(),
+                sent_at: NOW,
+            },
+            NOW,
+        );
+        match &reaction {
+            Reaction::Reply(frames) => match frames.first() {
+                Some(Frame::ConnectAck { version, .. }) => assert_eq!(
+                    *version, PROTOCOL_VERSION,
+                    "the relay must state its own ceiling as the selection"
+                ),
+                other => panic!("expected a CONNECT_ACK, got {other:?}"),
+            },
+            other => panic!("a newer client was refused: {other:?}"),
+        }
+        // And the connection continues to the challenge, which is what "served"
+        // means: a selection is not a refusal.
+        assert_eq!(session.state(), State::Challenged);
+        assert!(session.challenge().is_some());
     }
 }
 
@@ -1187,4 +1336,83 @@ fn the_process_resolves_a_digest_without_being_told_one() {
     assert!(wealdrelay::RunningDigest::resolve()
         .line()
         .starts_with("exe-blake3:"));
+}
+
+#[test]
+fn a_relay_with_calls_off_refuses_both_call_frames_and_stays_open() {
+    // The operator posture, proved as its own subject rather than as an accident
+    // of a default. `protocol_unsupported` and not a denial: the frame is well
+    // formed and the client's correct response is to report calls unavailable and
+    // stop sending, which is the same thing it does against a version 2 relay.
+    let config = calls_off();
+    for tag in [FrameTag::Call, FrameTag::Media] {
+        let mut session = session_in(State::Ready, &config);
+        match session.handle(sample(tag), NOW) {
+            Reaction::Reply(frames) => assert_eq!(
+                frames,
+                vec![Frame::Error(FrameError::new(
+                    ErrorCode::ProtocolUnsupported
+                ))],
+                "{tag:?} was answered with the wrong refusal"
+            ),
+            other => panic!("{tag:?} with calls off produced {other:?}"),
+        }
+        // And the session is still usable. A posture is not a protocol error, so
+        // durable traffic on the same socket is unaffected.
+        assert_eq!(session.state(), State::Ready);
+    }
+}
+
+#[test]
+fn a_hand_built_call_frame_with_a_wrong_width_id_is_refused_rather_than_panicking() {
+    // `Frame` is a public type, so a caller can construct one the codec would never
+    // produce: `Frame::decode` fixes `call_id` at sixteen bytes and `stream` at
+    // four, and nothing on the wire can carry another width. This is where that
+    // width is narrowed, and it is narrowed here rather than at the socket
+    // precisely so the refusal has one home that a test can reach. The socket layer
+    // then carries no arm that no sequence of bytes could execute.
+    let config = full();
+    let cases: Vec<(&str, Frame)> = vec![
+        (
+            "a short call id on CALL",
+            Frame::Call {
+                call_id: vec![0xC1; 8],
+                group: group(6),
+                epoch: CALL_EPOCH,
+                kind: CallKind::Offer as u8,
+                body: CALL_BODY.to_vec(),
+            },
+        ),
+        (
+            "a long call id on MEDIA",
+            Frame::Media {
+                call_id: vec![0xC1; 32],
+                stream: STREAM.to_vec(),
+                seq: MEDIA_SEQ,
+                ct: MEDIA_CT.to_vec(),
+            },
+        ),
+        (
+            "a short stream id on MEDIA",
+            Frame::Media {
+                call_id: CALL_ID.to_vec(),
+                stream: vec![0, 1],
+                seq: MEDIA_SEQ,
+                ct: MEDIA_CT.to_vec(),
+            },
+        ),
+    ];
+    for (what, frame) in cases {
+        let mut session = session_in(State::Ready, &config);
+        assert_eq!(
+            session.handle(frame, NOW),
+            Reaction::Reply(vec![Frame::Error(FrameError::new(
+                ErrorCode::MalformedHeader
+            ))]),
+            "{what}: expected a rejection"
+        );
+        // The frame, not the session. A malformed hand-built frame is one bad
+        // frame, and the connection continues.
+        assert_eq!(session.state(), State::Ready, "{what}");
+    }
 }

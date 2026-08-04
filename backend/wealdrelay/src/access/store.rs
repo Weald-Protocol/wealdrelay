@@ -565,9 +565,17 @@ pub async fn publish_for(
                 .await
                 .map_err(|error| StoreError::Database(error.to_string()))?
         {
-            return publish(pool, &workspace, candidate, body)
-                .await
-                .map(Published::Accepted);
+            let accepted = publish(pool, &workspace, candidate, body).await?;
+            // The founding device's own groups, created in the one moment the relay
+            // can attribute them: the genesis set has been accepted, so this device
+            // is now the workspace's trust root, and the groups it named in
+            // `CONNECT` are the workspace's first. Without this the founder
+            // reconnects, names groups no row exists for, is answered
+            // `denied/group_unknown`, and the workspace is unreachable for ever:
+            // the reservation that resolved the workspace here is destroyed by the
+            // same publication.
+            ensure_groups(pool, &workspace, groups).await?;
+            return Ok(Published::Accepted(accepted));
         }
     }
     Ok(Published::UnknownGroup)
@@ -624,7 +632,19 @@ pub async fn admission(
     let salt = salt(pool, &workspace).await?;
     let hash = entry_hash(device_key, &salt);
     match admits(pool, &workspace, device_key).await? {
-        Admission::InSet | Admission::Provisional => Ok(Verdict::Admitted {
+        Admission::InSet => {
+            // A member of this workspace named a group this relay does not have a
+            // row for, which is how every group after the first comes into
+            // existence: a new channel is a new group id derived client-side, and
+            // the relay learns of it here. Bounded to `InSet` on purpose, so a
+            // provisional grant cannot mint one. See `ensure_groups`.
+            ensure_groups(pool, &workspace, groups).await?;
+            Ok(Verdict::Admitted {
+                entry: hash,
+                workspace,
+            })
+        }
+        Admission::Provisional => Ok(Verdict::Admitted {
             entry: hash,
             workspace,
         }),
@@ -744,6 +764,64 @@ pub async fn workspace_of(pool: &PgPool, group: &[u8]) -> Result<Option<String>,
         Some(row) => Ok(Some(row.try_get::<String, _>("workspace_id").map_err(db)?)),
         None => Ok(None),
     }
+}
+
+/// The 32 opaque bytes a group id is. The table says the same thing as a check
+/// constraint; a value of another length is filtered here rather than sent, so a
+/// malformed `CONNECT` is a group nobody created instead of a database error that
+/// would refuse the whole session with `retry/backpressure`.
+const GROUP_ID_BYTES: usize = 32;
+
+/// Create the group rows a connection named, under the workspace that admitted it.
+///
+/// ## Why this exists at all
+///
+/// `accept.rs` answers `denied/group_unknown` for a group with no row, and until
+/// this function there was no code anywhere in the relay that wrote one: every row
+/// in every environment came from `scripts/weald-stack provision`, which reaches
+/// into the relay's Postgres with `psql`. That is a thing a laptop harness can do
+/// and a thing a hosted customer cannot, so a provisioned relay could complete
+/// enrolment and then refuse every subscription its founder made, for ever. The
+/// docs that described the gap (`specs/dev-environment/relay.md`,
+/// `specs/backend/build/local-harness.md`) said provisioning "belongs to the
+/// control plane", and `specs/backend/cloud/api.md` has no endpoint for it and
+/// never did. The protocol specs never made it an invariant.
+///
+/// ## Why this is not "a group created on first write"
+///
+/// The objection the old note raised is real: a relay that created a group for
+/// anyone with a socket would let a stranger allocate storage on somebody else's
+/// plan. Nothing here is open to a stranger. A row is written only for a device
+/// the workspace's own current access set carries (`Admission::InSet`, never a
+/// provisional grant, so a joiner redeeming an invite cannot mint groups), or for
+/// the founding device in the one publication that admits it. The storage is the
+/// workspace's own, which is the plan it is already accounted against
+/// (`relay_group.workspace_id` is what the quota reads), so the boundary the
+/// objection is about is exactly the boundary this respects.
+///
+/// Idempotent, and deliberately conflict-blind on `group_id`: a group id already
+/// belonging to another workspace is left alone rather than moved, so a device in
+/// workspace A naming workspace B's group id changes nothing and is then refused
+/// by `authorize_group` as it was before.
+pub async fn ensure_groups(
+    pool: &PgPool,
+    workspace: &str,
+    groups: &[Vec<u8>],
+) -> Result<u64, StoreError> {
+    let mut created = 0;
+    for group in groups.iter().filter(|group| group.len() == GROUP_ID_BYTES) {
+        let outcome = sqlx::query(
+            "insert into relay_group (group_id, workspace_id) values ($1, $2) \
+             on conflict (group_id) do nothing",
+        )
+        .bind(group.as_slice())
+        .bind(workspace)
+        .execute(pool)
+        .await
+        .map_err(db)?;
+        created += outcome.rows_affected();
+    }
+    Ok(created)
 }
 
 /// How many principals this relay has admitted, across every workspace on it.

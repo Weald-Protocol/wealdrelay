@@ -168,13 +168,27 @@ containing a hostname would be a guessable url for a ciphertext. And the blob is
 served on the **private observability listener** beside `/readyz`, never on the
 public one, with the genesis fingerprint alongside it:
 
-    GET /handoff/<derived>  ->  200 {"blob": "...", "genesis_fingerprint": "..."}
+    GET /handoff/<derived>  ->  200 {"blob": "...", "sealed_code": "...",
+                                     "genesis_fingerprint": "..."}
                                 404 before anything has been sealed
 
 The fingerprint travels with the blob because `cloud/api.md` returns the two
 together and the client checks which genesis key signed the invite it is about to
 redeem. Two separate reads would be two chances for a relay to answer about two
 different keys.
+
+`sealed_code` is the **code half**, sealed with the same function to the same key
+and in the same format, carrying the 12 Crockford symbols in the grouped form
+`Code::grouped` prints. Two ciphertexts rather than one, because the two halves
+travel to two different places for two different reasons
+(`cloud/provisioning.md`): the link half is claimed once by the buyer's browser
+and the code half is mailed to their verified address, and a single blob would put
+both in the same buffer in the endpoint that answers the browser. Sealing the code
+rather than serving it in the clear is what keeps the relay's own guarantee intact:
+it persists `Argon2id(code, salt=token)` and this ciphertext, and no recoverable
+plaintext code. A relay that serves a blob with no `sealed_code` beside it is
+refused, for the same reason one with no fingerprint is: a claim happens once, and
+a workspace whose code was never sealed is one nobody can ever enroll into.
 
 `specs/backend/contracts/wire/vectors/bootstrap-handoff.json` holds the
 conformance vectors: three sealed blobs with their keys and plaintexts, including

@@ -116,6 +116,10 @@ fn the_description_names_every_key_with_its_source() {
         (keys::WRITE_MODE, "read_only"),
         (keys::RELEASE_CHECK, "off"),
         (keys::METRICS_GROUP_LABELS, "on"),
+        // With a Redis url set, which is how a deployment declares a second
+        // instance, the ephemeral path has to be off or the configuration is
+        // refused. See `two_instances_with_process_fanout_refuse_to_start`.
+        (keys::LIVE, "off"),
     ]);
     let config = Config::resolve(&values).unwrap();
     let text = describe_config(&config, &values);
@@ -127,8 +131,15 @@ fn the_description_names_every_key_with_its_source() {
     assert!(text.contains("read_only"));
     assert!(text.contains("unlimited"));
     assert!(text.contains("50"));
-    // The three URLs that can carry a credential are named, not printed.
-    assert_eq!(text.matches("[set, not printed]").count(), 3, "{text}");
+    // The URLs that can carry a credential are named, not printed. Two here rather than
+    // three: the SMTP url is still withheld, and now says it configures nothing, because
+    // this relay has no SMTP client. See `invite::delivery` and WEALD-L072.
+    assert_eq!(text.matches("[set, not printed]").count(), 2, "{text}");
+    assert!(
+        text.contains("[set, and unused: this relay sends no mail]"),
+        "{text}"
+    );
+    assert!(!text.contains("smtp://mail:1025"), "{text}");
     assert!(text.contains("[set]"), "{text}");
     assert!(!text.contains("secret"), "{text}");
     assert!(!text.contains("redis://cache"), "{text}");
@@ -177,4 +188,47 @@ fn the_startup_action_is_debuggable() {
     let action = startup(Vec::<String>::new(), &complete());
     assert!(format!("{action:?}").contains("Serve"));
     assert!(format!("{:?}", Invocation::CheckConfig).contains("CheckConfig"));
+}
+
+#[test]
+fn two_instances_with_process_fanout_refuse_to_start() {
+    // The refusal that keeps a multi-instance deployment from showing half a room.
+    // Two relay processes each fanning out in process would show every member
+    // exactly the half that happens to share their socket, with nothing anywhere
+    // reporting a fault. A relay that will not start is a page a human reads; a
+    // half room is one nobody ever sees.
+    //
+    // Asserted at startup rather than at fanout, because by the time a beat is
+    // being fanned out the deployment is already live and the operator has already
+    // been told everything is fine.
+    let mut pairs: Vec<(&str, &str)> = vec![
+        (keys::HOSTNAME, "relay.acme.com"),
+        (keys::DATABASE_URL, "postgres://weald:secret@db/relay"),
+        (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+        (keys::REDIS_URL, "redis://cache:6379"),
+    ];
+    let outcome = printed(startup(
+        Vec::<String>::new(),
+        &Values::from_pairs(pairs.clone()),
+    ));
+    assert_eq!(outcome.code, wealdrelay::EXIT_CONFIG);
+    assert!(
+        outcome.stderr.contains(keys::LIVE_FANOUT),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stderr.contains(keys::REDIS_URL),
+        "{}",
+        outcome.stderr
+    );
+
+    // And the escape hatch starts, because with no beats there is nothing to fail
+    // to cross an instance boundary. Presence then reports unavailable, which is
+    // honest, rather than showing half a room, which is not.
+    pairs.push((keys::LIVE, "off"));
+    match startup(Vec::<String>::new(), &Values::from_pairs(pairs)) {
+        Startup::Serve(config) => assert_eq!(config.live_label(), "off"),
+        Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
+    }
 }

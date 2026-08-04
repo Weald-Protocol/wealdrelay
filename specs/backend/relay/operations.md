@@ -84,17 +84,39 @@ else's screen.
   decrypt. It waits per frame, and the connection ends only if that wait is
   exhausted, which distinguishes a peer that is slow from a peer that has stopped
   reading.
-- `ephemeral` (`0x00F0`) is the only kind that may be shed under pressure, which
-  is why it is the only kind the relay is permitted to drop at all.
+- `0x00F0 ephemeral` is retired and never used; under `enc: 1` the kind lives
+  inside `ct`, so a relay told to shed one kind and keep every other could never
+  tell them apart. The frames the relay may shed are `LIVE`
+  (`specs/backend/relay/presence.md`) and `CALL` and `MEDIA`
+  (`specs/backend/relay/calls.md`), and they are shed rather than downgraded:
+  a downgrade is a claim about durable state, and there is no reconciliation for
+  a presence beat or for audio.
 - A subscriber that cannot keep up with live push is downgraded to
   reconciliation, told so in a frame, and catches up by range fetch. Slow
   consumers degrade to polling instead of stalling the fanout for everyone.
 - Storage and database saturation return `quota` and `retry` respectively, never
   a silent accept.
 
-The per-connection budget bounds one slow client's blast radius. It is not yet a
-process-wide ceiling: nothing caps concurrent connections, so instance memory is
-still the budget times however many connect.
+The per-connection budget bounds one slow client's blast radius, and since
+protocol version 3 there is a process-wide ceiling behind it:
+`WEALD_RELAY_MAX_CONNECTIONS`, 256 by default, which at the 8 MiB per-connection
+queue is two gibibytes at the absolute worst case. It was recorded here as a gap
+for several releases, in these words: "nothing caps concurrent connections, so
+instance memory is still the budget times however many connect". Calls made the
+gap matter sooner, because a connection carrying one holds its queue busy rather
+than nearly empty, so the cap shipped with them.
+
+A connection past the ceiling is refused **before** the WebSocket upgrade, with
+HTTP 503 and `Retry-After`, because refusing after it would mean allocating the
+queues the cap exists to bound. There is no frame to refuse it in: the socket
+does not exist yet. `unlimited` remains expressible for an operator who has sized
+their instance and means it; the default is a number rather than `unlimited`
+precisely because a default of `unlimited` would have been the old behaviour under
+a new name.
+
+`/readyz` reports `call_stats.connections` and `call_stats.connections_refused`,
+so an operator can see the ceiling binding rather than infer it from a support
+ticket.
 
 ## Abuse and denial of service
 

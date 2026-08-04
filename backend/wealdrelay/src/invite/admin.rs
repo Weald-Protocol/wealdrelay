@@ -108,6 +108,22 @@ impl AdminError {
 }
 
 impl Request {
+    /// The client's half of the wire, kept beside the relay's decoder.
+    ///
+    /// The same shape as `redeem::Request`, and for the same reason: a decoder
+    /// proven only against bytes the test wrote by hand is a decoder proven
+    /// against one author's reading of the spec. With both halves here the round
+    /// trip is an assertion, and the encoder the relay's own tests drive is the
+    /// one an implementer can read.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Authority => cbor::array(&[cbor::uint(0)]),
+            Self::Create { record } => cbor::array(&[cbor::uint(1), cbor::bytes(record)]),
+            Self::List => cbor::array(&[cbor::uint(2)]),
+            Self::Revoke { token } => cbor::array(&[cbor::uint(3), cbor::bytes(token)]),
+        }
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, AdminError> {
         let mut reader = Reader::new(bytes);
         let fields = reader.array_header()?;
@@ -142,6 +158,35 @@ impl Response {
             Self::Revoked { token } => cbor::array(&[cbor::uint(3), cbor::bytes(token)]),
         }
     }
+
+    /// The client's half. See ``Request::encode`` for why both halves live here.
+    pub fn decode(bytes: &[u8]) -> Result<Self, AdminError> {
+        let mut reader = Reader::new(bytes);
+        let fields = reader.array_header()?;
+        let kind = reader.uint()?;
+        let response = match (kind, fields) {
+            (0, 2) => Self::Authority {
+                may_issue: reader.uint()? != 0,
+            },
+            (1, 2) => Self::Created {
+                token: reader.bytes()?,
+            },
+            (2, 2) => {
+                let count = reader.array_header()?;
+                let mut summaries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    summaries.push(Summary::decode(&mut reader)?);
+                }
+                Self::Live(summaries)
+            }
+            (3, 2) => Self::Revoked {
+                token: reader.bytes()?,
+            },
+            _ => return Err(AdminError::UnknownRequest(kind)),
+        };
+        reader.finish()?;
+        Ok(response)
+    }
 }
 
 impl Summary {
@@ -155,6 +200,25 @@ impl Summary {
             cbor::uint(self.scope_count as u64),
             cbor::bytes(self.state.as_bytes()),
         ])
+    }
+
+    /// One summary, from a reader already positioned on it.
+    fn decode(reader: &mut Reader) -> Result<Self, AdminError> {
+        reader.array(7)?;
+        Ok(Self {
+            token: reader.bytes()?,
+            issued_at: reader.uint()?,
+            expires: reader.uint()?,
+            // The wire carries these as unsigned integers and the type is a byte,
+            // so a value out of range is a malformed field rather than something to
+            // clamp: clamping would turn a corrupt list into a plausible one.
+            remaining: u8::try_from(reader.uint()?).map_err(|_| CborError::OutOfRange(0))?,
+            seats: u8::try_from(reader.uint()?).map_err(|_| CborError::OutOfRange(0))?,
+            scope_count: reader.uint()? as usize,
+            state: String::from_utf8(reader.bytes()?).map_err(|_| CborError::TypeMismatch {
+                expected: "utf8 text",
+            })?,
+        })
     }
 }
 
@@ -196,17 +260,19 @@ pub async fn handle(
     request: Request,
     now_ms: i64,
 ) -> Result<Response, AdminError> {
-    if let Request::Authority = request {
-        return Ok(Response::Authority {
-            may_issue: may_issue(pool, workspace_id, device_key).await?,
-        });
-    }
-    if !may_issue(pool, workspace_id, device_key).await? {
+    // `Authority` is the one request that is not gated on being an admin, because
+    // its whole answer is whether the caller is one. Written as a guard on the gate
+    // rather than as an early return with an `unreachable!` arm below it: that arm
+    // was a line no test could ever execute, and an unreachable line in the
+    // privileged path is a line nobody re-reads when the state machine changes.
+    if !matches!(request, Request::Authority) && !may_issue(pool, workspace_id, device_key).await? {
         return Err(AdminError::NotAnAdmin);
     }
 
     match request {
-        Request::Authority => unreachable!("answered above"),
+        Request::Authority => Ok(Response::Authority {
+            may_issue: may_issue(pool, workspace_id, device_key).await?,
+        }),
         Request::Create { record } => {
             let invite = Invite::decode(&record)?;
             // The issuer is checked against the authenticated device, not merely

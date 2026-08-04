@@ -1,41 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Dicyanin Labs
-//! Who sends the invite mail, decided by configuration and by nothing else.
+//! What happens to an invite link once it exists: the admin's client delivers it, and
+//! this relay serves the page it points at.
 //!
-//! `specs/backend/relay/invites.md`, step 2 of the join flow: a **self-hosted**
-//! relay may send the link via the operator's own SMTP, because the operator is the
-//! customer and an invitee address in their own mail server is not a disclosure to
-//! anyone. On the **hosted** tier relay-sent mail is off and cannot be enabled,
-//! because otherwise we would hold the email addresses of people being invited, in
-//! the data plane, which contradicts the claim in
-//! `specs/backend/cloud/overview.md` that we cannot tell which humans exist.
+//! ## Why the relay does not send mail
 //!
-//! ## Why there is no `if hosted` in this file
+//! It used to say it might. `Delivery::RelaySends` existed here, `decide` returned it
+//! whenever `WEALD_RELAY_SMTP_URL` was set, and the label `relay_sends` was a string a
+//! client could read. There was no SMTP client behind any of it and no mail crate in
+//! either `Cargo.toml`: a self-hoster who configured mail got a relay that reported it
+//! would send and then did not. A promise a binary cannot keep is worse than an absence,
+//! because the absence is at least visible from the admin surface, so the arm is gone
+//! rather than stubbed. See WEALD-L072.
 //!
-//! `specs/backend/build/environments.md` requires the hosted binary to be the
-//! audited binary, so a build must never branch on its environment. The difference
-//! is therefore carried entirely by one configuration value: this module asks
-//! whether an SMTP endpoint is configured, and `crate::profile` refuses
-//! `WEALD_RELAY_SMTP_URL` at startup on the hosted profile. A hosted relay reaches
-//! ``decide`` with `None` because it could not have started with anything else, and
-//! a self-hoster who sets the hosted profile watches their own relay refuse the same
-//! thing ours refuses, which is the only version of this claim checkable from
-//! outside.
+//! Delivery is therefore always the admin's own client. That was already the only path
+//! that worked and it is not a degraded mode: it is the path that keeps the invitee's
+//! address out of every server involved, which is the claim
+//! `specs/backend/cloud/overview.md` rests on. `Sources/UI/Invite/InviteSheet.swift`
+//! opens a local draft carrying the link, and the one-time code stays on its own button
+//! and its own channel.
 //!
-//! ``decide`` takes the resolved value rather than the `Config`, so the type system
-//! carries the rule: there is no `Profile` in scope here to branch on.
+//! `WEALD_RELAY_SMTP_URL` is still accepted on a self-host profile and still refused on
+//! the hosted one (`crate::profile`), because the variable is in
+//! `specs/backend/build/env-registry.json` and removing it is a separate change from
+//! removing the arm that lied about it. It configures nothing today, which is exactly
+//! what the label used to hide.
 
-/// What the admin's client is told to do with the link.
+/// What the admin's client is told to do with the link, which is always the same thing.
+///
+/// One arm, deliberately. It is kept as a named value rather than collapsed into a string
+/// literal at each call site so that the day a relay really can send mail, the second arm
+/// arrives with a sender behind it and every reader is already switching on the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    /// The relay will send it, over the operator's own SMTP.
-    RelaySends,
-    /// The relay will not. The admin's client sends it through the admin's own mail
-    /// client, or copies the link.
-    ///
-    /// Never a degraded mode: copy-to-clipboard is always available and is the
-    /// default on hosted, so no admin is ever forced to configure mail to onboard
-    /// someone.
+    /// The relay will not send it. The admin's client opens a draft, or copies the link.
     CopyLink,
 }
 
@@ -43,19 +41,17 @@ impl Delivery {
     /// The label the admin UI and the startup log use.
     pub fn label(self) -> &'static str {
         match self {
-            Self::RelaySends => "relay_sends",
             Self::CopyLink => "copy_link",
         }
     }
 }
 
-/// The decision, from the one value it depends on.
-pub fn decide(smtp_configured: bool) -> Delivery {
-    if smtp_configured {
-        Delivery::RelaySends
-    } else {
-        Delivery::CopyLink
-    }
+/// What this relay does with an invite link, whatever it is configured with.
+///
+/// Takes no argument, and that is the change. It used to take whether SMTP was
+/// configured, which made a configuration value look load-bearing when nothing read it.
+pub fn decide() -> Delivery {
+    Delivery::CopyLink
 }
 
 /// The landing page the relay serves at `/join/<token>`.
@@ -74,6 +70,14 @@ pub fn decide(smtp_configured: bool) -> Delivery {
 ///
 /// The deep link is assembled in the browser from `location`, which is the only
 /// place both halves are present at once.
+///
+/// A fragment eaten in transit is the likely failure rather than an edge case,
+/// because chat clients linkify a URL and drop everything after the `#`. When the
+/// fragment is absent the page says so specifically, in the same words the hosted
+/// page at `backend/weald-web/src/workspace-invite.tsx` uses, and withholds the deep
+/// link rather than offering one that cannot work. Both surfaces telling the person
+/// the same thing is the point: an invitee who lands on one of two pages should not
+/// get a diagnosis on one and silence on the other. See WEALD-L079.
 pub fn landing_page() -> &'static str {
     LANDING_PAGE
 }
@@ -87,10 +91,17 @@ const LANDING_PAGE: &str = "<!doctype html>\
 <p>Open this invite in your Weald client. You will need the one-time code the \
 person who invited you sent separately, which is not in this link.</p>\
 <p><a id=\"open\" href=\"#\">Open in Weald</a></p>\
+<p id=\"missing-secret\" hidden>This link is missing the part after the \
+<code>#</code>, which is the half that unlocks the workspace. Chat clients and link \
+previews sometimes cut it off. Ask for the link again, pasted as plain text.</p>\
 <p>No client yet? Ask the person who invited you which one this workspace uses. \
 The relay serving this page does not host client downloads.</p>\
 <script>\
 var open = document.getElementById('open');\
 open.href = 'weald://join/' + location.pathname.split('/').pop() + location.hash;\
+if (location.hash === '') {\
+document.getElementById('missing-secret').hidden = false;\
+open.removeAttribute('href');\
+}\
 </script>\
 </body></html>";

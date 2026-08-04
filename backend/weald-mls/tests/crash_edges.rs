@@ -52,11 +52,13 @@ const TEMPTING_BODY: &str = "different content under the same link";
 // MARK: Driving the victim
 
 /// The path to the built `crash-victim` binary.
+///
+/// From `CARGO_BIN_EXE_crash-victim`, for the reason written up at the same helper in
+/// `tests/crash.rs`: popping twice off `current_exe()` assumes a test binary sits in
+/// `<profile>/deps/`, which is not Cargo's contract, and nightly's build-dir layout puts
+/// it in `<profile>/build/<pkg>/<hash>/out/` instead.
 fn victim() -> PathBuf {
-    let mut path = std::env::current_exe().expect("this test binary's path");
-    path.pop(); // the deps directory
-    path.pop(); // the profile directory
-    path.push("crash-victim");
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_crash-victim"));
     assert!(
         path.exists(),
         "crash-victim is not built at {}. It is a bin target of this crate and \

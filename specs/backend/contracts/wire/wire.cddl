@@ -116,8 +116,10 @@ event-kind =
     k-doc-change          ; 0x0001
   / k-doc-snapshot        ; 0x0002
   / k-chat-message        ; 0x0010
+  / k-ticket-op           ; 0x0011
   / k-roster-update       ; 0x0020
   / k-roster-revoke       ; 0x0021
+  / k-dm-welcome          ; 0x0022
   / k-media-ref           ; 0x0030
   / k-git-patch           ; 0x0040
   / k-git-status          ; 0x0041
@@ -131,14 +133,20 @@ event-kind =
   / k-chain-reset         ; 0x0072
   / k-snapshot            ; 0x0073
   / k-media-retain        ; 0x0080
+  / k-agent-card          ; 0x0090
+  / k-agent-invoke        ; 0x0091
+  / k-agent-lifecycle     ; 0x0092
+  / k-agent-lease         ; 0x0093
   / k-ephemeral           ; 0x00F0
   / unknown-kind
 
 k-doc-change         = 1
 k-doc-snapshot       = 2
 k-chat-message       = 16
+k-ticket-op          = 17
 k-roster-update      = 32
 k-roster-revoke      = 33
+k-dm-welcome         = 34
 k-media-ref          = 48
 k-git-patch          = 64
 k-git-status         = 65
@@ -152,13 +160,30 @@ k-checkpoint         = 113
 k-chain-reset        = 114
 k-snapshot           = 115
 k-media-retain       = 128
+; The four agent kinds. Numbers are fixed by the table in
+; specs/backend/relay/wire.md; their bodies are specified with the rest of the
+; networked-agent protocol and are not schematised here yet, so an envelope
+; carrying one is a well-formed envelope of a known kind whose body this grammar
+; does not constrain. The relay never reads a body, so nothing it does depends on
+; the difference.
+k-agent-card         = 144
+k-agent-invoke       = 145
+k-agent-lifecycle    = 146
+k-agent-lease        = 147
 k-ephemeral          = 240
 
 unknown-kind = uint   ; stored and ignored. Forward compatibility is a
                       ; contract, not a courtesy.
 
-; 0x00F0 is the ONLY kind the relay may drop, and the only kind never written
-; to Postgres. It is therefore also the only kind sheddable under backpressure.
+; 0x00F0 is RESERVED AND NEVER USED. It was defined as the only kind the relay
+; may drop and the only one never written to Postgres, and that instruction has
+; no implementation and never could have one: under enc 1 the kind is inside ct,
+; so a relay told to drop one kind and keep every other cannot tell them apart.
+; Ephemeral traffic is the LIVE frame (tag 21), where the routing and shedding
+; decisions are visible and the content is not, and now also the CALL and MEDIA
+; frames (tags 23 and 24), which are ephemeral in exactly the same sense. The
+; number stays allocated forever. See specs/backend/relay/presence.md and
+; specs/backend/relay/calls.md.
 
 ; ---------------------------------------------------------------------------
 ; Bodies whose shape is load-bearing for a security property.
@@ -212,6 +237,19 @@ RecoveryWrapBody = {                     ; kind 0x0061
 blinded-tag = bstr .size 32
 ; Stored by the relay under a per-epoch blinded tag so that the existence of a
 ; recovery principal is not itself a queryable fact.
+
+DmWelcomeBody = {                        ; kind 0x0022
+  1 => blinded-tag                       ; BLAKE3("weald dm welcome v1",
+                                         ; key_package_ref)
+  2 => bstr                              ; MLS Welcome
+}
+
+; Two fields, and the omission is the shape. There is NO group-id here: the
+; joiner reads the dm group id out of the Welcome, which only the holder of the
+; referenced key package can open. A group-id in this record would let every
+; member of the workspace root group learn which pair opened a conversation and
+; when, from a log they are all entitled to read. See
+; specs/backend/relay/private-messaging.md.
 
 ; Access-set rotations are NOT Payload events: Payload is encrypted. ACCESS is
 ; a separately named cleartext control frame so the relay can validate its
@@ -299,3 +337,115 @@ ErrorBody = {
 }
 
 error-class = "retry" / "reject" / "denied" / "quota" / "version"
+
+; ---------------------------------------------------------------------------
+; Protocol version 2: the two frames added, and the two bodies they carry.
+; ---------------------------------------------------------------------------
+
+; Frame tag 21. The same shape in both directions, like HANDSHAKE. `ct` is a
+; sealed LiveBody and the relay cannot read it.
+LiveFrame = [21, [group-id, epoch, live-ct]]
+
+live-ct  = bstr .size (1..4096)   ; a beat is a signed struct, not a payload
+
+; The sealed content of a LIVE frame. Signed by the device it describes: a relay
+; that could synthesise one could show a member as at their keyboard when they
+; were not.
+LiveBody = [
+  live-kind,        ; 1 presence, 2 typing. 3 and 4 reserved, never sent.
+  member,           ; the author's device key
+  live-state,       ; 1 active, 2 idle, 3 away. Zero on a typing claim.
+  live-channel,     ; channel slug, typing only
+  at,               ; the author's clock in ms. Compared, never rendered.
+  ttl,              ; seconds this claim is good for, clamped to 120 by the receiver
+  cert,             ; delegation certificate, or null
+  sig
+]
+
+live-kind    = 1 / 2
+live-state   = 0 / 1 / 2 / 3
+live-channel = bstr / null
+member       = bstr .size 32
+at           = uint
+ttl          = uint .size 4
+cert         = bstr / null
+sig          = bstr .size 64
+
+; Frame tag 22. Five forms, discriminated by the leading byte, because they are
+; one conversation about one shelf.
+KeysFrame = [22, [keys-form, keys-fields]]
+
+keys-form   = 1 / 2 / 3 / 4 / 5
+keys-fields =
+    [* key-package]              ; form 1 publish, form 4 bundles
+  / [uint]                       ; form 2 published: remaining
+  / [device-key, fetch-count]    ; form 3 fetch
+  / []                           ; form 5 none
+
+key-package = bstr
+device-key  = bstr .size 32
+fetch-count = uint .size 1        ; capped at 8; higher is enumeration
+
+; ---------------------------------------------------------------------------
+; Protocol version 3: the two call frames. specs/backend/relay/calls.md.
+; ---------------------------------------------------------------------------
+
+; Frame tag 23. The same shape in both directions, like LIVE and HANDSHAKE.
+;
+; `kind` is cleartext and is the one field of either call frame the relay
+; interprets, because it decides call membership and membership is what lets
+; MEDIA be routed without a database read. `body` is sealed under the group's
+; MLS exporter and the relay cannot read it. The set of kinds is closed: a value
+; outside it is refused with reject/malformed_header rather than forwarded, so a
+; future client cannot change routing semantics without a version bump.
+CallFrame = [23, [call-id, group-id, epoch, call-kind, call-body]]
+
+call-id   = bstr .size 16         ; client-chosen, compared, never derived from
+call-kind = 1 / 2 / 3 / 4         ; offer, answer, decline, bye.
+                                  ; 5 (candidate) is reserved for the P2P step
+                                  ; and is not accepted by this version.
+call-body = bstr .size (0..4096)  ; sealed; a signalling body is a small struct
+
+; Frame tag 24. One encrypted audio frame.
+;
+; There is deliberately no group here. The group was checked when a CALL admitted
+; this connection to this call-id, and repeating the check on a path carrying
+; fifty frames a second per stream would put a Postgres read into the media path.
+;
+; `seq` is the sender's own per-stream counter, copied by the relay and never
+; interpreted. It is NOT the per-group seq: that one is an UPDATE ... RETURNING
+; inside a transaction, and routing audio through it would serialise every writer
+; in the group behind the call. The receiver's jitter buffer is its only reader.
+MediaFrame = [24, [call-id, stream-id, media-seq, media-ct]]
+
+stream-id = bstr .size 4          ; also the first half of the client's AES-GCM
+                                  ; nonce, so the wire width and the nonce width
+                                  ; are one number rather than two that drift
+media-seq = uint                  ; per stream, client-side, uninterpreted
+media-ct  = bstr .size (0..1500)  ; AES-256-GCM frame. One Ethernet MTU, which is
+                                  ; four hundred times a 20 ms AAC-ELD frame: it
+                                  ; bounds an attacker rather than fitting a codec
+
+; Kind 0x0022. Travels in the workspace root group as an ordinary envelope.
+; The dm group id is deliberately absent: the joiner learns it from inside the
+; Welcome, and naming it here would let every root member learn which pair
+; opened a conversation and when.
+DirectWelcome = [
+  dm-tag,      ; BLAKE3("weald dm welcome v1", key_package_ref)
+  welcome      ; the MLS Welcome, opaque
+]
+
+dm-tag  = bstr .size 32
+welcome = bstr
+
+; Kind 0x0020. Self-asserted and signed by the device it describes, admitted by
+; a reader only when that device key is in the access set.
+RosterEntry = {
+  1 => device-key,       ; 32 bytes
+  2 => tstr,             ; handle, normalized
+  3 => tstr,             ; display name
+  4 => tstr,             ; machine id
+  ? 5 => tstr,           ; email
+  ? 6 => tstr,           ; device label
+  7 => uint              ; claimed at, ms
+}

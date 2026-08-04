@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wealdrelay::cbor;
 use wealdrelay::frame::{
-    ErrorClass, ErrorCode, Frame, FrameDecodeError, FrameError, FrameTag, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION,
+    ErrorClass, ErrorCode, Frame, FrameDecodeError, FrameError, FrameTag, KeysBody,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
 /// A 32 byte field: a group id, a device key, a content hash.
@@ -85,6 +85,73 @@ fn every_variant() -> Vec<Frame> {
             message: vec![3; 512],
         },
         Frame::Join { body: vec![5; 96] },
+        // Both directions, same shape, like `HANDSHAKE`. The empty body case is
+        // deliberate: a beat whose sealed struct happened to be short must decode
+        // rather than being read as a truncated frame.
+        Frame::Live {
+            group: wide(11),
+            epoch: 4,
+            ct: vec![2; 96],
+        },
+        Frame::Live {
+            group: wide(11),
+            epoch: u64::MAX,
+            ct: vec![1],
+        },
+        // All five `KEYS` forms. The relay-to-client ones round trip here even
+        // though `session.rs` refuses them on the way in: this suite is about the
+        // codec, and a form the relay could send and not read back would be a form
+        // no test could ever check.
+        Frame::Keys(KeysBody::Publish {
+            packages: vec![vec![1; 64], vec![2; 64]],
+        }),
+        Frame::Keys(KeysBody::Publish {
+            packages: Vec::new(),
+        }),
+        Frame::Keys(KeysBody::Published { remaining: 97 }),
+        Frame::Keys(KeysBody::Fetch {
+            device: wide(12),
+            count: 8,
+        }),
+        Frame::Keys(KeysBody::Bundles {
+            packages: vec![vec![3; 64]],
+        }),
+        Frame::Keys(KeysBody::None),
+        // Every signalling kind, because the number is on the wire and it is the
+        // one field of either call frame the relay interprets.
+        Frame::Call {
+            call_id: vec![0xC1; 16],
+            group: wide(11),
+            epoch: 7,
+            kind: 1,
+            body: vec![0xDE, 0xAD],
+        },
+        Frame::Call {
+            call_id: vec![0xC2; 16],
+            group: wide(12),
+            epoch: u64::MAX,
+            kind: 4,
+            // A zero-length body is legal: an offer whose whole content is the
+            // kind is a frame the relay must carry unchanged.
+            body: Vec::new(),
+        },
+        Frame::Media {
+            call_id: vec![0xC3; 16],
+            stream: vec![0, 0, 0, 1],
+            seq: 0,
+            ct: vec![0x41; 80],
+        },
+        Frame::Media {
+            // An all-zero call id is not reserved and is not special-cased: the
+            // relay compares call ids and derives nothing from them.
+            call_id: vec![0; 16],
+            stream: vec![0xFF; 4],
+            // The counter never wraps inside an epoch by construction, but the
+            // codec has to carry the width regardless: a saturating read on
+            // either side would silently reorder a stream.
+            seq: u64::MAX,
+            ct: Vec::new(),
+        },
         Frame::Invite { body: vec![6; 64] },
         Frame::Handshake {
             group: wide(9),

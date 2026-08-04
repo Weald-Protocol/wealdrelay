@@ -108,9 +108,39 @@ pub struct Readiness {
     /// opaque.
     pub frozen_groups: Vec<String>,
     pub release: ReleaseState,
+    /// The call posture: `on` or `off`, reported for the reason `access_set` and
+    /// `min_enc` are. A customer whose calls do not connect should be able to see
+    /// that this relay does not carry them, rather than reading their operator's
+    /// environment file or concluding the network is broken.
+    pub calls: &'static str,
+    /// The four operator counters the call path produces. Capacity, never
+    /// identity: not one of them is per call, per group or per principal, because
+    /// a labelled count here would be exactly the metadata `crate::hub` refuses to
+    /// hold. `specs/backend/relay/calls.md`.
+    pub call_stats: CallStats,
     /// Whether the relay would accept a durable write right now. The one-line
     /// answer, so a poller does not have to reimplement the conjunction.
     pub ready: bool,
+}
+
+/// What an operator can see about calls, and the whole of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallStats {
+    /// Calls open on this process right now.
+    pub open: u64,
+    /// Media frames dropped because a recipient's queue was full, since start.
+    ///
+    /// The capacity signal the shed rule is observable through. A relay shedding
+    /// audio is one whose subscribers cannot keep up, and an operator needs to see
+    /// that; the affected client is deliberately not told, because the next frame
+    /// is 20 ms away and a downgrade would be a lie about its durable log.
+    pub media_shed: u64,
+    /// Media frames refused because the sender was not in the call it named.
+    pub media_denied: u64,
+    /// Client sockets open now, and how many have been refused at the cap since
+    /// start.
+    pub connections: u64,
+    pub connections_refused: u64,
 }
 
 /// Everything the readiness document needs, gathered once per request.
@@ -148,6 +178,25 @@ pub struct RelayState {
     /// (`specs/backend/relay/media.md`, "Bandwidth"), process-local and shared by
     /// every connection this relay serves.
     pub media_rate: crate::media::RateLimiter,
+    /// The calls this process is carrying, and the only place call state lives.
+    ///
+    /// Beside the hub rather than inside it, because the hub's map is group to
+    /// connection and a call is a narrower thing: two to five of a group's
+    /// subscribers, for a few minutes. Merging them would have made the hub's one
+    /// invariant (it holds a group id and a connection handle and nothing else)
+    /// harder to state.
+    pub calls: crate::calls::CallRegistry,
+    /// How many client sockets are open, against
+    /// `WEALD_RELAY_MAX_CONNECTIONS`.
+    ///
+    /// An `AtomicUsize` and not a semaphore: the cap is checked and incremented at
+    /// the upgrade and decremented when the reader loop ends, and there is no
+    /// caller that should ever wait for a slot. A relay at its ceiling refuses now
+    /// rather than holding a request open until somebody else leaves.
+    pub connections: std::sync::atomic::AtomicUsize,
+    /// How many connections were refused because the cap was reached. An operator
+    /// counter with no label: capacity, never identity.
+    pub connections_refused: std::sync::atomic::AtomicU64,
 }
 
 impl RelayState {
@@ -157,6 +206,11 @@ impl RelayState {
         } else {
             ReleaseState::Disabled
         };
+        // Read before `config` is moved into the struct. `None` is only reachable
+        // with calls off, where the registry is never consulted, and zero is then
+        // the honest ceiling rather than a number nobody chose.
+        let max_concurrent_calls =
+            usize::try_from(config.max_concurrent_calls.unwrap_or(0)).unwrap_or(usize::MAX);
         Self {
             config,
             database,
@@ -167,7 +221,58 @@ impl RelayState {
             hub: crate::hub::Hub::new(),
             media_presign_secret: random_secret(),
             media_rate: crate::media::default_rate_limiter(),
+            calls: crate::calls::CallRegistry::new(max_concurrent_calls),
+            connections: std::sync::atomic::AtomicUsize::new(0),
+            connections_refused: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Take one connection slot, or refuse.
+    ///
+    /// The check and the increment are one `fetch_update`, so two sockets arriving
+    /// in the same instant cannot both be told there was room for the last slot.
+    /// That is the whole reason this is not a read followed by an add.
+    pub fn admit_connection(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let ceiling = match self.config.max_connections {
+            crate::config::Limit::Unlimited => {
+                return {
+                    self.connections.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            }
+            crate::config::Limit::Of(value) => usize::try_from(value).unwrap_or(usize::MAX),
+        };
+        let taken = self
+            .connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < ceiling).then_some(open + 1)
+            });
+        if taken.is_err() {
+            self.connections_refused.fetch_add(1, Ordering::Relaxed);
+        }
+        taken.is_ok()
+    }
+
+    /// Give one connection slot back. Called exactly once per successful
+    /// ``admit_connection``, when the reader loop ends however it ends.
+    pub fn release_connection(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Saturating rather than wrapping. A decrement below zero would be a
+        // pairing bug, and wrapping to `usize::MAX` would turn it into a relay
+        // that refuses every future connection.
+        let _ = self
+            .connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                Some(open.saturating_sub(1))
+            });
+    }
+
+    /// Sockets open right now. For `/readyz` and the tests.
+    pub fn open_connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Milliseconds since the epoch, from whichever clock this state carries.
@@ -226,6 +331,16 @@ impl RelayState {
             },
             frozen_groups,
             release,
+            calls: self.config.calls_label(),
+            call_stats: CallStats {
+                open: self.calls.open_calls().await as u64,
+                media_shed: self.calls.shed(),
+                media_denied: self.calls.denied(),
+                connections: self.open_connections() as u64,
+                connections_refused: self
+                    .connections_refused
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
             ready,
         }
     }
@@ -350,9 +465,34 @@ async fn relay_socket(
     // connection info, which is every unit test: the budget then falls back to the
     // one the joiner cannot forge, which is its own device.
     let source = peer.map(|axum::extract::ConnectInfo(address)| address.ip().to_string());
+    // The cap, before the upgrade rather than after it.
+    //
+    // `operations.md` recorded the absence of this as a known gap: the per
+    // connection send queue is bounded in bytes, and nothing bounded the number of
+    // connections, so instance memory was the budget times however many clients
+    // chose to connect. Refusing here costs the peer one HTTP response and costs
+    // this process nothing; refusing after the upgrade would mean allocating the
+    // queues the cap exists to bound.
+    //
+    // 503 with `Retry-After`, which is the transport's own way of saying what
+    // `quota` says in a frame. There is no frame to say it in: the socket does not
+    // exist yet.
+    if !state.admit_connection() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            "at capacity\n",
+        )
+            .into_response();
+    }
     // A connection can outlive any one clock tick. `serve_connection` asks the
     // relay clock for each received message so an accepted envelope records its
     // receipt time, while session rules still receive an injected value.
+    // The slot is released by `serve_connection` itself, on every path out of it,
+    // rather than here: `on_upgrade` hands the future to the runtime and returns,
+    // so anything written after this line would run while the connection was still
+    // open. A slot leaked once per connection would be a relay that stops
+    // accepting after `WEALD_RELAY_MAX_CONNECTIONS` clients have ever visited.
     ws.on_upgrade(move |socket| crate::ws::serve_connection(socket, state, source))
 }
 
@@ -376,17 +516,29 @@ async fn relay_socket(
 /// because a network boundary is not an authentication boundary: every other
 /// service in a provider environment can reach this port.
 pub fn private_router(state: Arc<RelayState>) -> Router {
-    let operator = state.config.operator_token.is_some();
     let router = Router::new()
         .route("/readyz", get(readyz))
         .route("/healthz", get(healthz));
-    let router = if operator {
-        router.route("/admitted", get(admitted))
-    } else {
-        router
+    // The token is carried into the handler rather than read back out of the
+    // configuration there. Both would work, but reading it again inside the
+    // handler means the handler has a branch for "mounted with no token", which
+    // this function has just made impossible: dead code on the one path where a
+    // wrong answer hands out bootstrap authority, and dead code cannot be tested.
+    let router = match state.config.operator_token.clone() {
+        Some(token) => router.route(
+            "/admitted",
+            get(admitted).layer(axum::Extension(OperatorToken(token))),
+        ),
+        None => router,
     };
     router.with_state(state)
 }
+
+/// The operator bearer this relay was configured with, carried to the one handler
+/// that checks it. Present by construction: the route is mounted with it or not
+/// mounted at all.
+#[derive(Clone)]
+struct OperatorToken(String);
 
 /// What `/admitted` answers. One field, and the field is a number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -400,10 +552,7 @@ pub struct Admitted {
 /// poll, so a comparison that returned early would leak its length and then its
 /// bytes to anything that can reach the port, which on a provider network is
 /// more than just us.
-fn operator_authorized(state: &RelayState, headers: &axum::http::HeaderMap) -> bool {
-    let Some(expected) = state.config.operator_token.as_deref() else {
-        return false;
-    };
+fn operator_authorized(expected: &str, headers: &axum::http::HeaderMap) -> bool {
     let Some(offered) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -432,9 +581,10 @@ fn operator_authorized(state: &RelayState, headers: &axum::http::HeaderMap) -> b
 /// a wrong answer is the trust-root race in `specs/backend/cloud/provisioning.md`.
 async fn admitted(
     State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    if !operator_authorized(&state, &headers) {
+    if !operator_authorized(&expected, &headers) {
         return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
     }
     let Some(database) = state.database.as_ref() else {

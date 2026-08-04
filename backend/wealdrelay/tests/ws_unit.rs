@@ -554,3 +554,91 @@ async fn many_small_frames_still_stop_at_the_frame_count() {
     );
     assert!(sender.queued_bytes() < wealdrelay::ws::SEND_QUEUE_BYTE_BUDGET);
 }
+
+// MARK: The version 2 work items, against a relay with no database
+
+#[tokio::test]
+async fn a_beat_against_a_relay_that_cannot_look_is_refused_and_never_fanned_out() {
+    // `retry/backpressure`, from `authorize_group`, and the whole point is that a
+    // relay which cannot check the access set does not fan the beat out anyway. A
+    // presence claim admitted without a check is a stranger asserting they are in
+    // a room.
+    let state = blind();
+    let mut session = Session::new(&state.config);
+    let (sender, mut receiver) = outbound_channel();
+
+    assert!(
+        perform(
+            &sender,
+            &state,
+            &mut session,
+            CONNECTION,
+            Work::PublishLive {
+                group: vec![0x30; 32],
+                epoch: 3,
+                ct: vec![1, 2, 3],
+            },
+            NOW,
+        )
+        .await
+    );
+    assert_eq!(error_code(&queued(&mut receiver)), ErrorCode::Backpressure);
+}
+
+#[tokio::test]
+async fn a_keys_frame_against_a_relay_that_cannot_look_is_told_to_retry() {
+    use wealdrelay::frame::KeysBody;
+    let state = blind();
+    let mut session = Session::new(&state.config);
+    let (sender, mut receiver) = outbound_channel();
+
+    assert!(
+        perform(
+            &sender,
+            &state,
+            &mut session,
+            CONNECTION,
+            Work::KeyPackages {
+                body: KeysBody::Publish {
+                    packages: vec![vec![1; 16]],
+                },
+            },
+            NOW,
+        )
+        .await
+    );
+    assert_eq!(error_code(&queued(&mut receiver)), ErrorCode::Backpressure);
+}
+
+#[tokio::test]
+async fn a_keys_frame_from_a_session_with_no_workspace_is_refused_like_a_stranger() {
+    use wealdrelay::frame::KeysBody;
+    // Reachable with `WEALD_RELAY_ACCESS_SET=off`, the one mode that admits a
+    // session without a workspace claim. A shelf belongs to a workspace, so a
+    // session that carries none cannot be shown to be entitled to one, and the
+    // honest answer is the refusal a stranger gets rather than an admission by
+    // default.
+    let state = Arc::new(RelayState::new(config(), None, None));
+    let mut session = Session::new(&state.config);
+    let (sender, mut receiver) = outbound_channel();
+    for body in [
+        KeysBody::Published { remaining: 1 },
+        KeysBody::Fetch {
+            device: vec![0x11; 32],
+            count: 1,
+        },
+    ] {
+        assert!(
+            perform(
+                &sender,
+                &state,
+                &mut session,
+                CONNECTION,
+                Work::KeyPackages { body },
+                NOW,
+            )
+            .await
+        );
+        assert_eq!(error_code(&queued(&mut receiver)), ErrorCode::Backpressure);
+    }
+}

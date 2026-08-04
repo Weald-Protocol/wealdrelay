@@ -37,15 +37,15 @@ are not extensible without a protocol version bump.
 | `denied/writer_not_in_access_set` | denied | Authenticated session device absent from the current `ACCESS` set. | state hash |
 | `denied/group_unknown` | denied | Group id not known to this relay. | |
 | `denied/service_read_only` | denied | Durable `SEND` under `WEALD_RELAY_WRITE_MODE=read_only`. `SUB`, `RECON`, backups, export and recovery reads continue. | non-content reason code |
-| `denied/invite_code_invalid` | denied | Wrong code half. Counts against the 5-per-token attempt budget. | attempts remaining |
-| `denied/invite_seat_spent` | denied | Every seat on the invite is taken. | |
-| `denied/invite_expired` | denied | Past the invite's expiry, evaluated against the client's own clock. | |
+| `denied/invite_code_invalid` | denied | Wrong code half. Counts against the 5-per-token attempt budget. Answered inside the `JOIN` body's own response rather than as a frame-level error, which is why this row and the two below it are absent from the Rust `ErrorCode` enum and present in the client's `RelayError.Code`: the relay does not emit them as `ERROR` frames, and a client that could not name a code it is shown would render it as an unknown error. | attempts remaining |
+| `denied/invite_seat_spent` | denied | Every seat on the invite is taken. Carried by the `JOIN` response; see the note on `invite_code_invalid`. | |
+| `denied/invite_expired` | denied | Past the invite's expiry, evaluated against the client's own clock. Carried by the `JOIN` response; see the note on `invite_code_invalid`. | |
 | `denied/wrap_not_newer` | denied | A `WRAP` frame whose epoch does not advance the stored wrap in that `(group, tag)` slot. The bytes are well formed and would have been accepted an epoch ago, which is the replay the monotonicity rule in `../../relay/groups.md` refuses. The client re-derives the current epoch's wrap; it never resends this one. | the stored epoch |
 | `denied/group_frozen` | denied | Group frozen by a retention chain or an in-flight commit. | state hash |
 | `quota/storage_exhausted` | quota | Instance storage limit reached. | retry-after, the limit |
 | `quota/rate_limited` | quota | Per-IP or per-connection rate limit. | retry-after |
 | `quota/seats_exhausted` | quota | Workspace seat limit. | the limit |
-| `quota/group_ingress_limited` | quota | The admission-blind abuse budget in `../../relay/wire.md`: 8 MiB per principal per target group per minute, 64 MiB per workspace per minute, or 32 MiB of undelivered backlog. Charged before persistence. | retry-after, the limit |
+| `quota/group_ingress_limited` | quota | Two things, both ingress aimed at one group. The admission-blind abuse budget in `../../relay/wire.md`: 8 MiB per principal per target group per minute, 64 MiB per workspace per minute, or 32 MiB of undelivered backlog, charged before persistence. And, since protocol version 3, the media budgets in `../../relay/calls.md`: 60 `MEDIA` frames per stream per second, 1 MiB per connection per minute, and 32 distinct streams tracked per connection. | retry-after, the limit |
 | `version/protocol_unsupported` | version | `v` unsupported by this relay. | supported range |
 | `version/below_client_floor` | version | Relay's version is below the client's pinned floor. | relay version |
 
@@ -55,7 +55,25 @@ which meant `scripts/spec-check.sh` could not see that it also had no negative
 vector: a code invisible to the check that exists to close this gap. It is written
 here with its class prefix, which the prose in `wire.md` omits.
 
-Its vectors landed separately, and all three limits get one: the per-principal
+Until protocol version 3 it was a code with a row here, a paragraph in `wire.md`
+and **no reference anywhere in `backend/wealdrelay/src/`**. That is the worse
+half of the failure this table exists to catch: a code invisible to the check is a
+gap somebody will find, and a code visible to the check but enforced nowhere is
+protection somebody is relying on. The media limits in `../../relay/calls.md` are
+where it starts being emitted, and `backend/wealdrelay/tests/calls_unit.rs` and
+`tests/calls_socket.rs` assert this exact code rather than merely that an error
+occurred.
+
+One rule about it is specific to the media path and belongs here because it is
+about what a client is told rather than about what is enforced: a connection over
+a media limit is answered **at most once a second**. Every frame over the limit is
+refused either way; what is economised is the complaint. Answering each frame of a
+600-per-second flood is an amplifier, and the answers queue on the flooder's own
+bounded outbound queue, so a relay that complained about each one would fill that
+queue and turn a rate limit into a disconnect. A client learns the fact and reads
+`retry-after`; the next 599 answers would say the same thing.
+
+Its vectors landed separately, and all three of the original limits get one: the per-principal
 per-group minute, the per-workspace minute, and the standing undelivered backlog.
 Three more sit beside them and are the reason the set is worth reading. One holds
 exactly at the per-principal boundary and must be accepted, because wire.md sizes

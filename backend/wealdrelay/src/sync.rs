@@ -220,6 +220,7 @@ pub async fn subscribe(
     connection: ConnectionId,
     group: Vec<u8>,
     from_seq: u64,
+    protocol_version: u16,
 ) -> bool {
     let head = crate::ws::head_seq(state, &group).await;
 
@@ -246,7 +247,7 @@ pub async fn subscribe(
     // (`specs/backend/relay/migration.md`, dual transport).
     state
         .hub
-        .subscribe(&group, connection, sender.clone())
+        .subscribe(&group, connection, sender.clone(), protocol_version)
         .await;
 
     let Some(database) = &state.database else {

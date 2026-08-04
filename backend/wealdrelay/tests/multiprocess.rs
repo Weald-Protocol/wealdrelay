@@ -120,6 +120,15 @@ impl Relay {
             .stderr(Stdio::piped());
         if let Some(redis) = redis {
             command.env("WEALD_RELAY_REDIS_URL", redis);
+            // A Redis url is how `server.md` says a deployment declares more than
+            // one instance, and step 30 made `process` fanout refuse to start in
+            // that shape rather than serve every member half the room. This suite
+            // is about sequence assignment across processes and not about
+            // presence, so it declares the ephemeral path off, which is the
+            // deployment shape a multi-instance operator on this build actually
+            // has: no beats, presence reported as unavailable, and every durable
+            // guarantee intact.
+            command.env("WEALD_RELAY_LIVE", "off");
         }
         let child = command.spawn().expect("spawn a relay");
         Self { child, port }
@@ -426,6 +435,12 @@ async fn sequence_assignment_is_total_ordered_and_gap_free_across_three_processe
     // set on all three because `ci` runs them that way, and the point of setting it
     // is to show that the sequence numbers do not come from it: Redis is fanout, and
     // Postgres is the source of truth for whether an envelope was accepted.
+    //
+    // Since step 30 that url also declares a second instance, so `Relay::start`
+    // turns the ephemeral path off alongside it. That is not a workaround: it is
+    // the configuration a three-instance deployment on this build has, and running
+    // this suite in any other shape would be running it against a deployment the
+    // relay refuses to start.
     let redis_port =
         std::env::var("WEALD_STACK_REDIS_PORT").unwrap_or_else(|_| "54079".to_string());
     let redis = format!("redis://127.0.0.1:{redis_port}");

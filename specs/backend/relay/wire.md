@@ -304,8 +304,10 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0001` | `doc.change` | One Automerge change for the document named in the body header. |
 | `0x0002` | `doc.snapshot` | Compacted Automerge `save()` output. Checkpointing, and the payload an `open`-history invite bundle points at. |
 | `0x0010` | `chat.message` | Message text plus references. Structurally a `doc.change` on a channel doc, kept separate so chat can be tailed without loading the doc. |
+| `0x0011` | `ticket.op` | One `.wealdticket` file, whole, as UTF-8. Whole-file rather than a delta because the multi-writer contract on a ticket is a compare-and-swap on its revision, which belongs to the client's ticket store rather than to a merge. Written since step 2 by `EnvelopeKind.ticketFile` and missing from this table until step 31, which is exactly the kind of gap the numbering map below exists to make visible. |
 | `0x0020` | `roster.update` | Roster document change. Workspace group only. |
 | `0x0021` | `roster.revoke` | Revocation plus the epoch change that enforces it. |
+| `0x0022` | `dm.welcome` | One MLS Welcome into a two-person group, addressed by a blinded tag over the target key package reference and carrying no group id, published in the workspace root group because the two devices share no other. See `specs/backend/relay/private-messaging.md`. |
 | `0x0030` | `media.ref` | Ciphertext hash, per-blob key, mime, size, dimensions. |
 | `0x0040` | `git.patch` | Patch bytes, base commit, target ticket. Proposal only, never applied by the receiver. |
 | `0x0041` | `git.status` | CI or review status for a patch. |
@@ -319,13 +321,52 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0071` | `checkpoint` | Signed complete snapshot manifest: author barriers, index snapshot and every document snapshot/head required to replace dropped history. Makes compaction chain-safe. See `specs/backend/relay/lifecycle.md`. |
 | `0x0073` | `snapshot` | The replacement content a `checkpoint` names: a document snapshot, or the index snapshot that discovers the inventory. Referenced by envelope hash from the checkpoint and from the `drop_before` instruction, and kept forever by the relay as an anchor. Added in step 10: `lifecycle.md` requires the relay to verify "that all named snapshot envelopes are present and retained before deleting anything below the barrier", and this table had no kind for the envelopes that rule names. See `specs/backend/relay/lifecycle.md`. |
 | `0x0080` | `media.retain` | Signed set of media ciphertext hashes this group still references. Input to blob GC. See `specs/backend/relay/media.md`. |
-| `0x00F0` | `ephemeral` | Presence, typing, cursor. Not persisted by the relay. |
+| `0x0090` | `agent.card` | The workspace-visible, non-secret representation of a bot: agent id, host kind, owner principal, aliases, scopes, closed capability set, availability, profile version. Never a prompt, a credential, a local path or a tool secret, which is asserted by walking the encoded card. See `specs/agents/networked/protocol.md`. |
+| `0x0091` | `agent.invoke` | An explicit request that exactly one published agent act, emitted by the composer alongside the human-readable `chat.message` and never inferred from message text by a receiving client. A text mention is not execution authority. |
+| `0x0092` | `agent.lifecycle` | Convergent state for one `invocationID`: accepted, running, or one terminal record, signed by the executing host. Only terminal prose becomes a `chat.message`; progress is bounded metadata. |
+| `0x0093` | `agent.lease` | Manual host handoff and duplicate defence for a user-hosted agent. Never published by an organization agent, which has no second device and claims in its gateway's database instead. |
+| `0x00F0` | `ephemeral` | **Reserved and never used.** Retired to the `LIVE` frame; see below. |
 
 Kind numbers are permanent. Unknown kinds are stored and ignored, so an old
 client does not lose data written by a new one.
 
-`0x00F0` is the only kind the relay is permitted to drop. It fans out to
-currently-connected subscribers and is never written to Postgres.
+`0x00F0` was defined as presence, typing and cursor, "the only kind the relay is
+permitted to drop", fanned out to connected subscribers and never written to
+Postgres. That instruction has no implementation and never could have one: under
+`enc: 1` the kind is inside `ct`, so a relay told to drop one kind and keep every
+other cannot tell them apart. It is the same hole `WRAP` and `HANDSHAKE` were
+pulled out of the envelope to close, and the answer is the same. Ephemeral
+traffic is the `LIVE` frame, where the routing and shedding decisions are visible
+and the content is not. The kind number stays allocated forever, unused, pointing
+at `specs/backend/relay/presence.md`.
+
+Two numbering spaces exist and a reader should be warned: this table is the
+protocol's kind space, and `EnvelopeKind` in `Sources/Sync/EnvelopePayload.swift`
+is the client's, with `chatEntry = 1` against `0x0010 chat.message` here. Neither
+is renumbered, because both are on a wire and renumbering either would silently
+reinterpret every record already written under the old value.
+
+The map, which was warned about for six steps and never written until step 31:
+
+| `EnvelopeKind` | Raw | Protocol kind | Number |
+| --- | --- | --- | --- |
+| `chatEntry` | 1 | `chat.message` | `0x0010` |
+| `ticketFile` | 2 | `ticket.op` | `0x0011` |
+| `headAttest` | 3 | `head.attest` | `0x0070` |
+| `chainReset` | 4 | `chain.reset` | `0x0072` |
+| `checkpoint` | 5 | `checkpoint` | `0x0071` |
+| `snapshot` | 6 | `snapshot` | `0x0073` |
+| `rosterEntry` | 7 | `roster.update` | `0x0020` |
+| `rosterRevoke` | 8 | `roster.revoke` | `0x0021` |
+| `directWelcome` | 9 | `dm.welcome` | `0x0022` |
+| `agentCard` | 10 | `agent.card` | `0x0090` |
+| `agentInvoke` | 11 | `agent.invoke` | `0x0091` |
+| `agentLifecycle` | 12 | `agent.lifecycle` | `0x0092` |
+| `agentLease` | 13 | `agent.lease` | `0x0093` |
+
+`EnvelopeKind.protocolKind` is the same map in code, so a case added on the client
+without a decision about its protocol number does not compile. Where the two
+disagree this table is the protocol and the code is what gets corrected.
 
 ## Documents
 
@@ -393,8 +434,29 @@ WRAP      client to relay, one recovery wrap, stored under its blinded tag
 HANDSHAKE one MLS handshake message for a group, stored in order and fanned out
 JOIN      one step of an invite redemption, before the joiner can authenticate
 BLOB      media upload and download tickets, per specs/backend/relay/media.md
+LIVE      one ephemeral message for a group, fanned out and never stored
+KEYS      publish or fetch key packages, per specs/backend/relay/private-messaging.md
+CALL      one call signalling frame, fanned out at the group and never stored
+MEDIA     one encrypted audio frame, routed at a call's participants and never stored
 BYE       clean close
 ```
+
+`LIVE` and `KEYS` are protocol version 2 and are described in
+`specs/backend/relay/presence.md` and
+`specs/backend/relay/private-messaging.md`. A version 1 client is never sent
+either one.
+
+`CALL` and `MEDIA` are protocol version 3 and are described in
+`specs/backend/relay/calls.md`, with the design behind them in
+`specs/peer-calls.md`. A client below version 3 is never sent either one. They
+are the second and third frames after `LIVE` that the relay may shed under
+pressure, and like `LIVE` they are never sequenced, never stored, never returned
+by a `RECON` round, never attested and never named in a `drop_before` manifest.
+
+`MEDIA` carries no group and that is deliberate rather than an omission: the
+group is checked once, when a `CALL` admits the connection to that call id, and
+repeating the check on a path that carries fifty frames a second per stream would
+put a Postgres read into the media path. `calls.md` carries the whole argument.
 
 `WRAP` was added in step 8, and the reason is a hole in the sentence this
 document already contained. The event-kind table below says `recovery.wrap` is
@@ -823,15 +885,54 @@ off is not the default.
 | Media blob | 2 GiB | Object store practicalities. |
 | Envelopes per connection per minute | 600 | Abuse control without impeding agents. Per connecting device key, which is the only identity the relay has. Per-agent budgets are enforced in the app, since the relay cannot see an author (`specs/backend/relay/agents.md`). |
 | Groups per connection | 256 | Bounded server-side subscription state. |
-| Key packages per device | 100 outstanding | Prevents exhaustion. |
+| Key packages per device | 100 outstanding | Prevents exhaustion. Published and fetched over `KEYS`, one-time delivery (`specs/backend/relay/private-messaging.md`). |
+| `LIVE` `ct` | 4 KiB | A beat is tens of bytes. The cap stops the ephemeral path becoming an unlogged bulk channel. |
+| `LIVE` frames per connection per minute | 60 | Budgeted separately from the 600 envelope allowance, so presence can never starve a durable write. |
+| `KEYS` frames per connection per minute | 30 | A roster prefetch is a startup burst, not a stream. |
+| `MEDIA` `ct` | 1500 bytes | One Ethernet MTU, which is four hundred times a 20 ms AAC-ELD frame. It bounds an attacker rather than fitting a codec. |
+| `MEDIA` frames per stream per second | 60 | Against a codec producing fifty, so a client that jitters a frame across a window boundary is not punished and one at ten times the rate is. Refused with `quota/group_ingress_limited`, and the refusal is reported at most once a second because answering every frame of a flood is an amplifier (`calls.md`). |
+| `MEDIA` bytes per connection per minute | 1 MiB | A 24 kbps stream is about 190 KiB a minute including overhead, so this admits one stream comfortably and refuses a connection pushing a file down the media path. |
+| Streams tracked per connection | 32 | A bound on the budget's own memory, so a peer cannot make the relay hold a window per invented stream id. |
+| `CALL` `body` | 4 KiB | The `LIVE` ceiling, for the same reason: a signalling body is a small sealed struct, and a larger one is a client moving something durable down an ephemeral path. |
+| `CALL` frames per connection per minute | 120 | Signalling is a handful of frames per call. Generous for a human, narrow for a loop, and an order of magnitude below media because a `CALL` is fanned out at the whole group. |
+| Participants per call | 5 | Relayed egress grows as n(n-1), and five is where the quadratic term stops being free. |
+| Concurrent calls per instance | `WEALD_RELAY_MAX_CONCURRENT_CALLS` | No default, ever: call capacity is a sizing decision about one instance's bandwidth. Required when `WEALD_RELAY_CALLS=on`. |
+| Concurrent connections per instance | 256, or `WEALD_RELAY_MAX_CONNECTIONS` | Closes the gap `specs/backend/relay/operations.md` recorded in words. At the 8 MiB per-connection queue ceiling that is two gibibytes at the absolute worst case. Refused before the WebSocket upgrade, with HTTP 503 and `Retry-After`. |
 
 ## Versioning
 
-`v` in the envelope header and an explicit range in `CONNECT`. A client offers
-`min_version` and `max_version`; the relay selects the highest mutually supported
-version and signs the selection into the connection challenge. The client aborts
-if the selected version is below its minimum or differs from the pinned policy,
-so a network attacker cannot silently downgrade a connection.
+`v` in the envelope header, and a range in the handshake that is carried by one
+field rather than two.
+
+`CONNECT` has always had a single `version`, and it is the client's **maximum**
+offer. The client's minimum is `MIN_PROTOCOL_VERSION`, a build constant on both
+sides, 1 for this release. The relay selects `min(offered, PROTOCOL_VERSION)` and
+states the selection in `CONNECT_ACK`; an offer below `MIN_PROTOCOL_VERSION` is
+refused with `version/protocol_unsupported` carrying the relay's own maximum, and
+the connection ends. The client aborts if the selection is below its own minimum
+or above its own maximum, so a network attacker cannot silently downgrade a
+connection: the selection is a number the client checks, not one it accepts.
+
+This prose used to describe two fields, `min_version` and `max_version`, which
+`Frame::Connect` never carried. The artifact outranks the prose (`ADR-0008`), so
+the sentence was corrected rather than the frame: the shape of `CONNECT` is on the
+wire, and changing it is the one thing a version negotiation must not require. The
+selection is signed into the connection challenge exactly as before, because the
+challenge is derived over the requested groups and the connection nonce and the
+relay's clock, and a client that was answered with a selection it did not expect
+never reaches the point of signing anything.
+
+Version 2 adds the `LIVE` and `KEYS` frames and the `0x0022` kind, and changes
+nothing about the envelope, so a version 1 client keeps working against a version
+2 relay and simply never receives a frame it does not know. That is what a
+frame-tag addition is allowed to be: the selected version, not the tag set, is
+what a client checks.
+
+Version 3 adds the `CALL` and `MEDIA` frames and changes neither an envelope nor
+an existing frame, so the same sentence holds one version up: a version 1 or 2
+client keeps working against a version 3 relay. Fanout filters on the negotiated
+version at 3 for both, exactly as it filters at 2 for `LIVE`, and a client that
+was never sent a frame it cannot name never has to decide what to do with one.
 
 The relay accepts any envelope version it knows and stores unknown-kind payloads
 verbatim. Breaking the envelope means a new version number, a published

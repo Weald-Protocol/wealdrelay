@@ -62,6 +62,14 @@ pub async fn bind(
             address: state.config.listen.clone(),
             reason: error.to_string(),
         })?;
+    // Nagle off, on the public listener only.
+    //
+    // `specs/peer-calls.md` section 2: a 20 ms media frame is exactly the traffic
+    // Nagle was designed to coalesce, and coalescing it is pure added latency with
+    // no bandwidth won, because the frames are already the size they are going to
+    // be. The observability listener is left alone: it carries request-response
+    // JSON, which is what Nagle is good for.
+    set_nodelay(&public);
     let private = tokio::net::TcpListener::bind(&state.config.observability_listen)
         .await
         .map_err(|error| ServeError::Bind {
@@ -69,6 +77,98 @@ pub async fn bind(
             reason: error.to_string(),
         })?;
     Ok((public, private))
+}
+
+/// `TCP_NODELAY`, set on the listening socket so every socket accepted from it
+/// inherits it.
+///
+/// ## Why the listener and not the connection
+///
+/// Because there is no connection to reach. `axum::serve` in 0.7 takes a
+/// `tokio::net::TcpListener` by value and accepts inside its own loop; the
+/// accepted `TcpStream` is never handed to this crate, and `IncomingStream`
+/// exposes two addresses and no socket. Reaching it would mean either a direct
+/// `hyper` dependency and a hand-rolled accept loop, or a different HTTP crate,
+/// and `specs/peer-calls.md` section 4 spends the whole dependency budget on
+/// having neither.
+///
+/// Inheritance is a real guarantee rather than a hope, and it is asserted rather
+/// than assumed: `tests/nodelay.rs` sets the option on a listener, accepts a real
+/// connection and reads the option back off the accepted socket, so the platform
+/// the suite runs on has proved it. Both platforms this relay runs on copy the
+/// option to the child socket, Linux through `sk_clone_lock` and Darwin through
+/// `sonewconn`.
+///
+/// ## Why the FFI is written out here
+///
+/// Neither `std` nor `tokio` exposes `setsockopt` on a listener, and the crates
+/// that do (`socket2`, `libc` as a runtime dependency) are crates. The zero new
+/// crates rule in `specs/peer-calls.md` section 4 is not a stylistic preference:
+/// three independent builders have to agree on this image's digest
+/// (`specs/backend/relay/verification.md`), and every dependency is a thing they
+/// each have to fetch and agree about. Two constants and one extern declaration
+/// is a smaller surface than a crate, and both constants are fixed by POSIX and
+/// identical on every platform this builds for.
+///
+/// A failure is logged and not fatal. Nagle costs latency on a call and nothing
+/// at all on chat, so a relay that could not clear it is degraded rather than
+/// broken, and refusing to start would take a working chat relay down for a
+/// feature that may be switched off.
+fn set_nodelay(listener: &tokio::net::TcpListener) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        // POSIX: `IPPROTO_TCP` is 6 by the IANA protocol number, and
+        // `TCP_NODELAY` is 1 on Linux and on every BSD including Darwin.
+        const IPPROTO_TCP: i32 = 6;
+        const TCP_NODELAY: i32 = 1;
+
+        extern "C" {
+            fn setsockopt(
+                socket: i32,
+                level: i32,
+                name: i32,
+                value: *const core::ffi::c_void,
+                len: u32,
+            ) -> i32;
+        }
+
+        let enable: i32 = 1;
+        // Safety: the file descriptor is owned by `listener` and outlives this
+        // call, and the pointer is to a live `i32` whose length is passed
+        // alongside it, which is the contract `setsockopt` documents for an
+        // integer-valued option.
+        let outcome = unsafe {
+            setsockopt(
+                listener.as_raw_fd(),
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                std::ptr::addr_of!(enable).cast(),
+                u32::try_from(std::mem::size_of::<i32>()).unwrap_or(4),
+            )
+        };
+        if outcome != 0 {
+            let reason = std::io::Error::last_os_error().to_string();
+            tracing::warn!(
+                reason,
+                "could not clear Nagle on the public listener; call latency will include the \
+                 coalescing delay"
+            );
+        }
+    }
+}
+
+/// The same call the relay makes on its own listener, reachable from a test.
+///
+/// Public because the property it depends on is a platform one: an accepted
+/// socket inherits the option from the socket it was accepted on. That cannot be
+/// asserted through `bind`, because `axum::serve` owns the accept loop and never
+/// yields the accepted stream, so `tests/calls_capacity.rs` performs its own
+/// accept against this exact function. A test that reimplemented the `setsockopt`
+/// would be a test of the test.
+pub fn set_nodelay_for_test(listener: &tokio::net::TcpListener) {
+    set_nodelay(listener);
 }
 
 /// Serve both routers until `until` completes.

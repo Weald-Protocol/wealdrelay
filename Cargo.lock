@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "weald-mls"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "hex",
@@ -4449,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "wealdrelay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "argon2",
  "aws-config",

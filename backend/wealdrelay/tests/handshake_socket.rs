@@ -392,6 +392,7 @@ async fn a_subscriber_that_cannot_take_its_replay_ends_the_connection() {
         relay.state.hub.connect(),
         group.clone(),
         0,
+        wealdrelay::frame::PROTOCOL_VERSION,
     )
     .await;
     assert!(

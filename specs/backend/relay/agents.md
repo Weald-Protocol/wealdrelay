@@ -36,6 +36,27 @@ by the agent's key, over content the agent produced. Attribution is unchanged.
 Every line an agent writes is still attributable to that agent and to the human
 who delegated it.
 
+## The second shape: organization agents
+
+Everything above describes a user's agent, hosted on that person's Mac. There is
+a second shape, and this file's title question has a second answer for it.
+
+An organization agent (`@reviewer.acme`) is a service account owned by an
+organization rather than a person. It has no owner device, so it cannot proxy
+through a local app, and it does connect: it is a named principal in the access
+set with its own MLS membership, running as `backend/weald-agent-gateway`. That
+is a real widening of who holds epoch secrets and it is why the org agent gets
+its own disclosure sheet, its own group-kind rules and its own track.
+
+What does not widen: the `wealdrelay` crate and process are unchanged by the
+entire feature, hold no provider credential, decrypt nothing, and gain zero
+lines. Inference runs in a separate binary from the same codebase, with the
+provider key unwrapped in a third one that has no relay credential at all. The
+argument for why the literal reading of "run the model in the relay" is not
+buildable, and what is built instead, is `specs/agents/networked/org-agents.md`.
+
+The rules below apply to both shapes unless they name a device.
+
 ## Key custody
 
 - The agent's private key lives in the Keychain, in an item owned by the Weald

@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Dicyanin Labs
+//! The key-package shelf against real Postgres.
+//!
+//! One claim here is worth more than the rest, and it is the reason the fetch is
+//! a single statement: **a package is never served twice.** Serving the same one
+//! to two callers would hand two different private conversations the same joiner
+//! leaf key, which is the failure this shelf exists to prevent. It is asserted
+//! across concurrent interleavings rather than argued for in a comment.
+
+mod support;
+
+use std::collections::HashSet;
+
+use wealdrelay::keys::{store, MAX_OUTSTANDING};
+
+use support::{config_for, default_device, other_device, Running, Scratch};
+use wealdrelay::health::Clock;
+
+const CLOCK: u64 = 1_700_000_000_000;
+const WORKSPACE: &str = "acme";
+
+async fn pool(relay: &Running) -> &sqlx::PgPool {
+    relay.state.database.as_ref().expect("a database").pool()
+}
+
+fn key_bytes(device: &ed25519_dalek::SigningKey) -> Vec<u8> {
+    use ed25519_dalek::VerifyingKey;
+    let verifying: VerifyingKey = device.verifying_key();
+    verifying.to_bytes().to_vec()
+}
+
+fn package(seed: u8) -> Vec<u8> {
+    vec![seed; 48]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publishing_fills_the_shelf_the_auth_ack_has_been_counting_since_step_5() {
+    let scratch = Scratch::new("keys_publish").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    let published = store::publish(pool, WORKSPACE, &device, &[package(1), package(2)])
+        .await
+        .expect("publish");
+    assert_eq!(published, store::Published::Stored { remaining: 2 });
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_consumes_and_the_same_package_is_never_served_twice() {
+    let scratch = Scratch::new("keys_one_time").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    let packages: Vec<Vec<u8>> = (0..16).map(package).collect();
+    store::publish(pool, WORKSPACE, &device, &packages)
+        .await
+        .expect("publish");
+
+    // Eight concurrent fetchers of two each, which is exactly the shelf. Every
+    // package must come out once and no package twice, whatever order the
+    // statements interleave in.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let device = device.clone();
+        handles.push(tokio::spawn(async move {
+            store::fetch(&pool, WORKSPACE, &device, 2)
+                .await
+                .expect("fetch")
+        }));
+    }
+    let mut served: Vec<Vec<u8>> = Vec::new();
+    for handle in handles {
+        served.extend(handle.await.expect("join"));
+    }
+    let distinct: HashSet<Vec<u8>> = served.iter().cloned().collect();
+    assert_eq!(
+        served.len(),
+        distinct.len(),
+        "a key package was served twice, which would hand two dm groups one joiner leaf key"
+    );
+    assert_eq!(served.len(), 16, "the whole shelf should have been served");
+
+    // And the shelf is empty afterwards, which is not an error.
+    assert!(store::fetch(pool, WORKSPACE, &device, 1)
+        .await
+        .expect("fetch")
+        .is_empty());
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_the_cap_stores_nothing_rather_than_evicting_the_oldest() {
+    // A silent discard would produce an unaddable member with no error anywhere:
+    // the publisher believes it has a shelf, and the first person to open a
+    // conversation with it finds nothing and is told nothing.
+    let scratch = Scratch::new("keys_cap").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    let full: Vec<Vec<u8>> = (0..MAX_OUTSTANDING)
+        .map(|index| vec![u8::try_from(index % 251).unwrap_or(0); 48])
+        .collect();
+    assert_eq!(
+        store::publish(pool, WORKSPACE, &device, &full)
+            .await
+            .expect("publish"),
+        store::Published::Stored {
+            remaining: u32::try_from(MAX_OUTSTANDING).unwrap()
+        }
+    );
+    assert_eq!(
+        store::publish(pool, WORKSPACE, &device, &[package(200)])
+            .await
+            .expect("publish"),
+        store::Published::OverCap
+    );
+    // Nothing was taken, so the shelf still holds exactly the cap.
+    let served = store::fetch(pool, WORKSPACE, &device, 8)
+        .await
+        .expect("fetch");
+    assert_eq!(served.len(), 8);
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_devices_shelf_is_not_anothers() {
+    let scratch = Scratch::new("keys_per_device").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let ada = key_bytes(&default_device());
+    let bo = key_bytes(&other_device());
+
+    store::publish(pool, WORKSPACE, &ada, &[package(1)])
+        .await
+        .expect("publish");
+    assert!(
+        store::fetch(pool, WORKSPACE, &bo, 1)
+            .await
+            .expect("fetch")
+            .is_empty(),
+        "one device's fetch drew from another's shelf"
+    );
+    assert_eq!(
+        store::fetch(pool, WORKSPACE, &ada, 1)
+            .await
+            .expect("fetch")
+            .len(),
+        1
+    );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_workspaces_shelf_is_not_anothers() {
+    // The membership half of the same rule. A device key is global and a shelf is
+    // not: a fetch scoped only by device would let a member of one workspace draw
+    // down a shelf published in another.
+    let scratch = Scratch::new("keys_per_workspace").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    store::publish(pool, WORKSPACE, &device, &[package(1)])
+        .await
+        .expect("publish");
+    assert!(store::fetch(pool, "other", &device, 1)
+        .await
+        .expect("fetch")
+        .is_empty());
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_shelf_is_an_answer_and_not_an_error() {
+    let scratch = Scratch::new("keys_empty").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+
+    // The correct client behaviour is to wait for the peer to top up rather than
+    // to retry, and an error here would invite exactly the retry loop that drains
+    // a shelf.
+    let served = store::fetch(pool, WORKSPACE, &key_bytes(&default_device()), 4)
+        .await
+        .expect("an empty shelf is not a failure");
+    assert!(served.is_empty());
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

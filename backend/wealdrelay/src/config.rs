@@ -44,6 +44,46 @@ pub mod keys {
     pub const RELEASE_CHECK: &str = "WEALD_RELAY_RELEASE_CHECK";
     pub const METRICS_GROUP_LABELS: &str = "WEALD_RELAY_METRICS_GROUP_LABELS";
     pub const BOOTSTRAP_HANDOFF_PUBKEY: &str = "WEALD_RELAY_BOOTSTRAP_HANDOFF_PUBKEY";
+    /// Whether the ephemeral path is served at all.
+    ///
+    /// It exists because presence is the one thing this relay carries that a
+    /// self-hoster may reasonably not want to carry: a beat every 20 seconds per
+    /// connected device is traffic an operator did not ask for, and `off` is a
+    /// posture rather than a failure. A version 2 client told `off` reports presence
+    /// unavailable, which is the same thing it reports against a version 1 relay.
+    pub const LIVE: &str = "WEALD_RELAY_LIVE";
+    /// How a beat reaches the other instances of a multi-instance deployment.
+    ///
+    /// It exists because single-process fanout is correct only in a single-process
+    /// deployment, and a two-instance deployment on `process` would show every
+    /// member half the room with nothing anywhere reporting a fault. The relay
+    /// refuses to start in that combination rather than serving a half room.
+    pub const LIVE_FANOUT: &str = "WEALD_RELAY_LIVE_FANOUT";
+    /// Whether voice calls are carried at all.
+    ///
+    /// `off` by default, unlike `WEALD_RELAY_LIVE`, and the difference is
+    /// deliberate. Presence is the ordinary shape of the app and costs a beat
+    /// every twenty seconds. A call is a sustained stream an operator has to have
+    /// sized for, so it is opt-in: an instance carries calls because somebody
+    /// decided it would, and that decision is the same act as setting
+    /// `WEALD_RELAY_MAX_CONCURRENT_CALLS` (`specs/backend/relay/calls.md`).
+    pub const CALLS: &str = "WEALD_RELAY_CALLS";
+    /// How many calls one instance may carry at once.
+    ///
+    /// Required when `WEALD_RELAY_CALLS=on` and refused as meaningless when it is
+    /// off. There is no default and there deliberately never will be: call
+    /// capacity is a sizing decision about one instance's bandwidth, and a relay
+    /// that guessed one would be a relay whose ceiling nobody chose and whose
+    /// operator discovers it under load.
+    pub const MAX_CONCURRENT_CALLS: &str = "WEALD_RELAY_MAX_CONCURRENT_CALLS";
+    /// How many client sockets may be open at once.
+    ///
+    /// `specs/backend/relay/operations.md` recorded the absence of this as a known
+    /// gap: "nothing caps concurrent connections, so instance memory is still the
+    /// budget times however many connect". Calls make the gap matter sooner,
+    /// because a connection carrying a call holds its queue full rather than
+    /// nearly empty, so the cap ships with them.
+    pub const MAX_CONNECTIONS: &str = "WEALD_RELAY_MAX_CONNECTIONS";
     /// The bearer a control plane presents on the operator routes.
     ///
     /// `specs/backend/cloud/api.md` requires the relay to report how many
@@ -82,6 +122,11 @@ pub mod keys {
         RETENTION_DAYS,
         ACCESS_SET,
         MIN_ENC,
+        LIVE,
+        LIVE_FANOUT,
+        CALLS,
+        MAX_CONCURRENT_CALLS,
+        MAX_CONNECTIONS,
         SMTP_URL,
         WRITE_MODE,
         RELEASE_CHECK,
@@ -121,6 +166,48 @@ pub enum MinEncryption {
 pub enum TlsMode {
     Acme,
     File,
+    Off,
+}
+
+/// Whether the ephemeral path (`LIVE`) is served.
+///
+/// `off` refuses every beat with `reject/protocol_unsupported` and is what a
+/// self-hoster who does not want to carry presence traffic sets. A client told
+/// `off` reports presence unavailable, which is the same thing it reports against
+/// a version 1 relay: the one thing it must never do is render everybody offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveMode {
+    On,
+    Off,
+}
+
+/// How a beat reaches subscribers held by another process.
+///
+/// `specs/backend/relay/presence.md`: single-process fanout with a startup
+/// refusal, rather than a Redis dependency this release does not take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveFanout {
+    /// In-process channels. Correct in a single-process deployment and in no
+    /// other, which is why the combination below is refused rather than warned
+    /// about.
+    Process,
+    /// A shared fanout endpoint. Declared, and refused at startup by this build,
+    /// because a setting the binary accepts and does not honour is worse than one
+    /// it refuses: an operator would read the value back and believe presence
+    /// crossed their instances.
+    Shared(String),
+}
+
+/// Whether the call path (`CALL` and `MEDIA`) is served.
+///
+/// `off` refuses both frames with `reject/protocol_unsupported`, which is what a
+/// version 3 client reads as calls being unavailable on this relay: the same
+/// thing it reads from a version 2 relay, and a different thing from a call that
+/// failed. `off` is the default, because carrying a sustained media stream is a
+/// posture an operator adopts rather than one they inherit from an upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallMode {
+    On,
     Off,
 }
 
@@ -168,6 +255,14 @@ pub struct Config {
     pub retention_days: Limit,
     pub access_set: AccessSetMode,
     pub min_encryption: MinEncryption,
+    pub live: LiveMode,
+    pub live_fanout: LiveFanout,
+    pub calls: CallMode,
+    /// The concurrent-call ceiling. `None` exactly when calls are off, which is
+    /// the one combination `enforce_calls` permits: a number is required whenever
+    /// the feature is on, so nothing downstream has a default to fall back to.
+    pub max_concurrent_calls: Option<u64>,
+    pub max_connections: Limit,
     pub smtp_url: Option<String>,
     pub write_mode: WriteMode,
     pub release_check: bool,
@@ -212,6 +307,65 @@ pub enum ConfigError {
         "relay.toml at {path} sets {key} to a table or an array; every value must be a scalar"
     )]
     NonScalarFileValue { path: String, key: String },
+    /// `process` fanout in a deployment that has declared more than one instance.
+    ///
+    /// Fatal rather than a warning, and this is the whole reason the setting
+    /// exists. Two relay processes each fanning out in process would show every
+    /// member exactly the half of the room that happens to share their socket, with
+    /// nothing anywhere reporting a fault. A relay that will not start is a page a
+    /// human reads; a half room is one nobody ever sees.
+    #[error(
+        "{key}=process is refused because {declared} declares more than one instance; \
+         set {key} to a shared fanout url or set WEALD_RELAY_LIVE=off"
+    )]
+    LiveFanoutSingleProcess {
+        key: &'static str,
+        declared: &'static str,
+    },
+    /// A shared fanout url on a build that does not implement one.
+    #[error("{key}={value} names a shared fanout, which this build does not implement")]
+    LiveFanoutUnavailable { key: &'static str, value: String },
+    /// Calls turned on without the ceiling that sizes them.
+    ///
+    /// Fatal at startup and never defaulted. A relay that invented a number would
+    /// be a relay whose call capacity nobody chose, and the operator would meet it
+    /// as a refusal during a call rather than as a line in their configuration.
+    #[error("{key} is required when {because}=on and has no default: set it to the number of simultaneous calls this instance is sized for")]
+    CallsCeilingMissing {
+        key: &'static str,
+        because: &'static str,
+    },
+    /// The ceiling set on an instance that does not carry calls.
+    ///
+    /// Refused rather than ignored, for the reason an empty value is refused: a
+    /// setting the binary accepts and does not honour is one an operator reads
+    /// back and believes.
+    #[error("{key} is set but {because}=off, so it would do nothing; turn calls on or unset it")]
+    CallsCeilingUnused {
+        key: &'static str,
+        because: &'static str,
+    },
+    /// `WEALD_RELAY_CALLS=on` in a deployment that has declared more than one
+    /// instance.
+    ///
+    /// The same refusal `LIVE` gets and for a sharper reason. Call routing is
+    /// process-local, so two instances would put the two halves of a call on
+    /// different processes and the call would connect and then be silent. Chat
+    /// degrades to reconciliation across a process boundary; a call has no
+    /// reconciliation to degrade to.
+    #[error(
+        "{key}=on is refused because {declared} declares more than one instance and call routing \
+         is process local; unset {declared} or set {key}=off"
+    )]
+    CallsSingleProcess {
+        key: &'static str,
+        declared: &'static str,
+    },
+    /// A zero ceiling, for either cap. Refused rather than read as "none": a
+    /// relay that may carry no calls is one with `WEALD_RELAY_CALLS=off`, and a
+    /// relay that may hold no connections is not a relay.
+    #[error("{key}=0 is not a limit; use off or unlimited to say what you mean")]
+    ZeroLimit { key: &'static str },
     /// A setting the hosted profile forbids. Fatal at startup: a relay that
     /// logged about a forbidden setting and served anyway would be a relay whose
     /// posture nobody chose (`crate::profile`).
@@ -234,7 +388,13 @@ impl ConfigError {
             | Self::NotAPostgresUrl { key, .. }
             | Self::NotAStorageUrl { key, .. }
             | Self::NotAnAddress { key, .. }
-            | Self::RefusedOnHostedProfile { key, .. } => Some(key),
+            | Self::RefusedOnHostedProfile { key, .. }
+            | Self::LiveFanoutSingleProcess { key, .. }
+            | Self::LiveFanoutUnavailable { key, .. }
+            | Self::CallsCeilingMissing { key, .. }
+            | Self::CallsCeilingUnused { key, .. }
+            | Self::CallsSingleProcess { key, .. }
+            | Self::ZeroLimit { key } => Some(key),
             Self::UnknownFileKey { key, .. } | Self::NonScalarFileValue { key, .. } => Some(key),
             Self::UnreadableFile { .. } | Self::MalformedFile { .. } => None,
         }
@@ -409,6 +569,79 @@ impl Config {
         }
     }
 
+    /// The label `/readyz` and the startup log use for the ephemeral path.
+    pub fn live_label(&self) -> &'static str {
+        match self.live {
+            LiveMode::On => "on",
+            LiveMode::Off => "off",
+        }
+    }
+
+    /// Refuse the one combination that would serve half a room.
+    ///
+    /// A `WEALD_RELAY_REDIS_URL` is how `specs/backend/relay/server.md` says a
+    /// deployment declares that it runs more than one process: the table lists it
+    /// as "omit for single-process installs". So the declaration already exists and
+    /// this reads it rather than adding a second way to say the same thing.
+    ///
+    /// Skipped when the ephemeral path is off, because there is then no beat to
+    /// fail to cross an instance boundary.
+    fn enforce_live_fanout(&self) -> Result<(), ConfigError> {
+        if let LiveFanout::Shared(value) = &self.live_fanout {
+            return Err(ConfigError::LiveFanoutUnavailable {
+                key: keys::LIVE_FANOUT,
+                value: value.clone(),
+            });
+        }
+        if matches!(self.live, LiveMode::Off) || self.redis_url.is_none() {
+            return Ok(());
+        }
+        Err(ConfigError::LiveFanoutSingleProcess {
+            key: keys::LIVE_FANOUT,
+            declared: keys::REDIS_URL,
+        })
+    }
+
+    /// The label `/readyz` and the startup log use for the call path.
+    pub fn calls_label(&self) -> &'static str {
+        match self.calls {
+            CallMode::On => "on",
+            CallMode::Off => "off",
+        }
+    }
+
+    /// The three rules that make the call configuration answerable rather than
+    /// guessed: a ceiling exists exactly when calls do, and calls are refused in a
+    /// deployment that has declared a second process.
+    ///
+    /// All three are startup refusals rather than warnings. A relay that will not
+    /// start is a page a human reads; a call that connects and is silent is a bug
+    /// report six months later.
+    fn enforce_calls(&self) -> Result<(), ConfigError> {
+        match (self.calls, self.max_concurrent_calls) {
+            (CallMode::On, None) => {
+                return Err(ConfigError::CallsCeilingMissing {
+                    key: keys::MAX_CONCURRENT_CALLS,
+                    because: keys::CALLS,
+                })
+            }
+            (CallMode::Off, Some(_)) => {
+                return Err(ConfigError::CallsCeilingUnused {
+                    key: keys::MAX_CONCURRENT_CALLS,
+                    because: keys::CALLS,
+                })
+            }
+            (CallMode::On, Some(_)) | (CallMode::Off, None) => {}
+        }
+        if matches!(self.calls, CallMode::On) && self.redis_url.is_some() {
+            return Err(ConfigError::CallsSingleProcess {
+                key: keys::CALLS,
+                declared: keys::REDIS_URL,
+            });
+        }
+        Ok(())
+    }
+
     pub fn min_enc_label(&self) -> &'static str {
         match self.min_encryption {
             MinEncryption::None => "none",
@@ -477,6 +710,32 @@ impl Config {
                 "none, mls",
                 &[("none", MinEncryption::None), ("mls", MinEncryption::Mls)],
             )?,
+            // `on` by default, because the product's presence surfaces are the
+            // ordinary shape of the app and an operator who wants them off says so.
+            live: one_of(
+                values,
+                keys::LIVE,
+                LiveMode::On,
+                "on, off",
+                &[("on", LiveMode::On), ("off", LiveMode::Off)],
+            )?,
+            live_fanout: live_fanout(values, keys::LIVE_FANOUT)?,
+            // `off` by default, unlike `live`. See `keys::CALLS`.
+            calls: one_of(
+                values,
+                keys::CALLS,
+                CallMode::Off,
+                "on, off",
+                &[("on", CallMode::On), ("off", CallMode::Off)],
+            )?,
+            max_concurrent_calls: positive(values, keys::MAX_CONCURRENT_CALLS)?,
+            // A number rather than `Unlimited` by default, which is the whole
+            // point of closing the gap: the previous behaviour was unlimited and
+            // it is the behaviour being replaced. Two hundred and fifty six
+            // sockets against an 8 MiB per-connection queue budget is two
+            // gigabytes at the absolute ceiling, which is a bound a modest
+            // instance survives; an operator with more memory says so.
+            max_connections: connection_limit(values, keys::MAX_CONNECTIONS)?,
             smtp_url: optional(values, keys::SMTP_URL)?.map(str::to_string),
             write_mode: one_of(
                 values,
@@ -501,11 +760,25 @@ impl Config {
                 crate::profile::Profile::TABLE,
             )?,
         };
+        resolved.enforce_live_fanout()?;
+        resolved.enforce_calls()?;
         // Last, because the hosted rules are about the resolved values rather
         // than about the strings, and a rule that ran mid-resolution would have
         // to be re-stated for every source a value can come from.
         crate::profile::enforce(&resolved)?;
         Ok(resolved)
+    }
+}
+
+/// `process`, or anything else read as a shared fanout endpoint.
+///
+/// Not `one_of`, because the second arm is an open-ended value rather than a
+/// member of a closed set, and `one_of`'s error would have listed a url as if it
+/// were a keyword.
+fn live_fanout(values: &Values, key: &'static str) -> Result<LiveFanout, ConfigError> {
+    match optional(values, key)? {
+        None | Some("process") => Ok(LiveFanout::Process),
+        Some(value) => Ok(LiveFanout::Shared(value.to_string())),
     }
 }
 
@@ -612,6 +885,47 @@ fn limit(values: &Values, key: &'static str) -> Result<Limit, ConfigError> {
             key,
             value: value.to_string(),
         })
+}
+
+/// An optional count that must be at least one when it is there.
+///
+/// Separate from ``limit`` because there is no `unlimited` here: an unbounded
+/// number of simultaneous calls is the sizing decision this key exists to refuse.
+fn positive(values: &Values, key: &'static str) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = optional(values, key)? else {
+        return Ok(None);
+    };
+    let parsed = value.parse::<u64>().map_err(|_| ConfigError::NotANumber {
+        key,
+        value: value.to_string(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::ZeroLimit { key });
+    }
+    Ok(Some(parsed))
+}
+
+/// The socket cap: a number, or `unlimited` for the behaviour this key replaced.
+fn connection_limit(values: &Values, key: &'static str) -> Result<Limit, ConfigError> {
+    /// Sized against ``crate::ws::SEND_QUEUE_BYTE_BUDGET``: this many connections
+    /// each at their absolute queue ceiling is two gibibytes, which is the point
+    /// beyond which a modest instance is killed rather than degraded.
+    const DEFAULT: u64 = 256;
+
+    let Some(value) = optional(values, key)? else {
+        return Ok(Limit::Of(DEFAULT));
+    };
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(Limit::Unlimited);
+    }
+    let parsed = value.parse::<u64>().map_err(|_| ConfigError::NotANumber {
+        key,
+        value: value.to_string(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::ZeroLimit { key });
+    }
+    Ok(Limit::Of(parsed))
 }
 
 fn one_of<T: Copy>(

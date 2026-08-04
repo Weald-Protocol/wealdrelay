@@ -31,8 +31,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
-use crate::frame::Frame;
+use crate::frame::{Frame, MIN_PROTOCOL_VERSION};
 use crate::ws::{downgrade_frame, try_queue, OutboundSender, Queued};
+
+/// The version floor for a frame every version speaks. Named rather than written
+/// as a bare 1 at each call site, so a durable fanout cannot be mistaken for one
+/// that was deliberately restricted.
+pub const MIN_FANOUT_VERSION: u16 = MIN_PROTOCOL_VERSION;
 
 /// One connection's identity inside the hub. Opaque and per process: it exists so
 /// a connection does not receive its own writes back, and so a disconnect can
@@ -48,6 +53,13 @@ type PrincipalConnection = (ConnectionId, OutboundSender);
 pub enum Delivery {
     /// Queued for delivery.
     Sent,
+    /// The frame was not for this subscriber's protocol version. Not a failure
+    /// and not a downgrade: a version 1 client never learns that a version 2 frame
+    /// existed, which is exactly what "a v1 client keeps working" means.
+    NotSpoken,
+    /// An ephemeral frame was dropped because the queue was full. Silent by
+    /// design. See ``Hub::shed``.
+    Shed,
     /// Queue full: the subscriber was downgraded to reconciliation and told so.
     Downgraded,
     /// The connection has gone. Its entry is removed.
@@ -73,6 +85,16 @@ pub struct Hub {
     /// is a capacity signal, and one that only told the affected client would leave
     /// the operator unable to see it at all.
     downgrades: AtomicU64,
+    /// How many ephemeral frames have been dropped because a subscriber's queue
+    /// was full.
+    ///
+    /// A separate counter from ``downgrades`` and deliberately so. A downgrade is a
+    /// claim about durable state: it tells a client it has a hole in an author chain
+    /// and must reconcile. A shed beat is nothing of the kind, the next one is 20
+    /// seconds away, and telling a client to reconcile because a presence dot was
+    /// late would be a lie about its log. So shedding is silent to the client and
+    /// visible only here, where an operator can see the capacity signal.
+    shed: AtomicU64,
     /// Which live connections belong to which principal, by salted entry hash.
     ///
     /// The one thing in this registry that is about a device rather than a group,
@@ -91,6 +113,9 @@ pub struct Hub {
 struct Subscriber {
     id: ConnectionId,
     sender: OutboundSender,
+    /// The protocol version this connection negotiated. Fanout filters on it, so
+    /// a version 1 subscriber is never sent a frame its build cannot name.
+    protocol_version: u16,
     /// Set when this subscriber's queue was full and the downgrade frame could not
     /// be queued either, which is the normal case: the queue is full precisely when
     /// there is no room for anything.
@@ -115,7 +140,13 @@ impl Hub {
     /// Register interest in a group. Idempotent per connection: a client that
     /// re-subscribes after a downgrade must not end up receiving every envelope
     /// twice.
-    pub async fn subscribe(&self, group: &[u8], id: ConnectionId, sender: OutboundSender) {
+    pub async fn subscribe(
+        &self,
+        group: &[u8],
+        id: ConnectionId,
+        sender: OutboundSender,
+        protocol_version: u16,
+    ) {
         let mut groups = self.lock().await;
         let subscribers = groups.entry(group.to_vec()).or_default();
         if subscribers.iter().any(|subscriber| subscriber.id == id) {
@@ -124,6 +155,7 @@ impl Hub {
         subscribers.push(Subscriber {
             id,
             sender,
+            protocol_version,
             downgrade_owed: false,
         });
     }
@@ -204,6 +236,11 @@ impl Hub {
         self.downgrades.load(Ordering::Relaxed)
     }
 
+    /// How many ephemeral frames this process has shed under load.
+    pub fn shed(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
     /// Push one envelope to every subscriber except its writer.
     ///
     /// The writer is excluded because it already has the envelope and has been
@@ -222,6 +259,7 @@ impl Hub {
                 envelope: envelope.to_vec(),
             },
             except,
+            MIN_FANOUT_VERSION,
         )
         .await
     }
@@ -232,12 +270,26 @@ impl Hub {
     /// own: they are fanned out on exactly the same terms as envelopes, including
     /// the downgrade owed to a subscriber whose queue is full, and duplicating that
     /// logic for a second frame is how the two would drift apart.
+    /// Generalised again in step 30, when presence added a frame that must reach
+    /// only version 2 subscribers and must be shed rather than downgraded.
+    /// `minimum_version` is the version a subscriber has to have negotiated to be
+    /// sent this frame at all, and `ephemeral` is whether a full queue is a shed or
+    /// a downgrade.
     pub async fn fanout_frame(
         &self,
         group: &[u8],
         frame: &Frame,
         except: ConnectionId,
+        minimum_version: u16,
     ) -> Vec<(ConnectionId, Delivery)> {
+        // Ephemeral is a property of the frame rather than an argument, so the two
+        // can never be passed inconsistently: the frames that are never durable
+        // are the ones that say so.
+        //
+        // `MEDIA` is absent because it never comes through here. Media is routed
+        // at a call's participants by `calls::CallRegistry::route`, not at a
+        // group's subscribers, and it sheds there on the same terms.
+        let ephemeral = matches!(frame, Frame::Live { .. } | Frame::Call { .. });
         let mut outcomes = Vec::new();
         let mut gone = Vec::new();
         {
@@ -247,6 +299,28 @@ impl Hub {
             };
             for subscriber in subscribers.iter_mut() {
                 if subscriber.id == except {
+                    continue;
+                }
+                if subscriber.protocol_version < minimum_version {
+                    outcomes.push((subscriber.id, Delivery::NotSpoken));
+                    continue;
+                }
+                if ephemeral {
+                    // Shed first, before anything owed and before any durable
+                    // frame. A beat is worth less than the queue slot it would take
+                    // from an envelope, and the next one is 20 seconds away.
+                    let delivery = match try_queue(&subscriber.sender, frame.clone()) {
+                        Queued::Sent => Delivery::Sent,
+                        Queued::Full => {
+                            self.shed.fetch_add(1, Ordering::Relaxed);
+                            Delivery::Shed
+                        }
+                        Queued::Closed => {
+                            gone.push(subscriber.id);
+                            Delivery::Gone
+                        }
+                    };
+                    outcomes.push((subscriber.id, delivery));
                     continue;
                 }
                 // A downgrade owed from an earlier round goes out first, ahead of

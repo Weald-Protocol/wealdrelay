@@ -55,13 +55,19 @@ const TEMPTING_BODY: &str = "different content under the same link";
 
 /// The path to the built `crash-victim` binary.
 ///
-/// Derived from this test binary's own location rather than from `cargo run`, because
-/// `cargo run` inside a test would take the build lock the test runner already holds.
+/// From `CARGO_BIN_EXE_crash-victim`, which Cargo sets at compile time for an integration
+/// test in a crate that has the bin target, and not from `cargo run`, because `cargo run`
+/// inside a test would take the build lock the test runner already holds.
+///
+/// It used to be derived from `current_exe()` by popping twice, on the assumption that a
+/// test binary sits in `<profile>/deps/`. That assumption is not Cargo's contract, and
+/// nightly stopped honouring it: under the build-dir layout the binary is built into
+/// `<profile>/build/<pkg>/<hash>/out/`, so two pops landed on the hash directory and this
+/// asserted that a `[[bin]]` entry was missing when it was right there in Cargo.toml. The
+/// coverage job runs nightly, so ci failed on the layout while every stable run passed.
+/// The environment variable is the supported answer and cannot drift with the layout.
 fn victim() -> PathBuf {
-    let mut path = std::env::current_exe().expect("this test binary's path");
-    path.pop(); // the deps directory
-    path.pop(); // the profile directory
-    path.push("crash-victim");
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_crash-victim"));
     assert!(
         path.exists(),
         "crash-victim is not built at {}. It is a bin target of this crate and \

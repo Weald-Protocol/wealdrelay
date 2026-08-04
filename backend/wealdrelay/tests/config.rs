@@ -10,8 +10,8 @@
 //! are separate operator mistakes.
 
 use wealdrelay::config::{
-    keys, AccessSetMode, Config, ConfigError, Limit, MinEncryption, Source, StorageTarget, TlsMode,
-    Values, WriteMode,
+    keys, AccessSetMode, CallMode, Config, ConfigError, Limit, LiveFanout, LiveMode, MinEncryption,
+    Source, StorageTarget, TlsMode, Values, WriteMode,
 };
 
 /// The three required keys, valid, and nothing else. Every test starts here and
@@ -33,6 +33,17 @@ fn with(key: &'static str, value: &'static str) -> Values {
 
 fn resolve(key: &'static str, value: &'static str) -> Result<Config, ConfigError> {
     Config::resolve(&with(key, value))
+}
+
+/// Resolve with several keys set at once, for the rules that are about a
+/// combination rather than a single value.
+fn resolve_with(pairs: &[(&'static str, &'static str)]) -> Result<Config, ConfigError> {
+    let mut values = minimal();
+    for (key, value) in pairs {
+        values.retain(|(existing, _)| existing != key);
+        values.push((key, value));
+    }
+    Config::resolve(&Values::from_pairs(values))
 }
 
 // MARK: The defaults
@@ -358,11 +369,18 @@ fn a_limit_is_a_number_or_the_word_unlimited() {
 
 #[test]
 fn the_optional_urls_are_carried_verbatim() {
+    // With the ephemeral path off, because a Redis url is how `server.md` says a
+    // deployment declares more than one instance and `process` fanout is refused in
+    // that combination. The setting under test here is the passthrough, not the
+    // refusal, which has its own test below.
     assert_eq!(
-        resolve(keys::REDIS_URL, "redis://localhost:6379")
-            .unwrap()
-            .redis_url
-            .as_deref(),
+        resolve_with(&[
+            (keys::REDIS_URL, "redis://localhost:6379"),
+            (keys::LIVE, "off"),
+        ])
+        .unwrap()
+        .redis_url
+        .as_deref(),
         Some("redis://localhost:6379")
     );
     assert_eq!(
@@ -607,9 +625,76 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     // WEALD_RELAY_OPERATOR_TOKEN, the bearer the control plane presents on the
     // operator routes: provider-private networking is a network boundary and not
     // an authentication one, so the routes that report the admitted count are
-    // mounted only where there is a credential to check them against.
-    assert_eq!(keys::ALL.len(), 18);
+    // mounted only where there is a credential to check them against. 20 since
+    // relay step 30 added WEALD_RELAY_LIVE and WEALD_RELAY_LIVE_FANOUT, the
+    // ephemeral path's on switch and the setting whose only job is to refuse a
+    // multi-instance deployment that would show every member half the room. 23
+    // since step 35 added WEALD_RELAY_CALLS, WEALD_RELAY_MAX_CONCURRENT_CALLS and
+    // WEALD_RELAY_MAX_CONNECTIONS: the call path's on switch, the ceiling that
+    // sizes it and has no default on purpose, and the socket cap that
+    // `specs/backend/relay/operations.md` had recorded as a known gap.
+    assert_eq!(keys::ALL.len(), 23);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
+}
+
+// MARK: The ephemeral path
+
+#[test]
+fn the_ephemeral_path_is_on_by_default_and_fans_out_in_process() {
+    let config = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(config.live, LiveMode::On);
+    assert_eq!(config.live_fanout, LiveFanout::Process);
+    assert_eq!(config.live_label(), "on");
+}
+
+#[test]
+fn the_ephemeral_path_can_be_turned_off() {
+    let config = resolve(keys::LIVE, "off").expect("off resolves");
+    assert_eq!(config.live, LiveMode::Off);
+    assert_eq!(config.live_label(), "off");
+}
+
+#[test]
+fn an_unknown_live_value_is_refused_by_name() {
+    let error = resolve(keys::LIVE, "sometimes").expect_err("refused");
+    assert_eq!(error.key(), Some(keys::LIVE));
+}
+
+#[test]
+fn process_fanout_is_refused_in_a_multi_instance_deployment() {
+    // The whole reason the setting exists. Two relay processes each fanning out in
+    // process would show every member exactly the half of the room that happens to
+    // share their socket, with nothing anywhere reporting a fault. A relay that
+    // will not start is a page a human reads; a half room is one nobody sees.
+    let error = resolve_with(&[(keys::REDIS_URL, "redis://localhost:6379")])
+        .expect_err("process fanout with a declared second instance is refused");
+    assert!(matches!(error, ConfigError::LiveFanoutSingleProcess { .. }));
+    assert_eq!(error.key(), Some(keys::LIVE_FANOUT));
+    assert!(error.to_string().contains(keys::REDIS_URL));
+}
+
+#[test]
+fn a_multi_instance_deployment_may_turn_the_ephemeral_path_off_instead() {
+    // The escape hatch, and it is the honest one: with no beats there is nothing to
+    // fail to cross an instance boundary, so the deployment starts and presence
+    // reports unavailable rather than showing half a room.
+    let config = resolve_with(&[
+        (keys::REDIS_URL, "redis://localhost:6379"),
+        (keys::LIVE, "off"),
+    ])
+    .expect("live off resolves alongside a second instance");
+    assert_eq!(config.live, LiveMode::Off);
+}
+
+#[test]
+fn a_shared_fanout_url_is_refused_because_this_build_does_not_implement_one() {
+    // A setting the binary accepts and does not honour is worse than one it
+    // refuses: an operator would read the value back and believe presence crossed
+    // their instances.
+    let error =
+        resolve(keys::LIVE_FANOUT, "redis://localhost:6379").expect_err("shared fanout refused");
+    assert!(matches!(error, ConfigError::LiveFanoutUnavailable { .. }));
+    assert_eq!(error.key(), Some(keys::LIVE_FANOUT));
 }
 
 #[test]
@@ -899,4 +984,147 @@ fn the_operator_token_is_reported_as_set_and_never_printed() {
         printed.contains(keys::OPERATOR_TOKEN),
         "check-config did not mention the operator token at all: {printed}"
     );
+}
+
+// MARK: The call path
+
+/// Calls on, with the ceiling the on switch requires. Two keys rather than one
+/// because that pairing is itself a rule, tested on its own below.
+fn calls_on(pairs: &[(&'static str, &'static str)]) -> Result<Config, ConfigError> {
+    let mut values = vec![(keys::CALLS, "on"), (keys::MAX_CONCURRENT_CALLS, "3")];
+    values.extend_from_slice(pairs);
+    resolve_with(&values)
+}
+
+#[test]
+fn the_call_path_is_off_by_default_and_carries_no_ceiling() {
+    // Off, unlike the ephemeral path, and the asymmetry is the decision. A beat
+    // every twenty seconds is the ordinary shape of the app; a sustained media
+    // stream is capacity an operator has to have sized for, so it is opted into.
+    let config = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(config.calls, CallMode::Off);
+    assert_eq!(config.calls_label(), "off");
+    assert_eq!(config.max_concurrent_calls, None);
+}
+
+#[test]
+fn calls_on_with_a_ceiling_resolves() {
+    let config = calls_on(&[]).expect("calls on with a ceiling resolves");
+    assert_eq!(config.calls, CallMode::On);
+    assert_eq!(config.calls_label(), "on");
+    assert_eq!(config.max_concurrent_calls, Some(3));
+}
+
+#[test]
+fn calls_on_without_a_ceiling_refuses_to_start_and_names_the_key() {
+    // The variable with no default, and the reason there will never be one: call
+    // capacity is a sizing decision about one instance's bandwidth, and a relay
+    // that guessed would be a relay whose ceiling nobody chose and whose operator
+    // meets it as a refusal during a call.
+    let error = resolve(keys::CALLS, "on").expect_err("a ceiling is required");
+    assert!(matches!(error, ConfigError::CallsCeilingMissing { .. }));
+    assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
+    assert!(error.to_string().contains(keys::CALLS));
+}
+
+#[test]
+fn a_ceiling_without_calls_is_refused_rather_than_ignored() {
+    // For the reason an empty value is refused: a setting the binary accepts and
+    // does not honour is one an operator reads back and believes.
+    let error =
+        resolve(keys::MAX_CONCURRENT_CALLS, "3").expect_err("a ceiling with calls off is refused");
+    assert!(matches!(error, ConfigError::CallsCeilingUnused { .. }));
+    assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
+}
+
+#[test]
+fn a_zero_ceiling_is_refused_because_it_is_not_a_limit() {
+    let error = resolve_with(&[(keys::CALLS, "on"), (keys::MAX_CONCURRENT_CALLS, "0")])
+        .expect_err("zero is refused");
+    assert!(matches!(error, ConfigError::ZeroLimit { .. }));
+    assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
+}
+
+#[test]
+fn a_ceiling_that_is_not_a_number_is_refused_by_name() {
+    let error = resolve_with(&[(keys::CALLS, "on"), (keys::MAX_CONCURRENT_CALLS, "lots")])
+        .expect_err("refused");
+    assert!(matches!(error, ConfigError::NotANumber { .. }));
+    assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
+}
+
+#[test]
+fn an_unknown_calls_value_is_refused_by_name() {
+    let error = resolve(keys::CALLS, "sometimes").expect_err("refused");
+    assert!(matches!(error, ConfigError::NotAllowed { .. }));
+    assert_eq!(error.key(), Some(keys::CALLS));
+}
+
+#[test]
+fn calls_are_refused_in_a_multi_instance_deployment() {
+    // Sharper than the presence refusal it copies. Two instances would put the two
+    // halves of a call on different processes, so the call would connect and then
+    // be silent: chat degrades to reconciliation across that boundary and a call
+    // has no reconciliation to degrade to.
+    // Presence turned off, so the refusal under test is the call one rather than
+    // the beat one: both rules read the same declaration and presence resolves
+    // first, so leaving it on would prove `LiveFanoutSingleProcess` twice.
+    let error = calls_on(&[
+        (keys::REDIS_URL, "redis://localhost:6379"),
+        (keys::LIVE, "off"),
+    ])
+    .expect_err("calls with a declared second instance are refused");
+    assert!(matches!(error, ConfigError::CallsSingleProcess { .. }));
+    assert_eq!(error.key(), Some(keys::CALLS));
+    assert!(error.to_string().contains(keys::REDIS_URL));
+}
+
+#[test]
+fn a_multi_instance_deployment_may_leave_calls_off() {
+    let config = resolve_with(&[
+        (keys::REDIS_URL, "redis://localhost:6379"),
+        (keys::LIVE, "off"),
+    ])
+    .expect("calls off resolves alongside a second instance");
+    assert_eq!(config.calls, CallMode::Off);
+}
+
+// MARK: The connection cap
+
+#[test]
+fn the_connection_cap_defaults_to_a_number_rather_than_to_unlimited() {
+    // The gap being closed. `specs/backend/relay/operations.md` recorded that
+    // nothing capped concurrent connections, so instance memory was the per
+    // connection queue budget times however many clients chose to connect. A
+    // default of `unlimited` would have been the old behaviour under a new name.
+    let config = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(config.max_connections, Limit::Of(256));
+}
+
+#[test]
+fn the_connection_cap_can_be_raised_or_removed_deliberately() {
+    assert_eq!(
+        resolve(keys::MAX_CONNECTIONS, "4096")
+            .expect("a number resolves")
+            .max_connections,
+        Limit::Of(4096)
+    );
+    // `unlimited` is still expressible, because an operator who has sized their
+    // instance and means it should be able to say so.
+    assert_eq!(
+        resolve(keys::MAX_CONNECTIONS, "unlimited")
+            .expect("unlimited resolves")
+            .max_connections,
+        Limit::Unlimited
+    );
+}
+
+#[test]
+fn a_zero_or_unparseable_connection_cap_is_refused_by_name() {
+    let zero = resolve(keys::MAX_CONNECTIONS, "0").expect_err("zero is not a limit");
+    assert!(matches!(zero, ConfigError::ZeroLimit { .. }));
+    assert_eq!(zero.key(), Some(keys::MAX_CONNECTIONS));
+    let words = resolve(keys::MAX_CONNECTIONS, "many").expect_err("refused");
+    assert!(matches!(words, ConfigError::NotANumber { .. }));
+    assert_eq!(words.key(), Some(keys::MAX_CONNECTIONS));
 }

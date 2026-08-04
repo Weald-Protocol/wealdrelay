@@ -23,13 +23,28 @@
 
 use crate::cbor::{self, CborError, Reader};
 
-/// The protocol version this build speaks.
+/// The highest protocol version this build speaks.
 ///
-/// One value. A client that offers something else is answered with
-/// `version/protocol_unsupported` carrying this range, and the connection ends:
-/// `operations.md` says a version failure aborts the connection and never
-/// silently continues.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// `CONNECT` carries one field, which is the client's maximum offer, and the
+/// relay selects `min(offered, PROTOCOL_VERSION)`. An offer below
+/// ``MIN_PROTOCOL_VERSION`` is answered with `version/protocol_unsupported`
+/// carrying this number, and the connection ends: `operations.md` says a version
+/// failure aborts the connection and never silently continues.
+///
+/// Version 2 adds two frames (``FrameTag::Live`` and ``FrameTag::Keys``) and one
+/// envelope kind, and changes no envelope. Version 3 adds two more
+/// (``FrameTag::Call`` and ``FrameTag::Media``) and changes neither an envelope
+/// nor an existing frame. A client of any earlier version keeps working and
+/// simply never receives a frame it does not know.
+pub const PROTOCOL_VERSION: u16 = 3;
+
+/// The lowest protocol version this build will still serve.
+///
+/// The other half of the range. A build constant on both sides rather than a
+/// second field on `CONNECT`, because the shape of `CONNECT` is on the wire and
+/// changing it is the one thing a version negotiation must not require
+/// (`specs/backend/relay/wire.md`, versioning).
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
 /// The five classes from `operations.md`. Not extensible without a protocol
 /// version bump, which is why this is an enum and not a string.
@@ -296,6 +311,38 @@ pub enum FrameTag {
     ///
     /// `specs/backend/relay/invites.md`, "Admin controls".
     Invite = 20,
+    /// One ephemeral beat: presence or typing. Never stored, never sequenced.
+    ///
+    /// A frame rather than event kind `0x00F0`, which is retired to reserved
+    /// forever. Under `enc: 1` the kind lives inside `ct`, so a relay told to drop
+    /// one kind and keep every other cannot tell them apart, which is the same hole
+    /// `WRAP` and `HANDSHAKE` were pulled out of the envelope to close
+    /// (`specs/backend/relay/presence.md`).
+    Live = 21,
+    /// Publish or fetch MLS key packages.
+    ///
+    /// A frame rather than a kind because key packages are cleartext by
+    /// construction, since they bootstrap encryption, and the relay has to index
+    /// them by device key to serve a fetch at all
+    /// (`specs/backend/relay/private-messaging.md`).
+    Keys = 22,
+    /// One call signalling frame: offer, answer, decline or bye.
+    ///
+    /// A frame rather than an event kind, for the third time and for the reason
+    /// `WRAP`, `HANDSHAKE` and `LIVE` are frames: the relay has to act on this,
+    /// and under `enc: 1` it cannot read anything inside `ct`. What it acts on is
+    /// the cleartext `kind`, which decides call membership, and membership is what
+    /// lets `MEDIA` be routed without a database read
+    /// (`specs/backend/relay/calls.md`).
+    Call = 23,
+    /// One encrypted audio frame.
+    ///
+    /// Separate from ``FrameTag::Call`` and deliberately so. Signalling is rare,
+    /// access-set checked and carries a group; media is fifty frames a second,
+    /// carries no group at all and is routed on the call the sender was already
+    /// admitted to. Folding them into one tag would have put the expensive check
+    /// on the cheap path.
+    Media = 24,
 }
 
 impl FrameTag {
@@ -321,6 +368,10 @@ impl FrameTag {
             18 => Self::Join,
             19 => Self::Drop,
             20 => Self::Invite,
+            21 => Self::Live,
+            22 => Self::Keys,
+            23 => Self::Call,
+            24 => Self::Media,
             _ => return None,
         })
     }
@@ -346,6 +397,10 @@ impl FrameTag {
         Self::Join,
         Self::Drop,
         Self::Invite,
+        Self::Live,
+        Self::Keys,
+        Self::Call,
+        Self::Media,
     ];
 }
 
@@ -528,6 +583,97 @@ pub enum Frame {
     Invite {
         body: Vec<u8>,
     },
+    /// One ephemeral beat for a group, the same shape in both directions.
+    ///
+    /// `ct` is a sealed ``LiveBody``: a signed presence or typing claim, opaque to
+    /// the relay exactly like an envelope's payload. Nothing about it is durable.
+    /// It is never given a sequence number, never stored, never returned by a
+    /// `RECON` round, never attested and never named in a `drop_before` manifest.
+    Live {
+        group: Vec<u8>,
+        epoch: u64,
+        ct: Vec<u8>,
+    },
+    /// One key-package publication or fetch, or the relay's answer to one.
+    ///
+    /// Five forms in one frame, discriminated by the leading `form` byte, because
+    /// they are one conversation about one shelf and a client that could reach a
+    /// fetch without the publish half is a client with a different frame set.
+    Keys(KeysBody),
+    /// One call signalling frame, the same shape in both directions.
+    ///
+    /// `kind` is the only field of either call frame the relay reads beside the
+    /// routing ids: a small closed enum (``crate::calls::CallKind``) that decides
+    /// whether the sender is joining or leaving. `body` is sealed under the
+    /// group's MLS exporter and is opaque exactly like an envelope's payload.
+    /// Nothing about it is durable: no sequence number, no row, no `RECON`, no
+    /// attestation, no `drop_before` manifest entry.
+    Call {
+        call_id: Vec<u8>,
+        group: Vec<u8>,
+        epoch: u64,
+        kind: u8,
+        body: Vec<u8>,
+    },
+    /// One encrypted audio frame, the same shape in both directions.
+    ///
+    /// No group, deliberately. The group was checked when this connection was
+    /// admitted to `call_id` by a `CALL` frame, and repeating the check here would
+    /// put a Postgres read on a path that carries fifty frames a second per
+    /// stream (`specs/peer-calls.md` section 3).
+    ///
+    /// `seq` is the sender's own per-stream counter, copied and never
+    /// interpreted. It is emphatically **not** the per-group `seq` in
+    /// `accept.rs`: that one is an `UPDATE ... RETURNING` inside a transaction,
+    /// and routing audio through it would serialise every writer in the group
+    /// behind the call. Out of order is reordered by the receiver's jitter
+    /// buffer, late is dropped, missing is concealed.
+    Media {
+        call_id: Vec<u8>,
+        stream: Vec<u8>,
+        seq: u64,
+        ct: Vec<u8>,
+    },
+}
+
+/// The `KEYS` forms. `specs/backend/relay/private-messaging.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeysBody {
+    /// Client to relay: store these against the authenticated device key.
+    Publish { packages: Vec<Vec<u8>> },
+    /// Relay to client: how many are on the shelf now.
+    Published { remaining: u32 },
+    /// Client to relay: hand me at most `count` packages for this device.
+    Fetch { device: Vec<u8>, count: u8 },
+    /// Relay to client: here they are, and they are gone from the shelf.
+    Bundles { packages: Vec<Vec<u8>> },
+    /// Relay to client: the shelf is empty. Not an error. The correct client
+    /// behaviour is to wait for the peer to top up rather than to retry.
+    None,
+}
+
+impl KeysBody {
+    /// The leading discriminant on the wire. Fixed numbers for the same reason a
+    /// frame tag is fixed.
+    pub fn form(&self) -> u8 {
+        match self {
+            Self::Publish { .. } => 1,
+            Self::Published { .. } => 2,
+            Self::Fetch { .. } => 3,
+            Self::Bundles { .. } => 4,
+            Self::None => 5,
+        }
+    }
+
+    /// What holding this body costs, in bytes, for the queue budget.
+    pub fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Publish { packages } | Self::Bundles { packages } => {
+                packages.iter().map(Vec::len).sum()
+            }
+            Self::Published { .. } | Self::Fetch { .. } | Self::None => 0,
+        }
+    }
 }
 
 impl Frame {
@@ -552,6 +698,10 @@ impl Frame {
             Self::Blob { .. } => FrameTag::Blob,
             Self::Drop { .. } => FrameTag::Drop,
             Self::Bye { .. } => FrameTag::Bye,
+            Self::Live { .. } => FrameTag::Live,
+            Self::Keys(_) => FrameTag::Keys,
+            Self::Call { .. } => FrameTag::Call,
+            Self::Media { .. } => FrameTag::Media,
             Self::Error(_) => FrameTag::Error,
         }
     }
@@ -586,6 +736,10 @@ impl Frame {
             | Self::Invite { body } => body.len(),
             Self::Blob { payload } => payload.len(),
             Self::Connect { groups, .. } => groups.iter().map(Vec::len).sum(),
+            Self::Live { ct, .. } => ct.len(),
+            Self::Call { body, .. } => body.len(),
+            Self::Media { ct, .. } => ct.len(),
+            Self::Keys(body) => body.queued_bytes(),
             // Everything else is headers and integers, covered by the allowance.
             _ => 0,
         };
@@ -655,6 +809,48 @@ impl Frame {
             Self::Blob { payload } => cbor::array(&[cbor::bytes(payload)]),
             Self::Drop { payload } => cbor::array(&[cbor::bytes(payload)]),
             Self::Bye { reason } => cbor::array(&[cbor::bytes(reason)]),
+            Self::Live { group, epoch, ct } => {
+                cbor::array(&[cbor::bytes(group), cbor::uint(*epoch), cbor::bytes(ct)])
+            }
+            Self::Call {
+                call_id,
+                group,
+                epoch,
+                kind,
+                body,
+            } => cbor::array(&[
+                cbor::bytes(call_id),
+                cbor::bytes(group),
+                cbor::uint(*epoch),
+                cbor::uint(u64::from(*kind)),
+                cbor::bytes(body),
+            ]),
+            Self::Media {
+                call_id,
+                stream,
+                seq,
+                ct,
+            } => cbor::array(&[
+                cbor::bytes(call_id),
+                cbor::bytes(stream),
+                cbor::uint(*seq),
+                cbor::bytes(ct),
+            ]),
+            Self::Keys(body) => {
+                let fields = match body {
+                    KeysBody::Publish { packages } | KeysBody::Bundles { packages } => {
+                        cbor::array(&packages.iter().map(|p| cbor::bytes(p)).collect::<Vec<_>>())
+                    }
+                    KeysBody::Published { remaining } => {
+                        cbor::array(&[cbor::uint(u64::from(*remaining))])
+                    }
+                    KeysBody::Fetch { device, count } => {
+                        cbor::array(&[cbor::bytes(device), cbor::uint(u64::from(*count))])
+                    }
+                    KeysBody::None => cbor::array(&[]),
+                };
+                cbor::array(&[cbor::uint(u64::from(body.form())), fields])
+            }
             Self::Error(error) => cbor::array(&[
                 cbor::bytes(error.code.class().as_str().as_bytes()),
                 cbor::bytes(error.code.as_str().as_bytes()),
@@ -684,7 +880,10 @@ impl Frame {
             FrameTag::Connect => {
                 reader.array(3)?;
                 let version = reader.u16()?;
-                if version != PROTOCOL_VERSION {
+                // A range rather than an equality, so a version 1 client's
+                // `CONNECT` still decodes on a version 2 build. Contradiction 1 in
+                // `specs/backend/build/presence-buildout-prompt.md`.
+                if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
                     return Err(FrameDecodeError::UnsupportedVersion(version));
                 }
                 let count = reader.array_header()?;
@@ -701,7 +900,11 @@ impl Frame {
             FrameTag::ConnectAck => {
                 reader.array(3)?;
                 let version = reader.u16()?;
-                if version != PROTOCOL_VERSION {
+                // Admits a selection below the local maximum on purpose: that is
+                // exactly a version 2 client learning it is talking to a version 1
+                // relay, which it reports as presence unavailable rather than
+                // treating as a failure.
+                if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
                     return Err(FrameDecodeError::UnsupportedVersion(version));
                 }
                 Self::ConnectAck {
@@ -822,6 +1025,70 @@ impl Frame {
                 Self::Bye {
                     reason: reader.bytes()?,
                 }
+            }
+            FrameTag::Live => {
+                reader.array(3)?;
+                Self::Live {
+                    group: reader.bytes_of(32)?,
+                    epoch: reader.uint()?,
+                    ct: reader.bytes()?,
+                }
+            }
+            FrameTag::Call => {
+                reader.array(5)?;
+                Self::Call {
+                    call_id: reader.bytes_of(crate::calls::CALL_ID_BYTES)?,
+                    group: reader.bytes_of(32)?,
+                    epoch: reader.uint()?,
+                    kind: reader.u8()?,
+                    body: reader.bytes()?,
+                }
+            }
+            FrameTag::Media => {
+                reader.array(4)?;
+                Self::Media {
+                    call_id: reader.bytes_of(crate::calls::CALL_ID_BYTES)?,
+                    stream: reader.bytes_of(crate::calls::STREAM_BYTES)?,
+                    seq: reader.uint()?,
+                    ct: reader.bytes()?,
+                }
+            }
+            FrameTag::Keys => {
+                reader.array(2)?;
+                let form = reader.u8()?;
+                let body = match form {
+                    1 | 4 => {
+                        let count = reader.array_header()?;
+                        let mut packages = Vec::new();
+                        for _ in 0..count {
+                            packages.push(reader.bytes()?);
+                        }
+                        if form == 1 {
+                            KeysBody::Publish { packages }
+                        } else {
+                            KeysBody::Bundles { packages }
+                        }
+                    }
+                    2 => {
+                        reader.array(1)?;
+                        KeysBody::Published {
+                            remaining: reader.u32()?,
+                        }
+                    }
+                    3 => {
+                        reader.array(2)?;
+                        KeysBody::Fetch {
+                            device: reader.bytes_of(32)?,
+                            count: reader.u8()?,
+                        }
+                    }
+                    5 => {
+                        reader.array(0)?;
+                        KeysBody::None
+                    }
+                    _ => return Err(FrameDecodeError::BadField { field: "form" }),
+                };
+                Self::Keys(body)
             }
             FrameTag::Error => {
                 reader.array(4)?;

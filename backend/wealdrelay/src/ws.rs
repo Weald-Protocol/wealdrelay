@@ -265,6 +265,10 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
     // reader has stopped. A hub entry outliving its socket would be fanned out to
     // once per accepted envelope for the life of the process.
     state.hub.disconnect(connection).await;
+    // And out of every call it was in, for the same reason and a louder one: a
+    // stale participant would be sent fifty media frames a second rather than one
+    // envelope per write.
+    state.calls.forget(connection).await;
 
     // Dropped rather than sent a `Close`. Queuing one here would be a frame like any
     // other, so it would wait for room on a queue that is full precisely when the
@@ -272,6 +276,12 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
     // go of the connection.
     drop(sender);
     let _ = writer.await;
+    // Last, and on every path out of this function, because this is the only
+    // function that can know the connection is finished. `relay_socket` took the
+    // slot before the upgrade; releasing it there would have released it while the
+    // socket was still open, and releasing it only on the clean path would leak
+    // one per client that vanished.
+    state.release_connection();
 }
 
 /// Decide about one incoming message. Returns false when the connection should
@@ -434,7 +444,7 @@ async fn admit(state: &Arc<RelayState>, session: &Session, device_key: &[u8]) ->
 /// and neither was reachable, which is how they were found: the coverage floor
 /// reported them as lines no test could execute, and the correct fix for
 /// unreachable code is to delete it rather than to write a test that cannot run.
-async fn authorize_group<'a>(
+pub(crate) async fn authorize_group<'a>(
     state: &'a Arc<RelayState>,
     session: &Session,
     group: &[u8],
@@ -616,15 +626,16 @@ async fn administer_invite(
         Ok(request) => request,
         Err(error) => return queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
     };
-    let Some(database) = &state.database else {
-        return queue_all(
-            sender,
-            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
-        );
-    };
     // `Ready` is the only state this work item is produced from, so both of these are
     // present by construction. Handled rather than unwrapped anyway: an unwrap in the
     // privileged path is a panic waiting for a state machine change nobody re-read.
+    //
+    // Checked before the database is looked for, not after. Who the caller is does
+    // not depend on whether this relay can reach Postgres, and answering `retry` to
+    // a caller that will never be allowed to do this would invite it to come back
+    // forever. It also makes the guard reachable in a test, which the other order
+    // did not: a relay with no database answered `retry` first, so the arm that
+    // exists for a state-machine change nobody re-read could never itself be run.
     let (Some(workspace), Some(device_key)) =
         (session.authorized_workspace(), session.device_key())
     else {
@@ -633,6 +644,12 @@ async fn administer_invite(
             vec![Frame::Error(FrameError::new(
                 ErrorCode::WriterNotInAccessSet,
             ))],
+        );
+    };
+    let Some(database) = &state.database else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
         );
     };
 
@@ -856,7 +873,12 @@ async fn publish_handshake(
             // cursor advances on.
             state
                 .hub
-                .fanout_frame(&handshake.group, &frame, connection)
+                .fanout_frame(
+                    &handshake.group,
+                    &frame,
+                    connection,
+                    crate::hub::MIN_FANOUT_VERSION,
+                )
                 .await;
             queue_all(sender, vec![frame])
         }
@@ -871,6 +893,51 @@ async fn publish_handshake(
             vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
         ),
     }
+}
+
+/// One ephemeral beat.
+///
+/// The access-set check is `authorize_group`, reused rather than copied: the
+/// requirement in `specs/backend/relay/presence.md` is that a beat is admitted by
+/// exactly the check `SEND` is admitted by, and two copies of a rule are two
+/// places for it to drift.
+///
+/// Then fanout, and then nothing. No sequence number, no acknowledgement, no row.
+/// No other connected subscriber means the beat is discarded, which is normal and
+/// is not an error: a member beating into a room nobody is watching has said
+/// nothing that needed keeping.
+async fn publish_live(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    connection: crate::hub::ConnectionId,
+    group: Vec<u8>,
+    epoch: u64,
+    ct: Vec<u8>,
+) -> bool {
+    if let Err(code) = authorize_group(state, session, &group).await {
+        return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
+    }
+    let frame = Frame::Live {
+        group: group.clone(),
+        epoch,
+        ct,
+    };
+    // Version 2 and above only. A version 1 subscriber never learns the frame
+    // existed, which is what makes a version 1 client keep working unchanged.
+    state.hub.fanout_frame(&group, &frame, connection, 2).await;
+    true
+}
+
+/// One key-package publication or fetch.
+async fn key_packages(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    body: crate::frame::KeysBody,
+) -> bool {
+    let answer = crate::keys::handle(state, session, body).await;
+    queue_all(sender, vec![answer])
 }
 
 /// Answer the state query: the workspace salt and the head of the set chain.
@@ -1114,7 +1181,15 @@ pub async fn perform(
             if let Err(code) = authorize_group(state, session, &group).await {
                 return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
             }
-            crate::sync::subscribe(sender, state, connection, group, from_seq).await
+            crate::sync::subscribe(
+                sender,
+                state,
+                connection,
+                group,
+                from_seq,
+                session.negotiated_version(),
+            )
+            .await
         }
         Work::Reconcile { group, payload } => {
             if let Err(code) = authorize_group(state, session, &group).await {
@@ -1129,6 +1204,31 @@ pub async fn perform(
         Work::PublishHandshake { group, message } => {
             publish_handshake(sender, state, session, connection, group, message).await
         }
+        Work::PublishLive { group, epoch, ct } => {
+            publish_live(sender, state, session, connection, group, epoch, ct).await
+        }
+        Work::PublishCall {
+            call_id,
+            group,
+            epoch,
+            kind,
+            body,
+        } => {
+            crate::calls::socket::publish_call(
+                sender, state, session, connection, call_id, group, epoch, kind, body,
+            )
+            .await
+        }
+        Work::PublishMedia {
+            call_id,
+            stream,
+            seq,
+            ct,
+        } => {
+            crate::calls::socket::publish_media(sender, state, connection, call_id, stream, seq, ct)
+                .await
+        }
+        Work::KeyPackages { body } => key_packages(sender, state, session, body).await,
         Work::BlobTicket { payload } => {
             let answer = crate::media::handle(state, session, payload, &state.media_rate).await;
             queue_all(sender, vec![answer])
@@ -1184,4 +1284,81 @@ pub async fn head_seq(state: &Arc<RelayState>, group: &[u8]) -> u64 {
             .await
             .ok();
     u64::try_from(head.flatten().unwrap_or_default()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{keys, Config, Values};
+
+    /// A relay with no database and nothing dialled. Enough for the two refusals
+    /// that are decided before any query runs.
+    fn stateless() -> Arc<RelayState> {
+        let config = Config::resolve(&Values::from_pairs([
+            (keys::HOSTNAME, "relay.acme.com"),
+            (keys::DATABASE_URL, "postgres://weald@localhost/weald_relay"),
+            (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+            (keys::RELEASE_CHECK, "off"),
+        ]))
+        .expect("the configuration resolves");
+        Arc::new(RelayState::new(config, None, None))
+    }
+
+    fn ready_session(state: &Arc<RelayState>) -> Session {
+        Session::new(&state.config)
+    }
+
+    /// The one frame the outbound queue took, or nothing.
+    fn taken(receiver: &mut OutboundReceiver) -> Option<Frame> {
+        match receiver.try_recv() {
+            Ok(Outbound::Frame(frame)) => Some(frame),
+            _ => None,
+        }
+    }
+
+    /// Both of `administer_invite`'s guards, called directly.
+    ///
+    /// They are guards on states the session machine says cannot happen: `INVITE`
+    /// is deferred only from `Ready`, and a `Ready` session has both a workspace
+    /// and a device key. That is exactly why they are worth executing at least
+    /// once. They were written so a later change to the machine fails as a refusal
+    /// rather than as a panic in the privileged path, and a guard nobody has ever
+    /// run is a guard nobody knows the behaviour of. Reached here rather than over
+    /// a socket because no sequence of frames can reach them, which is the claim.
+    #[tokio::test]
+    async fn the_admin_path_refuses_rather_than_panics_when_its_preconditions_do_not_hold() {
+        let state = stateless();
+
+        // No database. `retry`, not a refusal: nothing has been learned about the
+        // request.
+        let (sender, mut receiver) = outbound_channel();
+        let mut session = ready_session(&state);
+        session.bind_workspace("ws-unit".to_string());
+        session.bind_device(vec![0x01; 32]);
+        let request = crate::invite::admin::Request::List.encode();
+        assert!(administer_invite(&sender, &state, &session, request.clone()).await);
+        assert_eq!(
+            taken(&mut receiver),
+            Some(Frame::Error(FrameError::new(ErrorCode::Backpressure)))
+        );
+
+        // A body that is not a request at all, refused before the database is even
+        // looked for.
+        let (sender, mut receiver) = outbound_channel();
+        assert!(administer_invite(&sender, &state, &session, vec![0xff, 0xff]).await);
+        assert!(matches!(taken(&mut receiver), Some(Frame::Error(_))));
+
+        // A session with no device key. Not reachable from `Ready`, and the answer
+        // is the same one a writer outside the access set gets.
+        let (sender, mut receiver) = outbound_channel();
+        let mut anonymous = ready_session(&state);
+        anonymous.bind_workspace("ws-unit".to_string());
+        assert!(administer_invite(&sender, &state, &anonymous, request).await);
+        assert_eq!(
+            taken(&mut receiver),
+            Some(Frame::Error(FrameError::new(
+                ErrorCode::WriterNotInAccessSet
+            )))
+        );
+    }
 }

@@ -17,6 +17,7 @@
 
 pub mod accept;
 pub mod access;
+pub mod calls;
 pub mod cbor;
 pub mod config;
 pub mod db;
@@ -26,6 +27,7 @@ pub mod handshake;
 pub mod health;
 pub mod hub;
 pub mod invite;
+pub mod keys;
 pub mod lifecycle;
 pub mod log;
 pub mod logging;
@@ -314,10 +316,40 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
         keys::MIN_ENC,
         format!("{:?}", resolved.min_encryption).to_lowercase(),
     );
+    row(keys::LIVE, resolved.live_label().to_string());
+    row(
+        keys::LIVE_FANOUT,
+        match &resolved.live_fanout {
+            config::LiveFanout::Process => "process".to_string(),
+            // Named, not printed: a shared fanout endpoint can carry a credential
+            // in its url exactly as the database and cache urls can.
+            config::LiveFanout::Shared(_) => "[set, not printed]".to_string(),
+        },
+    );
+    row(keys::CALLS, resolved.calls_label().to_string());
+    row(
+        keys::MAX_CONCURRENT_CALLS,
+        match resolved.max_concurrent_calls {
+            Some(limit) => limit.to_string(),
+            // Only reachable with calls off, which `Config::enforce_calls`
+            // guarantees: a relay carrying calls without a ceiling does not start.
+            // Saying so here rather than printing an empty column means an operator
+            // reading this back sees why the number is absent.
+            None => "unset, calls off".to_string(),
+        },
+    );
+    row(
+        keys::MAX_CONNECTIONS,
+        describe_limit(resolved.max_connections),
+    );
     row(
         keys::SMTP_URL,
         match resolved.smtp_url {
-            Some(_) => "[set, not printed]".to_string(),
+            // Said out loud rather than left as "[set]". This relay has no SMTP client,
+            // so an operator who configured mail and read a bare "set" would reasonably
+            // conclude invites were being sent. Delivery is the admin's own mail client;
+            // see `invite::delivery`.
+            Some(_) => "[set, and unused: this relay sends no mail]".to_string(),
             None => "unset".to_string(),
         },
     );

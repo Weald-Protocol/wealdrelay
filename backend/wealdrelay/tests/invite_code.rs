@@ -170,24 +170,24 @@ fn the_rate_limit_constants_are_the_ones_the_spec_names() {
 // MARK: Mail
 
 #[test]
-fn who_sends_the_mail_is_decided_by_configuration_and_nothing_else() {
-    // A self-hosted relay with SMTP configured may send it: the operator is the
-    // customer and an invitee address in their own mail server is not a disclosure to
-    // anyone. Everything else copies the link, which is always available and is never
-    // a degraded mode.
-    assert_eq!(delivery::decide(true), Delivery::RelaySends);
-    assert_eq!(delivery::decide(false), Delivery::CopyLink);
-    assert_eq!(Delivery::RelaySends.label(), "relay_sends");
+fn the_relay_never_claims_it_will_send_the_mail() {
+    // The negative for WEALD-L072. `Delivery::RelaySends` and the `relay_sends` label
+    // are gone, because no SMTP client was ever written behind them: a relay that
+    // reported it would send and then did not is worse than one that says plainly that
+    // delivery is the admin's client. `decide` takes no argument now, so there is no
+    // configuration that can move it.
+    assert_eq!(delivery::decide(), Delivery::CopyLink);
     assert_eq!(Delivery::CopyLink.label(), "copy_link");
 }
 
 #[test]
-fn the_hosted_tier_cannot_reach_the_relay_sends_arm() {
-    // Not because this module checks the profile, which would be exactly the branch
-    // on environment `specs/backend/build/environments.md` forbids, but because a
-    // hosted relay cannot start with an SMTP URL at all. The refusal lives in
-    // `profile::enforce` and this is the proof that the two halves meet: the only
-    // input `decide` has is the one the hosted profile makes impossible.
+fn a_hosted_relay_still_refuses_an_smtp_url() {
+    // Unchanged by the arm's removal, and worth keeping for that reason: the variable is
+    // still in the registry and still accepted on a self-host profile, so the refusal on
+    // hosted is the thing that stops a hosted relay from ever holding an invitee address.
+    // The refusal lives in `profile::enforce` rather than here, because a module that
+    // branched on its own environment is what
+    // `specs/backend/build/environments.md` forbids.
     use wealdrelay::config::{keys, Config, Values};
     let values = Values::from_pairs([
         (keys::HOSTNAME, "relay.acme.com"),
@@ -215,4 +215,29 @@ fn the_landing_page_says_nothing_the_relay_does_not_know() {
     assert!(page.contains("location.hash"));
     // The same bytes for every token, including tokens that do not exist.
     assert_eq!(page, delivery::landing_page());
+}
+
+/// A fragment eaten in transit gets a specific message, not silence.
+///
+/// The hosted page at `backend/weald-web/src/workspace-invite.tsx` already diagnosed
+/// this; the relay-served page did not, so which of the two pages an invitee landed
+/// on decided whether they were told why nothing worked. See WEALD-L079.
+#[test]
+fn the_landing_page_names_a_missing_fragment() {
+    let page = delivery::landing_page();
+    assert!(
+        page.contains("id=\"missing-secret\""),
+        "the page has nowhere to put the missing-fragment message"
+    );
+    assert!(
+        page.contains("missing the part after the"),
+        "the message must name the fragment, not just say something went wrong"
+    );
+    // Hidden until the browser knows there is no fragment: the server never sees one,
+    // so a page that showed this unconditionally would accuse every good link.
+    assert!(page.contains("hidden"));
+    assert!(page.contains("location.hash === ''"));
+    // And the dead link is withheld rather than offered, because a `weald://` URL
+    // without the secret is a link macOS answers with an error sheet.
+    assert!(page.contains("removeAttribute('href')"));
 }
