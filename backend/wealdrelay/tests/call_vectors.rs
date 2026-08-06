@@ -128,9 +128,21 @@ fn both_sides_agree_on_the_version_and_the_two_ceilings() {
     // media ceiling was 1600 would send frames the relay refuses, and the refusal
     // would look like a network fault rather than like a disagreement.
     let document = document();
-    assert_eq!(
-        document["protocol_version"].as_u64(),
-        Some(u64::from(PROTOCOL_VERSION))
+    // A range rather than an equality, and the reason is the same one `CONNECT`'s
+    // decoder gives for admitting a version below this build's maximum. This corpus
+    // records the version it was generated at, and version 4 (`WAKE`,
+    // `specs/backend/relay/push.md`) added a frame without touching either call frame
+    // or the envelope. Pinning equality here would mean regenerating a corpus that has
+    // not changed every time an unrelated frame is added, and a regenerated corpus is
+    // one nobody re-derives by hand.
+    let generated_at = document["protocol_version"]
+        .as_u64()
+        .expect("the corpus records the version it was generated at");
+    assert!(
+        (u64::from(wealdrelay::calls::CALL_PROTOCOL_VERSION)..=u64::from(PROTOCOL_VERSION))
+            .contains(&generated_at),
+        "the corpus was generated at version {generated_at}, which is either older than the \
+         version that introduced these frames or newer than this build speaks"
     );
     assert_eq!(
         document["call_protocol_version"].as_u64(),

@@ -166,3 +166,28 @@ Phases 0 to 3 are built and tracked in `specs/backend/build/ledger.json` as step
 it gets a ticket when the archive tier is scheduled rather than before, because
 sequencing work behind an interface that does not yet exist is how a spec family
 turns into fiction.
+
+## Adopting a seal without a relaunch
+
+A transport resolves its seal from disk when it is built, and a device that
+joins a group afterwards is the ordinary joiner: `WorkspaceEncryption` opens a
+socket *in order to* acquire the group, so at the moment the transport was made
+the workspace held no content key.
+
+`RelayTransport.adopt(seal:)` is the one propagation point. It re-points the
+writer, the shared seal holder the publisher reads, the split-view monitor and
+the connection, and then runs `projectBacklog` over what arrived while the
+device was blind. `ChatHub.adoptSeal(forProjectAt:)` is the seam the enrolment
+path calls, and the join model calls it once enrolment has written the group
+store.
+
+The seal is held by reference (`SealHolder`) rather than copied into each
+collaborator, because `EnvelopeLogPublisher` is a struct that `ChatModel` and
+`TicketBoardOutbox` are handed by value at workspace open. A seal stored in
+those copies would be the seal they kept publishing with for the life of the
+process, so the writer would have adopted and the two things that actually
+publish would not have.
+
+Adopting is idempotent and is not a reset of the split-view detector: the
+per-group round state is what the two-consecutive-rounds rule counts, and
+clearing it would make the rule unable to fire in the workspace it protects.

@@ -438,6 +438,7 @@ LIVE      one ephemeral message for a group, fanned out and never stored
 KEYS      publish or fetch key packages, per specs/backend/relay/private-messaging.md
 CALL      one call signalling frame, fanned out at the group and never stored
 MEDIA     one encrypted audio frame, routed at a call's participants and never stored
+WAKE      register, clear or ask about remote push, per specs/backend/relay/push.md
 BYE       clean close
 ```
 
@@ -452,6 +453,21 @@ either one.
 are the second and third frames after `LIVE` that the relay may shed under
 pressure, and like `LIVE` they are never sequenced, never stored, never returned
 by a `RECON` round, never attested and never named in a `drop_before` manifest.
+
+`WAKE` is protocol version 4 and is described in
+`specs/backend/relay/push.md`, with the component at the other end of it in
+`specs/backend/relay/ringer.md` and the decision behind the pair in
+`specs/backend/contracts/decisions/ADR-0012-push-via-a-separate-ringer.md`. Tag 25,
+the next free integer, and named `WAKE` rather than `PUSH` because tag 10 has been
+`PUSH` since version 1 and reusing the word in a second place would be a defect
+waiting for a reader.
+
+It is unlike the four frames above it in the one way that matters here: it is
+durable. A registration is a row, written on the accept path and removed with the
+access-set entry that owns it or by the GC pass at its expiry, so `WAKE` is never
+shed under pressure and a `Register` that is not answered was not stored. What it
+stores is sixteen opaque bytes minted elsewhere, and the relay holds no APNs token,
+receives none, and has no field that could hold one.
 
 `MEDIA` carries no group and that is deliberate rather than an omission: the
 group is checked once, when a `CALL` admits the connection to that call id, and
@@ -576,7 +592,7 @@ membership proof; v1 must not claim one.
 `AUTH` proves the connecting party holds a key in the current **access set**. It
 deliberately does not prove group membership, because proving that to the relay
 would leak the membership graph. Within the access set, the relay serves any
-group a connected device asks for, and non-members simply cannot decrypt. Rate
+group a connected device asks for, and non-members cannot decrypt it. Rate
 limiting and quota are per device.
 
 ## The access set
@@ -924,7 +940,7 @@ never reaches the point of signing anything.
 
 Version 2 adds the `LIVE` and `KEYS` frames and the `0x0022` kind, and changes
 nothing about the envelope, so a version 1 client keeps working against a version
-2 relay and simply never receives a frame it does not know. That is what a
+2 relay and never receives a frame it does not know. That is what a
 frame-tag addition is allowed to be: the selected version, not the tag set, is
 what a client checks.
 
@@ -933,6 +949,21 @@ an existing frame, so the same sentence holds one version up: a version 1 or 2
 client keeps working against a version 3 relay. Fanout filters on the negotiated
 version at 3 for both, exactly as it filters at 2 for `LIVE`, and a client that
 was never sent a frame it cannot name never has to decide what to do with one.
+
+Version 4 adds the `WAKE` frame and changes nothing else, so the sentence holds a
+third time. `PROTOCOL_VERSION` is 4, `MIN_PROTOCOL_VERSION` is still 1, `CONNECT`
+still carries one field, and the relay still selects the lower of the two ceilings
+exactly as it has since version 1. A version 3 client keeps working and simply never
+sends a `WAKE`, which means it never receives a push, which is the same posture as a
+relay whose operator set `WEALD_RELAY_PUSH=off`. Naming that equivalence is the
+point: an old client is not in a degraded state, it is in a configuration this
+protocol supports, and there is nothing for either side to detect or work around.
+
+Version 4 also adds `limit` to the error classes, which is the only class this
+protocol has ever added and is breaking for the reason `contracts/governance.md`
+section 3 gives: clients branch on the class before the code, so a class they do not
+know is a branch they cannot take. It rides this bump rather than arriving as a
+clarification, and it is the reason version 4 is a version bump and not two of them.
 
 The relay accepts any envelope version it knows and stores unknown-kind payloads
 verbatim. Breaking the envelope means a new version number, a published

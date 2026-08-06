@@ -219,6 +219,12 @@ pub enum Work {
     },
     /// One key-package publication or fetch (step 33).
     KeyPackages { body: KeysBody },
+    /// One push-wake registration, clear or query (step 37).
+    ///
+    /// Deferred exactly like ``Work::KeyPackages``: the state machine decides that the
+    /// session may ask, and everything that needs the database or the configuration
+    /// is decided by `ws::wake_registration`.
+    WakeRegistration { body: crate::frame::WakeBody },
     /// One call signalling frame: access-set checked, applied to the call
     /// registry, then fanned out to the group's version 3 subscribers and
     /// forgotten (step 35). Nothing is stored and the publisher is not answered.
@@ -635,6 +641,41 @@ impl Session {
                     )]);
                 }
                 Reaction::Defer(Work::KeyPackages { body })
+            }
+            // `Ready` only, like every frame except `JOIN`. A registration is a
+            // statement about an admitted principal, and the relay learns which
+            // principal from the authenticated session rather than from a field, so a
+            // session that has not authenticated has nothing to register against.
+            (State::Ready, Frame::Wake(body)) => {
+                // The relay-to-client forms are refused on the way in, exactly as
+                // `KEYS` refuses its own. A client sending one is a client that is
+                // wrong about the protocol, and the catch-all's answer is the right
+                // one.
+                if !matches!(
+                    body,
+                    crate::frame::WakeBody::Register { .. }
+                        | crate::frame::WakeBody::Clear
+                        | crate::frame::WakeBody::Query
+                ) {
+                    self.state = State::Closed;
+                    return Reaction::ReplyAndClose(vec![Frame::Error(FrameError::new(
+                        ErrorCode::MalformedHeader,
+                    ))]);
+                }
+                // An expiry that has already passed, judged against the relay's own
+                // observed time. Here rather than in the codec because the codec has
+                // no clock, and `reject` rather than `denied` because a registration
+                // that expired before it arrived is permanently wrong as sent: the
+                // client's fix is to ask the ringer for a live handle, never to resend
+                // this one (`specs/backend/relay/push.md` section 3).
+                if let crate::frame::WakeBody::Register { expires_at, .. } = &body {
+                    if *expires_at <= now_ms {
+                        return Reaction::Reply(vec![Frame::Error(FrameError::new(
+                            ErrorCode::PushHandleMalformed,
+                        ))]);
+                    }
+                }
+                Reaction::Defer(Work::WakeRegistration { body })
             }
             // `Ready` only, like every other group-addressed frame. A call frame
             // names a group and claims a place in a conversation inside it, which

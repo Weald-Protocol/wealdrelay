@@ -106,6 +106,14 @@ pub async fn publish_call(
         .hub
         .fanout_frame(&group, &frame, connection, CALL_PROTOCOL_VERSION)
         .await;
+    // An offer, and only an offer, wakes the group's sleeping devices. An answer, a
+    // decline and a bye are all about a call somebody is already in, so the device
+    // that would be woken is by construction a device holding a socket. The wake is
+    // exempt from coalescing (`crate::push::queue`): a ring that arrives two seconds
+    // late is a missed call.
+    if matches!(kind, CallKind::Offer) {
+        crate::push::dispatch::after_commit(state, group.clone(), crate::push::Category::Call);
+    }
     // And then nothing. No acknowledgement and no sequence number, because nothing
     // was kept: the same silence a `LIVE` gets, for the same reason.
     true

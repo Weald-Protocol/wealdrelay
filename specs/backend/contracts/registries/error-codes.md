@@ -22,6 +22,19 @@ are not extensible without a protocol version bump.
 | `denied` | Well formed, not permitted now. Do not retry blind. Re-read the named state and act. |
 | `quota` | Over a limit. Retry after the named interval, or surface the limit with the lever that clears it. |
 | `version` | Unsupported or below the pinned floor. Abort the connection. Never silently continue. |
+| `limit` | Over a per-principal ceiling on a write the client can simply stop making. Retry after the named interval, on the frame only: the connection stays up and durable traffic is unaffected. |
+
+`limit` arrived with protocol version 4 and is the only class this protocol has
+ever added. Adding a class is a breaking change by the mechanical test in
+`../governance.md` section 3, because clients branch on the class before the code,
+so it rides the same version bump the `WAKE` frame does rather than arriving as a
+clarification. It exists rather than being folded into `quota` because the two
+mean different things to the person on the other end: `quota` is a workspace over
+an allowance an operator or an invoice can raise, and it belongs in a sentence
+naming the lever that clears it, while `limit` is one device's own behaviour and
+the honest client response is to slow down and say nothing to anybody. Folding it
+into `quota` would have put "you are over your plan" in front of a user whose
+phone rotated a push handle in a loop.
 
 | Code | Class | Emitted when | Carries |
 | --- | --- | --- | --- |
@@ -48,6 +61,10 @@ are not extensible without a protocol version bump.
 | `quota/group_ingress_limited` | quota | Two things, both ingress aimed at one group. The admission-blind abuse budget in `../../relay/wire.md`: 8 MiB per principal per target group per minute, 64 MiB per workspace per minute, or 32 MiB of undelivered backlog, charged before persistence. And, since protocol version 3, the media budgets in `../../relay/calls.md`: 60 `MEDIA` frames per stream per second, 1 MiB per connection per minute, and 32 distinct streams tracked per connection. | retry-after, the limit |
 | `version/protocol_unsupported` | version | `v` unsupported by this relay. | supported range |
 | `version/below_client_floor` | version | Relay's version is below the client's pinned floor. | relay version |
+| `reject/push_handle_malformed` | reject | A `WAKE` `Register` whose handle is not exactly 16 bytes, whose `categories` bitmask is empty or carries an undefined bit, or whose `expires_at` has already elapsed; and, in the other direction, a `Capability` whose `register_url` is not `https` or is longer than 512 bytes, which the client refuses rather than registering against. A reject and not a denial because every one of those is permanently wrong as sent, so resending would be wrong in the same way. | |
+| `denied/push_not_configured` | denied | A well-formed `Register` sent to a relay with `WEALD_RELAY_PUSH=off`, which is the default and a supported deployment rather than a degraded one. Denied rather than rejected because the frame is correct and the answer would change if the operator changed one variable; the client re-reads state by sending `Query` and never by retrying the registration. | |
+| `limit/push_registration_rate` | limit | More than five `WAKE` registrations per principal per hour. Rotation is weekly by design, so five is generous, and the ceiling exists because a registration is a write and a device with a loop must not be one. Refused on the frame only. | retry-after, the limit |
+| `retry/push_backpressure` | retry | No database on a `WAKE` registration. Fails closed like every other admission path. Distinct from `retry/backpressure`, which is the relay's own receive queue, and distinct from the wake path's bounded outbound queue, which drops the oldest and increments a counter rather than answering anybody, because a wake has nobody to answer. | retry-after |
 
 `quota/group_ingress_limited` was added to this table in step 4. It was specified
 in `../../relay/wire.md` and named in the protocol document, but had no row here,

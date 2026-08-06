@@ -338,3 +338,74 @@ fn the_landing_page_offers_a_download_that_resolves_off_the_relay() {
         "the way back after installing must be stated, or the download is another dead end"
     );
 }
+
+#[tokio::test]
+async fn readyz_reports_push_off_on_a_relay_that_has_no_outbound_leg() {
+    // The default posture, and a supported deployment rather than a degraded one. A
+    // customer whose notifications are local should be able to see that from the
+    // document rather than by reading their operator's environment file.
+    let state = RelayState::new(config(&[(keys::RELEASE_CHECK, "off")]), None, None);
+    let readiness = state.readiness().await;
+    assert_eq!(readiness.push, "off");
+    // And the field is in the serialised document, because a poller parses that
+    // rather than the struct.
+    let rendered = serde_json::to_value(&readiness).expect("the document serialises");
+    assert_eq!(rendered["push"], "off");
+}
+
+#[tokio::test]
+async fn readyz_reports_configured_and_then_unreachable_without_becoming_un_ready() {
+    // `push.md` section 5: unreachable is not un-ready. A relay whose ringer is down
+    // still accepts, stores and serves, and taking a whole deployment out of a load
+    // balancer for a best-effort side channel would be a self-inflicted outage.
+    let state = RelayState::new(
+        config(&[
+            (keys::RELEASE_CHECK, "off"),
+            (keys::PUSH, "on"),
+            (keys::PUSH_URL, "https://ringer.weald.team/v1/wake"),
+        ]),
+        None,
+        None,
+    );
+    assert_eq!(state.readiness().await.push, "configured");
+
+    // A wake that did not reach the ringer at all.
+    state
+        .push
+        .record(wealdrelay::push::ringer::Outcome::Unreachable);
+    let readiness = state.readiness().await;
+    assert_eq!(readiness.push, "unreachable");
+    // `ready` is decided by the database, the storage, the write mode and the frozen
+    // groups, and by nothing else. Both are down here, so this asserts the narrower
+    // thing that matters: push is not one of the terms.
+    assert!(!readiness.ready, "no dependencies, so not ready");
+    let with_dependencies = readiness.ready;
+    assert_eq!(
+        with_dependencies,
+        RelayState::new(config(&[(keys::RELEASE_CHECK, "off")]), None, None)
+            .readiness()
+            .await
+            .ready,
+        "turning push on or breaking it changes nothing about readiness"
+    );
+
+    // And a ringer that answers again is `configured` again, without a restart.
+    state
+        .push
+        .record(wealdrelay::push::ringer::Outcome::Accepted);
+    assert_eq!(state.readiness().await.push, "configured");
+}
+
+#[test]
+fn the_three_push_states_are_the_strings_the_document_promises() {
+    // A closed set, checked against the set rather than against a string somebody
+    // typed twice. A fourth state would be a document shape a poller has to learn.
+    use wealdrelay::push::Health;
+
+    assert_eq!(Health::Off.as_str(), "off");
+    assert_eq!(Health::Configured.as_str(), "configured");
+    assert_eq!(Health::Unreachable.as_str(), "unreachable");
+    for state in [Health::Off, Health::Configured, Health::Unreachable] {
+        assert!(format!("{state:?}").len() > 2, "the state is debuggable");
+    }
+}

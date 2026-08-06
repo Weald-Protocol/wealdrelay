@@ -108,6 +108,14 @@ pub struct Readiness {
     /// opaque.
     pub frozen_groups: Vec<String>,
     pub release: ReleaseState,
+    /// The push posture: `off`, `configured` or `unreachable`.
+    ///
+    /// Reported for the reason `access_set` and `calls` are, and with one extra
+    /// consequence stated in `specs/backend/relay/push.md` section 5: `unreachable`
+    /// is **not** un-ready. A relay whose ringer is down still accepts, stores and
+    /// serves, and taking a whole deployment out of a load balancer for a best-effort
+    /// side channel would be a self-inflicted outage.
+    pub push: &'static str,
     /// The call posture: `on` or `off`, reported for the reason `access_set` and
     /// `min_enc` are. A customer whose calls do not connect should be able to see
     /// that this relay does not carry them, rather than reading their operator's
@@ -118,9 +126,38 @@ pub struct Readiness {
     /// a labelled count here would be exactly the metadata `crate::hub` refuses to
     /// hold. `specs/backend/relay/calls.md`.
     pub call_stats: CallStats,
+    /// What the Postgres pool is doing. The signal a hosted resize is driven by,
+    /// and the one an operator sizing their own instance needs.
+    pub db_pool: PoolStats,
     /// Whether the relay would accept a durable write right now. The one-line
     /// answer, so a poller does not have to reimplement the conjunction.
     pub ready: bool,
+}
+
+/// The Postgres pool, as three numbers.
+///
+/// Reported because the pool ceiling is the relay's hardest capacity limit and
+/// the least visible one. `specs/backend/cloud/provisioning.md` promises resize
+/// is metric-driven, and a database resize needs a metric about the database:
+/// CPU on the relay's own container says nothing about a pool that is fully
+/// checked out, and the symptom of an undersized pool is an `acquire_timeout`
+/// that looks like a relay defect from every other vantage point.
+///
+/// Capacity, never identity: no group, no principal, no query. Three integers
+/// about this process's own connections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolStats {
+    /// The ceiling, from `WEALD_RELAY_DB_POOL_SIZE`.
+    pub size: u32,
+    /// Connections the pool holds right now, busy or idle.
+    pub connections: u32,
+    /// Of those, the ones checked out to a query at this instant.
+    ///
+    /// Equal to `size` is the state that matters: every further caller is waiting
+    /// on `acquire_timeout`, and a relay that sits there is one whose database is
+    /// too small or whose pool is, which are different fixes with the same
+    /// symptom.
+    pub in_use: u32,
 }
 
 /// What an operator can see about calls, and the whole of it.
@@ -197,6 +234,16 @@ pub struct RelayState {
     /// How many connections were refused because the cap was reached. An operator
     /// counter with no label: capacity, never identity.
     pub connections_refused: std::sync::atomic::AtomicU64,
+    /// The wake path: the bounded queue, the settings and the counters
+    /// (`crate::push`). Present whether push is on or off, because a relay with push
+    /// off still has to answer a `Query` with `enabled: false` and still has to say
+    /// `off` on `/readyz`, and an `Option` here would have put a "no push path
+    /// configured" arm on every one of those call sites.
+    pub push: crate::push::Push,
+    /// The five-per-hour-per-principal registration ceiling. Process-local, shared by
+    /// every connection this relay serves, and keyed by entry hash so a device that
+    /// reconnects does not get a fresh allowance.
+    pub push_rate: crate::push::store::RateLimiter,
 }
 
 impl RelayState {
@@ -211,6 +258,9 @@ impl RelayState {
         // the honest ceiling rather than a number nobody chose.
         let max_concurrent_calls =
             usize::try_from(config.max_concurrent_calls.unwrap_or(0)).unwrap_or(usize::MAX);
+        // Built before `config` is moved, for the reason the call ceiling is read
+        // first: this reads six of its fields and the struct owns it afterwards.
+        let push = crate::push::Push::from_config(&config);
         Self {
             config,
             database,
@@ -224,6 +274,8 @@ impl RelayState {
             calls: crate::calls::CallRegistry::new(max_concurrent_calls),
             connections: std::sync::atomic::AtomicUsize::new(0),
             connections_refused: std::sync::atomic::AtomicU64::new(0),
+            push,
+            push_rate: crate::push::store::RateLimiter::new(),
         }
     }
 
@@ -331,6 +383,7 @@ impl RelayState {
             },
             frozen_groups,
             release,
+            push: self.push.health().as_str(),
             calls: self.config.calls_label(),
             call_stats: CallStats {
                 open: self.calls.open_calls().await as u64,
@@ -341,7 +394,33 @@ impl RelayState {
                     .connections_refused
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
+            db_pool: self.pool_stats(),
             ready,
+        }
+    }
+
+    /// The pool's three numbers, or zeroes where there is no pool. Zeroes rather
+    /// than an absent field: the document shape does not change with the
+    /// configuration, so a poller has one shape to parse.
+    fn pool_stats(&self) -> PoolStats {
+        let size = self.config.db_pool_size;
+        match &self.database {
+            None => PoolStats {
+                size,
+                connections: 0,
+                in_use: 0,
+            },
+            Some(db) => {
+                let pool = db.pool();
+                // `size` is already a `u32`; `num_idle` is a `usize`.
+                let connections = pool.size();
+                let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX);
+                PoolStats {
+                    size,
+                    connections,
+                    in_use: connections.saturating_sub(idle),
+                }
+            }
         }
     }
 

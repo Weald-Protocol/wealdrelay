@@ -232,9 +232,21 @@ pub async fn run(
         axum::serve(private, private_router(private_state).into_make_service()).into_future(),
     );
 
+    // The wake worker, when push is on. Started here rather than in `prepare`,
+    // because `prepare` is also what `--check-config` and the store suites drive and
+    // neither of those should have an outbound leg running behind them. `None` when
+    // push is off, which is the default and a supported deployment.
+    let push_worker = crate::push::spawn(&state);
+
     until.await;
     public_task.abort();
     private_task.abort();
+    if let Some(worker) = push_worker {
+        // Aborted rather than awaited. The worker's loop has no exit and nothing it
+        // holds needs unwinding: a wake in flight is best effort by construction, and
+        // a wake still in the queue is one the client's reconciliation covers.
+        worker.abort();
+    }
     tracing::info!("wealdrelay stopped");
 }
 
@@ -246,7 +258,8 @@ pub async fn run(
 /// failure harder to read without making it more real. The suite also runs the
 /// built binary, for the parts that are about the process.
 pub async fn prepare(config: Config) -> Result<RelayState, ServeError> {
-    let database = Database::connect(&config.database_url).await?;
+    let database =
+        Database::connect_with_pool_size(&config.database_url, config.db_pool_size).await?;
     // Migrations before the listener, not after: see the module comment.
     database.migrate().await?;
     bootstrap(&database, &config).await;

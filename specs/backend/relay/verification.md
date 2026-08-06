@@ -210,3 +210,45 @@ review rather than a judgement call:
 Any feature request that needs one of these is a request to change the trust
 boundary and belongs in `specs/backend/relay/overview.md` as a product change,
 argued in those words.
+
+## The client's own floor, and the alarm it raises
+
+Two things the client owes independently of what the relay says about itself.
+Both existed as mechanism and neither reached a user, which is the failure mode
+this section exists to prevent: a detector whose answer is discarded is not a
+detector.
+
+**The encryption floor is the client's, derived from what it holds.** A
+workspace that holds content keys refuses an `enc: 0` record arriving over the
+socket (`EnvelopeSeal.floor`, applied in `RelayConnection.accept`). The relay's
+`WEALD_RELAY_MIN_ENC` defends the other direction only: it makes a client prove
+it can seal, and says nothing about what a client accepts. A relay restarted
+with the floor off is the cheapest move the operator of our own infrastructure
+has, and until the client had a floor of its own the panel's sentence "this
+relay refuses unencrypted envelopes" was the server's answer about the server.
+The refusal is a panel state (`Status.downgradeRefused`), not a log line, and it
+does not clear itself.
+
+The floor is applied at the arrival boundary and deliberately not inside
+`EnvelopeSeal.open`. Records already in the log from before a workspace turned
+encryption on are history a person can still read; refusing them retroactively
+would blank a migrated workspace rather than protect it.
+
+**A relabelled record is reported as tampering, not as a missing key.** A relay
+cannot forge a signature, so what remains to it is relabelling, rehoming,
+withholding and reordering. `EnvelopePayload.open` has always caught the first
+two and named both header summaries; every live reader went through
+`payloadIfReadable`, which collapsed that to `nil` and left a relabelled
+envelope looking like an epoch we joined too late for. `Envelope.read(opening:)`
+keeps the distinction, `TamperLog` holds it for the session, and the encryption
+panel states it with both summaries so the reader is not asked to take our word
+for what changed.
+
+Nothing is disclosed by the relabelling itself: the record still does not open.
+What was lost was the alarm, and the alarm is the product. "The relay cannot
+tamper without you noticing" is only true if the client notices out loud.
+
+The audit reports the two classes separately (`rejected` for a record that is
+wrong, `unreadable` for one this device holds no key for) because a caller that
+cannot tell them apart cannot use `holds` for anything: before the split, a
+joiner reading history from before it arrived indicted itself.

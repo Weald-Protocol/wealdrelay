@@ -30,6 +30,15 @@ use std::path::{Path, PathBuf};
 pub mod keys {
     pub const HOSTNAME: &str = "WEALD_RELAY_HOSTNAME";
     pub const DATABASE_URL: &str = "WEALD_RELAY_DATABASE_URL";
+    /// How many Postgres backends this process holds open at once.
+    ///
+    /// A memory budget on the database rather than on the relay, and on a small
+    /// instance a hard ceiling too: providers cap connections per plan, and a
+    /// pool above the cap fails `acquire_timeout` under load rather than
+    /// degrading. Defaults to `crate::db::DEFAULT_POOL_SIZE`, which is sized for
+    /// the smallest plan the hosted tier sells; an operator on a larger database
+    /// raises it deliberately.
+    pub const DB_POOL_SIZE: &str = "WEALD_RELAY_DB_POOL_SIZE";
     pub const STORAGE_URL: &str = "WEALD_RELAY_STORAGE_URL";
     pub const REDIS_URL: &str = "WEALD_RELAY_REDIS_URL";
     pub const LISTEN: &str = "WEALD_RELAY_LISTEN";
@@ -101,6 +110,38 @@ pub mod keys {
     /// means the routes are not there at all, which is the self-host shape: a
     /// self-hoster has no control plane and reads the invite off stdout.
     pub const OPERATOR_TOKEN: &str = "WEALD_RELAY_OPERATOR_TOKEN";
+    /// Whether the relay has an outbound wake leg at all.
+    ///
+    /// `off` by default, and off is a supported deployment rather than a degraded
+    /// one: the relay then has no outbound leg, devices are told push is unavailable
+    /// and never register, and notifications stay local and full-content exactly as
+    /// `specs/backend/relay/notifications.md` version 1 describes them. A
+    /// self-hoster on a private network keeps this forever.
+    pub const PUSH: &str = "WEALD_RELAY_PUSH";
+    /// Where a wake is POSTed. Required if and only if push is on.
+    ///
+    /// No default, ever, for the same reason `WEALD_RELAY_MAX_CONCURRENT_CALLS` has
+    /// none: a wake destination is a trust boundary, and a relay that inherited one
+    /// silently would be a relay whose users' devices are being woken by a party
+    /// their operator never chose.
+    pub const PUSH_URL: &str = "WEALD_RELAY_PUSH_URL";
+    /// The bearer the ringer checks, when it is configured with one.
+    ///
+    /// Optional, because authority to wake a device is possession of the handle and
+    /// the handle is a capability the device minted. Never printed by
+    /// `--check-config` and never logged.
+    pub const PUSH_TOKEN: &str = "WEALD_RELAY_PUSH_TOKEN";
+    /// What `Capability` states, when it differs from the wake url.
+    ///
+    /// Defaults to `PUSH_URL` with the ringer's own `/v1/handles` path, because that
+    /// is where the reference ringer serves registration. The relay states it rather
+    /// than letting the device guess, since guessing ours would mean a self-hoster's
+    /// users silently registering with a ringer their operator did not choose.
+    pub const PUSH_REGISTER_URL: &str = "WEALD_RELAY_PUSH_REGISTER_URL";
+    /// The coalescing window in milliseconds. Zero is legal and means no coalescing.
+    pub const PUSH_COALESCE_MS: &str = "WEALD_RELAY_PUSH_COALESCE_MS";
+    /// The bound on the wake queue. A bound, not a target.
+    pub const PUSH_QUEUE: &str = "WEALD_RELAY_PUSH_QUEUE";
     /// Which deployment this is. `self_host` by default; `hosted` refuses the
     /// settings `specs/backend/relay/server.md` says the hosted tier forbids.
     /// Configuration, never a compile-time branch: both profiles are in every
@@ -113,6 +154,7 @@ pub mod keys {
     pub const ALL: &[&str] = &[
         HOSTNAME,
         DATABASE_URL,
+        DB_POOL_SIZE,
         STORAGE_URL,
         REDIS_URL,
         LISTEN,
@@ -134,6 +176,12 @@ pub mod keys {
         BOOTSTRAP_HANDOFF_PUBKEY,
         OPERATOR_TOKEN,
         PROFILE,
+        PUSH,
+        PUSH_URL,
+        PUSH_TOKEN,
+        PUSH_REGISTER_URL,
+        PUSH_COALESCE_MS,
+        PUSH_QUEUE,
     ];
 }
 
@@ -211,6 +259,18 @@ pub enum CallMode {
     Off,
 }
 
+/// Whether the relay has an outbound wake leg.
+///
+/// `off` is the default and is a posture rather than a failure: a relay with no
+/// ringer answers `denied/push_not_configured` to a `Register` and `enabled: false`
+/// to a `Query`, and a client reads both as an instruction to hold no registration
+/// and raise no expectation of push (`specs/backend/relay/push.md` section 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushMode {
+    On,
+    Off,
+}
+
 /// A vendor-neutral local maintenance mode. `read_only` rejects new durable
 /// writes while leaving reconciliation and export available. It does not contact
 /// or name a billing system.
@@ -251,6 +311,8 @@ pub struct Config {
     pub listen: String,
     pub observability_listen: String,
     pub tls: TlsMode,
+    /// The Postgres pool ceiling. See `keys::DB_POOL_SIZE`.
+    pub db_pool_size: u32,
     pub max_storage_gb: Limit,
     pub retention_days: Limit,
     pub access_set: AccessSetMode,
@@ -271,6 +333,17 @@ pub struct Config {
     /// The operator bearer, or `None` where the operator routes are not mounted.
     pub operator_token: Option<String>,
     pub profile: crate::profile::Profile,
+    pub push: PushMode,
+    /// Where a wake is POSTed. `Some` exactly when push is on, which
+    /// `enforce_push` guarantees in both directions: on without a url does not
+    /// start, and off with one does not either.
+    pub push_url: Option<String>,
+    pub push_token: Option<String>,
+    /// What `Capability` states, when the operator set it explicitly. `None` means
+    /// "derive it from the wake url", which `crate::push::Settings` does once.
+    pub push_register_url: Option<String>,
+    pub push_coalesce_ms: u64,
+    pub push_queue: u64,
 }
 
 /// Why a configuration was refused.
@@ -366,6 +439,42 @@ pub enum ConfigError {
     /// relay that may hold no connections is not a relay.
     #[error("{key}=0 is not a limit; use off or unlimited to say what you mean")]
     ZeroLimit { key: &'static str },
+    /// Push on with nowhere to send a wake.
+    ///
+    /// Fatal and never defaulted, for the reason the call ceiling is never
+    /// defaulted: this is a trust boundary, and an operator who meant to point at
+    /// their own ringer must not silently inherit somebody else's.
+    #[error(
+        "{key} is required when {because}=on and has no default: a wake destination is a trust \
+         boundary and inheriting one silently is the mistake this refusal exists to prevent"
+    )]
+    PushUrlMissing {
+        key: &'static str,
+        because: &'static str,
+    },
+    /// A `PUSH_*` variable set on a relay with push off.
+    ///
+    /// Refused rather than ignored. A configured-and-ignored outbound destination
+    /// reads as working and is not, which is exactly the class of mistake
+    /// `--check-config` exists to surface.
+    #[error("{key} is set but {because}=off, so it would do nothing; turn push on or unset it")]
+    PushSettingUnused {
+        key: &'static str,
+        because: &'static str,
+    },
+    /// A wake or registration url that is not `https` and not loopback.
+    ///
+    /// `push.md` section 5 exempts the `local` and `ci` profiles, and the exemption
+    /// is spelled here as loopback because that is the part of it this binary can
+    /// check: the relay has no notion of a build profile, and those two profiles are
+    /// exactly the deployments whose ringer is a listener on 127.0.0.1 reaching no
+    /// vendor at all. Anything else is a wake destination on the open internet, and
+    /// a handle in cleartext there is a wake capability anybody on the path can use.
+    #[error(
+        "{key}={value} must be https, or http against loopback for a local harness ringer; \
+         a plaintext wake url on any other host puts a wake capability on the wire"
+    )]
+    PushUrlNotSecure { key: &'static str, value: String },
     /// A setting the hosted profile forbids. Fatal at startup: a relay that
     /// logged about a forbidden setting and served anyway would be a relay whose
     /// posture nobody chose (`crate::profile`).
@@ -394,6 +503,9 @@ impl ConfigError {
             | Self::CallsCeilingMissing { key, .. }
             | Self::CallsCeilingUnused { key, .. }
             | Self::CallsSingleProcess { key, .. }
+            | Self::PushUrlMissing { key, .. }
+            | Self::PushSettingUnused { key, .. }
+            | Self::PushUrlNotSecure { key, .. }
             | Self::ZeroLimit { key } => Some(key),
             Self::UnknownFileKey { key, .. } | Self::NonScalarFileValue { key, .. } => Some(key),
             Self::UnreadableFile { .. } | Self::MalformedFile { .. } => None,
@@ -642,6 +754,77 @@ impl Config {
         Ok(())
     }
 
+    /// The label `/readyz`, the startup log and `--check-config` use for push.
+    pub fn push_label(&self) -> &'static str {
+        match self.push {
+            PushMode::On => "on",
+            PushMode::Off => "off",
+        }
+    }
+
+    /// The four rules that make the push configuration answerable rather than
+    /// guessed, all four fatal at startup (`specs/backend/relay/push.md` section 5).
+    ///
+    /// Fatal rather than warned about, for the reason the call rules are: a relay
+    /// that will not start is a page a human reads, and a relay that quietly holds a
+    /// wake destination nobody chose is a privacy failure nobody sees.
+    fn enforce_push(&self) -> Result<(), ConfigError> {
+        match (self.push, self.push_url.as_deref()) {
+            (PushMode::On, None) => {
+                return Err(ConfigError::PushUrlMissing {
+                    key: keys::PUSH_URL,
+                    because: keys::PUSH,
+                })
+            }
+            (PushMode::Off, Some(_)) => {
+                return Err(ConfigError::PushSettingUnused {
+                    key: keys::PUSH_URL,
+                    because: keys::PUSH,
+                })
+            }
+            (PushMode::On, Some(_)) | (PushMode::Off, None) => {}
+        }
+        // The other three, in the order an operator is most likely to have set them.
+        // Each is refused rather than ignored: a variable the binary accepts and does
+        // not honour is one an operator reads back and believes.
+        if matches!(self.push, PushMode::Off) {
+            for (key, set) in [
+                (keys::PUSH_TOKEN, self.push_token.is_some()),
+                (keys::PUSH_REGISTER_URL, self.push_register_url.is_some()),
+                (
+                    keys::PUSH_COALESCE_MS,
+                    self.push_coalesce_ms != crate::push::DEFAULT_COALESCE_MS,
+                ),
+                (
+                    keys::PUSH_QUEUE,
+                    self.push_queue != crate::push::DEFAULT_QUEUE,
+                ),
+            ] {
+                if set {
+                    return Err(ConfigError::PushSettingUnused {
+                        key,
+                        because: keys::PUSH,
+                    });
+                }
+            }
+            return Ok(());
+        }
+        for (key, url) in [
+            (keys::PUSH_URL, self.push_url.as_deref()),
+            (keys::PUSH_REGISTER_URL, self.push_register_url.as_deref()),
+        ] {
+            if let Some(url) = url {
+                if !is_secure_push_url(url) {
+                    return Err(ConfigError::PushUrlNotSecure {
+                        key,
+                        value: url.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn min_enc_label(&self) -> &'static str {
         match self.min_encryption {
             MinEncryption::None => "none",
@@ -736,6 +919,7 @@ impl Config {
             // gigabytes at the absolute ceiling, which is a bound a modest
             // instance survives; an operator with more memory says so.
             max_connections: connection_limit(values, keys::MAX_CONNECTIONS)?,
+            db_pool_size: pool_size(values, keys::DB_POOL_SIZE)?,
             smtp_url: optional(values, keys::SMTP_URL)?.map(str::to_string),
             write_mode: one_of(
                 values,
@@ -759,9 +943,33 @@ impl Config {
                 crate::profile::Profile::ALLOWED,
                 crate::profile::Profile::TABLE,
             )?,
+            // `off` by default, like `calls` and unlike `live`. Push is the only
+            // component of this system that talks to a party outside the operator's
+            // control, so it is a posture an operator adopts rather than one they
+            // inherit from an upgrade (`specs/backend/relay/push.md` section 5).
+            push: one_of(
+                values,
+                keys::PUSH,
+                PushMode::Off,
+                "on, off",
+                &[("on", PushMode::On), ("off", PushMode::Off)],
+            )?,
+            push_url: optional(values, keys::PUSH_URL)?.map(str::to_string),
+            push_token: optional(values, keys::PUSH_TOKEN)?.map(str::to_string),
+            push_register_url: optional(values, keys::PUSH_REGISTER_URL)?.map(str::to_string),
+            // Zero is legal here and means no coalescing, so this is not `positive`:
+            // a relay whose operator wants every wake sent as it arrives is a
+            // deployment, not a mistake.
+            push_coalesce_ms: count(
+                values,
+                keys::PUSH_COALESCE_MS,
+                crate::push::DEFAULT_COALESCE_MS,
+            )?,
+            push_queue: positive(values, keys::PUSH_QUEUE)?.unwrap_or(crate::push::DEFAULT_QUEUE),
         };
         resolved.enforce_live_fanout()?;
         resolved.enforce_calls()?;
+        resolved.enforce_push()?;
         // Last, because the hosted rules are about the resolved values rather
         // than about the strings, and a rule that ran mid-resolution would have
         // to be re-stated for every source a value can come from.
@@ -905,6 +1113,32 @@ fn positive(values: &Values, key: &'static str) -> Result<Option<u64>, ConfigErr
     Ok(Some(parsed))
 }
 
+/// A plain count with a default, where zero is a legal value that means something.
+///
+/// Separate from ``positive`` because zero is the whole point at the one key that
+/// uses this: `WEALD_RELAY_PUSH_COALESCE_MS=0` is "send every wake as it arrives",
+/// which is a posture rather than the absent limit ``positive`` exists to refuse.
+fn count(values: &Values, key: &'static str, default: u64) -> Result<u64, ConfigError> {
+    let Some(value) = optional(values, key)? else {
+        return Ok(default);
+    };
+    value.parse::<u64>().map_err(|_| ConfigError::NotANumber {
+        key,
+        value: value.to_string(),
+    })
+}
+
+/// Whether a wake destination may be used as written.
+///
+/// The rule itself is `crate::push::is_acceptable_register_url`, and it lives there
+/// because the `WAKE` codec applies the same one: a relay that refused a url at
+/// startup and encoded one on the wire would be two rules with one name. Here it is
+/// wrapped only to refuse the empty string, which is a legal `Capability` field
+/// meaning "no ringer" and is not a legal wake destination.
+fn is_secure_push_url(value: &str) -> bool {
+    !value.is_empty() && crate::push::is_acceptable_register_url(value)
+}
+
 /// The socket cap: a number, or `unlimited` for the behaviour this key replaced.
 fn connection_limit(values: &Values, key: &'static str) -> Result<Limit, ConfigError> {
     /// Sized against ``crate::ws::SEND_QUEUE_BYTE_BUDGET``: this many connections
@@ -926,6 +1160,24 @@ fn connection_limit(values: &Values, key: &'static str) -> Result<Limit, ConfigE
         return Err(ConfigError::ZeroLimit { key });
     }
     Ok(Limit::Of(parsed))
+}
+
+/// The Postgres pool ceiling: a positive integer, defaulting to the relay's own
+/// sizing. Unlike `connection_limit` there is no `unlimited`, because an
+/// unbounded pool against a database with a per-plan connection cap is not a
+/// choice an operator can mean.
+fn pool_size(values: &Values, key: &'static str) -> Result<u32, ConfigError> {
+    let Some(value) = optional(values, key)? else {
+        return Ok(crate::db::DEFAULT_POOL_SIZE);
+    };
+    let parsed = value.parse::<u32>().map_err(|_| ConfigError::NotANumber {
+        key,
+        value: value.to_string(),
+    })?;
+    if parsed == 0 {
+        return Err(ConfigError::ZeroLimit { key });
+    }
+    Ok(parsed)
 }
 
 fn one_of<T: Copy>(

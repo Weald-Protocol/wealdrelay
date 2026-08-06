@@ -1,6 +1,6 @@
 [package]
 name = "wealdrelay"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -55,6 +55,19 @@ ed25519-dalek = { version = "3.0.0", default-features = false }
 # offline (specs/backend/relay/invites.md).
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"
+# The outbound wake POST. Already in this tree transitively under axum and the AWS
+# SDK, so this takes no new third party: hyper plus a rustls connector is the
+# client the crate already links.
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
+http-body-util = "0.1"
+# Named directly for one reason: the crypto provider is passed to the connector
+# explicitly rather than taken from the process-wide default. Two providers are
+# reachable in this dependency graph, and `ClientConfig::builder()` panics when it
+# cannot pick one, which would be a panic on the wake path of a relay that started
+# fine. Already in the tree under sqlx's `tls-rustls-ring`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 proptest = "1"

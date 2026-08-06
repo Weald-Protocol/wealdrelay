@@ -76,6 +76,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_lifecycle",
         include_str!("../migrations/0007_lifecycle.sql"),
     ),
+    (
+        "0008_envelope_read_path",
+        include_str!("../migrations/0008_envelope_read_path.sql"),
+    ),
+    ("0009_push", include_str!("../migrations/0009_push.sql")),
 ];
 
 /// The ledger of what has been applied. Created before anything else, and by the
@@ -110,6 +115,32 @@ fn fingerprint(sql: &str) -> String {
     format!("fnv1a:{hash:016x}")
 }
 
+/// How many Postgres backends one relay process will hold open.
+///
+/// Eight, not sixteen. The number is not a throughput dial, it is a memory
+/// budget on the database rather than on the relay: a Postgres backend is on the
+/// order of a hundred megabytes resident before shared buffers, so sixteen of
+/// them is most of a 256 MB instance and the instance is killed rather than
+/// slowed. It is also a hard cap: Render limits connections per plan, and a pool
+/// above that plan's cap does not degrade, it fails `acquire_timeout` under
+/// exactly the load the pool was widened for.
+///
+/// Eight is chosen against the work rather than against the plan. The relay's
+/// database work is short: an accept is one insert, a reconciliation round is one
+/// indexed scan, and both are sub-millisecond on a warm instance. Concurrency
+/// past a few is queueing, not parallelism, and the socket layer's own queue is
+/// where a burst is supposed to wait. An operator on a larger plan raises it with
+/// `WEALD_RELAY_DB_POOL_SIZE`.
+pub const DEFAULT_POOL_SIZE: u32 = 8;
+
+/// The per-statement ceiling, as Postgres wants it: milliseconds, as a string.
+///
+/// Fifteen seconds. Far above every query this relay runs and far below "a
+/// connection is gone for the afternoon", which is the failure it exists to
+/// bound: with a pool of eight, two stuck statements is a quarter of the relay's
+/// database capacity held by work nobody is waiting for any more.
+const STATEMENT_TIMEOUT_MS: &str = "15000";
+
 /// Why the database layer refused.
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -134,6 +165,12 @@ impl Database {
     /// reachable" and "the schema is current" are different failures with
     /// different operator responses, and `/readyz` reports the first.
     pub async fn connect(url: &str) -> Result<Self, DbError> {
+        Self::connect_with_pool_size(url, DEFAULT_POOL_SIZE).await
+    }
+
+    /// Connect with an explicit pool ceiling, which is what `serve` passes from
+    /// `WEALD_RELAY_DB_POOL_SIZE`.
+    pub async fn connect_with_pool_size(url: &str, pool_size: u32) -> Result<Self, DbError> {
         let mut options: sqlx::postgres::PgConnectOptions =
             url.parse().map_err(|error: sqlx::Error| DbError::BadUrl {
                 reason: error.to_string(),
@@ -143,8 +180,21 @@ impl Database {
         // logging its own bind parameters would put `ct` in the log with no
         // scrubber in the path.
         options = options.disable_statement_logging();
+        // A ceiling on any one statement, set on the connection rather than per
+        // query so it covers every path including the ones added later. A read
+        // that has run for this long is not going to finish usefully: the client
+        // that asked has already been told to retry, and the connection it is
+        // holding is one of a very small number.
+        options = options.options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(pool_size.max(1))
+            // Idle connections are given back rather than held, because a
+            // Postgres backend is roughly a hundred megabytes resident and the
+            // relay's load is bursty: a reconnect herd wants headroom, and the
+            // hour after it does not.
+            .min_connections(1)
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800))
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(options)
             .await

@@ -409,6 +409,15 @@ pub async fn publish(
     .await
     .map_err(db)?;
 
+    // Every push registration held by a principal this publication removed, in this
+    // transaction. `specs/backend/relay/push.md` section 2: a principal who is no
+    // longer admitted must not keep a wake capability. Doing it after the commit
+    // would leave a window in which the entry is gone and the capability is not, and
+    // the window is short while the consequence is permanent.
+    crate::push::store::delete_for_entries(&mut transaction, workspace, &effects.removed)
+        .await
+        .map_err(|error| StoreError::Database(error.to_string()))?;
+
     // Genesis, and the one moment the relay's own key dies.
     //
     // Inside this transaction rather than after it, because

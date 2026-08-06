@@ -11,7 +11,7 @@
 
 use wealdrelay::config::{
     keys, AccessSetMode, CallMode, Config, ConfigError, Limit, LiveFanout, LiveMode, MinEncryption,
-    Source, StorageTarget, TlsMode, Values, WriteMode,
+    PushMode, Source, StorageTarget, TlsMode, Values, WriteMode,
 };
 
 /// The three required keys, valid, and nothing else. Every test starts here and
@@ -632,8 +632,13 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     // since step 35 added WEALD_RELAY_CALLS, WEALD_RELAY_MAX_CONCURRENT_CALLS and
     // WEALD_RELAY_MAX_CONNECTIONS: the call path's on switch, the ceiling that
     // sizes it and has no default on purpose, and the socket cap that
-    // `specs/backend/relay/operations.md` had recorded as a known gap.
-    assert_eq!(keys::ALL.len(), 23);
+    // `specs/backend/relay/operations.md` had recorded as a known gap. 24 with
+    // WEALD_RELAY_DB_POOL_SIZE, the Postgres pool ceiling an operator on a larger
+    // plan raises. 30 since step 37 added the six push variables: the on switch, the
+    // wake destination that has no default because it is a trust boundary, the
+    // optional bearer, the registration url a device is told rather than left to
+    // guess, the coalescing window and the queue bound.
+    assert_eq!(keys::ALL.len(), 30);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
 }
 
@@ -1127,4 +1132,216 @@ fn a_zero_or_unparseable_connection_cap_is_refused_by_name() {
     let words = resolve(keys::MAX_CONNECTIONS, "many").expect_err("refused");
     assert!(matches!(words, ConfigError::NotANumber { .. }));
     assert_eq!(words.key(), Some(keys::MAX_CONNECTIONS));
+}
+
+// MARK: Push
+
+#[test]
+fn push_is_off_by_default_and_carries_no_destination() {
+    // Off, like calls and unlike presence, and the asymmetry is the decision: push is
+    // the only component of this system that talks to a party outside the operator's
+    // control, so it is a posture an operator adopts rather than one they inherit from
+    // an upgrade (`specs/backend/relay/push.md` section 5).
+    let config = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(config.push, PushMode::Off);
+    assert_eq!(config.push_label(), "off");
+    assert_eq!(config.push_url, None);
+    assert_eq!(config.push_token, None);
+    assert_eq!(config.push_register_url, None);
+    assert_eq!(
+        config.push_coalesce_ms,
+        wealdrelay::push::DEFAULT_COALESCE_MS
+    );
+    assert_eq!(config.push_queue, wealdrelay::push::DEFAULT_QUEUE);
+}
+
+#[test]
+fn push_on_with_a_destination_resolves_and_carries_every_default() {
+    let config = resolve_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+    ])
+    .expect("push on with a url resolves");
+    assert_eq!(config.push, PushMode::On);
+    assert_eq!(config.push_label(), "on");
+    assert_eq!(
+        config.push_url.as_deref(),
+        Some("https://ringer.example/v1/wake")
+    );
+    assert_eq!(config.push_coalesce_ms, 2000);
+    assert_eq!(config.push_queue, 1024);
+}
+
+#[test]
+fn push_on_without_a_destination_refuses_to_start_and_names_the_key() {
+    // The variable with no default, and the reason there will never be one: a wake
+    // destination is a trust boundary, and a relay that inherited one silently would
+    // be waking its users' devices through a party its operator never chose.
+    let error = resolve(keys::PUSH, "on").expect_err("a destination is required");
+    assert!(matches!(error, ConfigError::PushUrlMissing { .. }));
+    assert_eq!(error.key(), Some(keys::PUSH_URL));
+    assert!(error.to_string().contains(keys::PUSH));
+    assert!(error.to_string().contains("trust boundary"));
+}
+
+#[test]
+fn any_push_setting_with_push_off_is_refused_rather_than_ignored() {
+    // A configured-and-ignored outbound destination reads as working and is not,
+    // which is exactly the class of mistake `--check-config` exists to surface. All
+    // five of the other keys, because an operator who set one of them meant push to
+    // be on and needs to be told it is not.
+    for (key, value) in [
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+        (keys::PUSH_TOKEN, "a-bearer"),
+        (keys::PUSH_REGISTER_URL, "https://ringer.example/v1/handles"),
+        (keys::PUSH_COALESCE_MS, "500"),
+        (keys::PUSH_QUEUE, "64"),
+    ] {
+        let error = resolve(key, value).expect_err("a push setting with push off is refused");
+        assert!(
+            matches!(error, ConfigError::PushSettingUnused { .. }),
+            "{key} was accepted with push off"
+        );
+        assert_eq!(error.key(), Some(key));
+        assert!(error.to_string().contains(keys::PUSH));
+    }
+}
+
+#[test]
+fn a_push_setting_left_at_its_default_is_not_read_as_set() {
+    // The other half of the rule above, and it matters because the two numeric keys
+    // are read as values rather than as options: an operator who writes the default
+    // out explicitly is saying nothing, and a relay that refused to start over it
+    // would be refusing over a no-op.
+    let config = resolve_with(&[(keys::PUSH_COALESCE_MS, "2000"), (keys::PUSH_QUEUE, "1024")])
+        .expect("the defaults, written out, are still the defaults");
+    assert_eq!(config.push, PushMode::Off);
+}
+
+#[test]
+fn a_plaintext_wake_destination_is_refused_unless_it_is_loopback() {
+    // `push.md` section 5 exempts `local` and `ci`, which reach no vendor at all, and
+    // the exemption is spelled as loopback because that is the part of it this binary
+    // can check: those two profiles run a ringer on 127.0.0.1 and nothing else does.
+    for (key, other) in [
+        (keys::PUSH_URL, None),
+        (
+            keys::PUSH_REGISTER_URL,
+            Some((keys::PUSH_URL, "https://ringer.example/v1/wake")),
+        ),
+    ] {
+        for value in [
+            "http://ringer.example/v1/wake",
+            "ftp://ringer.example/v1/wake",
+            "not a url at all",
+        ] {
+            let mut pairs = vec![(keys::PUSH, "on"), (key, value)];
+            if let Some(extra) = other {
+                pairs.push(extra);
+            } else {
+                pairs.push((keys::PUSH_URL, value));
+            }
+            let error = resolve_with(&pairs).expect_err("a plaintext destination is refused");
+            assert!(
+                matches!(error, ConfigError::PushUrlNotSecure { .. }),
+                "{value} was accepted for {key}"
+            );
+            assert!(error.to_string().contains("https"));
+        }
+    }
+    // And loopback in every spelling starts, because that is the local harness.
+    for url in [
+        "http://127.0.0.1:9099/v1/wake",
+        "http://localhost:9099/v1/wake",
+    ] {
+        let config = resolve_with(&[(keys::PUSH, "on"), (keys::PUSH_URL, url)])
+            .expect("a loopback ringer is legal");
+        assert_eq!(config.push_url.as_deref(), Some(url));
+    }
+}
+
+#[test]
+fn a_zero_queue_is_refused_because_it_is_not_a_bound() {
+    let error = resolve_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+        (keys::PUSH_QUEUE, "0"),
+    ])
+    .expect_err("zero is refused");
+    assert!(matches!(error, ConfigError::ZeroLimit { .. }));
+    assert_eq!(error.key(), Some(keys::PUSH_QUEUE));
+}
+
+#[test]
+fn a_zero_coalescing_window_is_legal_because_it_means_something() {
+    // Unlike the queue bound. An operator who wants every wake sent as it arrives is
+    // describing a deployment rather than making a mistake.
+    let config = resolve_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+        (keys::PUSH_COALESCE_MS, "0"),
+    ])
+    .expect("zero is a window");
+    assert_eq!(config.push_coalesce_ms, 0);
+}
+
+#[test]
+fn a_push_number_that_is_not_a_number_is_refused_by_name() {
+    for key in [keys::PUSH_COALESCE_MS, keys::PUSH_QUEUE] {
+        let error = resolve_with(&[
+            (keys::PUSH, "on"),
+            (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+            (key, "soon"),
+        ])
+        .expect_err("a word is not a number");
+        assert!(matches!(error, ConfigError::NotANumber { .. }));
+        assert_eq!(error.key(), Some(key));
+    }
+}
+
+#[test]
+fn push_takes_only_on_or_off() {
+    let error = resolve(keys::PUSH, "maybe").expect_err("a third value is refused");
+    assert!(matches!(error, ConfigError::NotAllowed { .. }));
+    assert_eq!(error.key(), Some(keys::PUSH));
+    assert!(error.to_string().contains("on, off"));
+}
+
+#[test]
+fn the_hosted_profile_refuses_a_loopback_ringer() {
+    // The profile-forbidden refusal. A hosted relay's ringer is a service on the
+    // internet, so a plaintext wake destination here is either a harness
+    // configuration copied by accident or a host on a shared provider network, and
+    // both put a wake capability on the wire in cleartext.
+    for key in [keys::PUSH_URL, keys::PUSH_REGISTER_URL] {
+        let mut pairs = vec![
+            (keys::PROFILE, "hosted"),
+            (keys::PUSH, "on"),
+            (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+            (keys::MIN_ENC, "mls"),
+        ];
+        pairs.retain(|(existing, _)| *existing != key || key == keys::PUSH_URL);
+        if key == keys::PUSH_URL {
+            pairs.retain(|(existing, _)| *existing != keys::PUSH_URL);
+            pairs.push((keys::PUSH_URL, "http://127.0.0.1:9099/v1/wake"));
+        } else {
+            pairs.push((key, "http://127.0.0.1:9099/v1/handles"));
+        }
+        let error = resolve_with(&pairs).expect_err("the hosted profile forbids this");
+        assert!(
+            matches!(error, ConfigError::RefusedOnHostedProfile { .. }),
+            "{key} was accepted on the hosted profile"
+        );
+        assert_eq!(error.key(), Some(key));
+        assert!(error.to_string().contains("cleartext"));
+    }
+    // And an https ringer is exactly what the hosted tier is for, so it starts.
+    let config = resolve_with(&[
+        (keys::PROFILE, "hosted"),
+        (keys::MIN_ENC, "mls"),
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.weald.team/v1/wake"),
+    ])
+    .expect("a hosted relay with a real ringer starts");
+    assert_eq!(config.push, PushMode::On);
 }

@@ -15,7 +15,12 @@
 //! This crate has no test double in any environment. See
 //! `specs/backend/build/local-harness.md`.
 
+pub mod agent_card;
+pub mod agent_cbor;
 pub mod agent_corpus;
+pub mod agent_invoke;
+pub mod agent_lifecycle;
+pub mod agent_vectors;
 pub mod boundary;
 pub mod buffer;
 pub mod ffi;

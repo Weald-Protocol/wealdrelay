@@ -1,6 +1,6 @@
 [package]
 name = "weald-mls"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -56,6 +56,11 @@ test-hooks = []
 # its envelope code already used. The tag this crate hashes is 64 bytes once per
 # commit per recovery key, so the throughput difference is not measurable here.
 blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
+# `agent.card` carries an Ed25519 signature by the owner's device principal, and
+# both codecs must refuse a card the named principal did not sign. Already in the
+# lock at this version through openmls, so this adds a name and no download.
+# Verification only: this crate never holds a signing key.
+ed25519-dalek = "2.2"
 openmls = "0.8.1"
 openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5.1"

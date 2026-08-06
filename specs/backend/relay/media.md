@@ -75,6 +75,23 @@ they are rate limited per device to prevent a compromised access-set entry from
 being used to drain a bucket at our expense: 50 blob requests per minute, 5 GB
 per device per day, both raisable per instance.
 
+## Listing
+
+`BLOB list` names a workspace and a group and is answered with one entry per
+stored object: the ciphertext hash and the stored byte length, and nothing else.
+The relay never held a key, so it has no filename, mime type, author or
+timestamp to report, and a listing that carried any of those would be the relay
+claiming to know something about content it cannot read. A name, where the
+client has one, comes from the workspace's own sealed `media.ref` records.
+
+Authorized exactly like `BLOB get`, so a device can only ever enumerate a group
+of its own workspace, and charged one request against the same limiter, because
+a free listing is a free probe for which objects exist. The daily byte budget is
+not charged: a listing moves hashes and lengths rather than objects. The list is
+bounded by `MAX_LIST` on both sides.
+
+The surface above it is `/specs/workspace-files.md`.
+
 ## Quota
 
 Checked at `BLOB put`, before the presigned URL is issued, against the

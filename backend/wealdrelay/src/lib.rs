@@ -34,6 +34,7 @@ pub mod logging;
 pub mod media;
 pub mod negentropy;
 pub mod profile;
+pub mod push;
 pub mod recovery;
 pub mod serve;
 pub mod session;
@@ -338,6 +339,7 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
             None => "unset, calls off".to_string(),
         },
     );
+    row(keys::DB_POOL_SIZE, resolved.db_pool_size.to_string());
     row(
         keys::MAX_CONNECTIONS,
         describe_limit(resolved.max_connections),
@@ -361,6 +363,43 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
         },
     );
     row(keys::PROFILE, resolved.profile.label().to_string());
+    row(keys::PUSH, resolved.push_label().to_string());
+    row(
+        keys::PUSH_URL,
+        match &resolved.push_url {
+            // Printed, unlike the database url, because it carries no credential and
+            // it is the one value an operator most needs to confirm: which party is
+            // being handed their users' wake handles. A url an operator cannot read
+            // back is a trust boundary they cannot audit.
+            Some(url) => url.clone(),
+            None => "unset, push off".to_string(),
+        },
+    );
+    // Set or unset, never the value, for the reason the operator token is never
+    // printed: `--check-config` output is the first thing anybody pastes into a
+    // support ticket.
+    row(
+        keys::PUSH_TOKEN,
+        match resolved.push_token {
+            Some(_) => "[set]".to_string(),
+            None => "unset".to_string(),
+        },
+    );
+    row(
+        keys::PUSH_REGISTER_URL,
+        // Resolved rather than echoed, because the default is derived from the wake
+        // url and an operator reading back an empty column would not know what their
+        // devices are actually being told (`push::Settings::from_config`).
+        match push::Settings::from_config(resolved).register_url {
+            url if url.is_empty() => "unset, push off".to_string(),
+            url => url,
+        },
+    );
+    row(
+        keys::PUSH_COALESCE_MS,
+        resolved.push_coalesce_ms.to_string(),
+    );
+    row(keys::PUSH_QUEUE, resolved.push_queue.to_string());
     row(keys::RELEASE_CHECK, on_off(resolved.release_check));
     row(
         keys::METRICS_GROUP_LABELS,

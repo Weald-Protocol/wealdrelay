@@ -293,6 +293,7 @@ pub async fn handle(
         wire::Request::MultipartAbort { session_id } => {
             handle_multipart_abort(state, session, pool, &session_id).await
         }
+        wire::Request::List { group, .. } => handle_list(state, session, pool, &group, rate).await,
         wire::Request::RetentionControl(record) => handle_control(session, pool, &record).await,
         wire::Request::RetentionManifest(record) => handle_manifest(session, pool, &record).await,
         wire::Request::RetentionPolicy(record) => {
@@ -470,6 +471,75 @@ async fn handle_get(
         expires_in: PRESIGN_TTL_SECONDS,
     })
     .await
+}
+
+/// Answer `BLOB list` with what the bucket holds for one group.
+///
+/// Authorized exactly like `BLOB get`, through ``authorize_group``, so a device
+/// can only ever enumerate a group of its own workspace, and charged one request
+/// against the same limiter for the same reason: a free listing is a free probe
+/// for which objects exist.
+///
+/// The daily byte budget is deliberately not charged. A listing moves hashes and
+/// lengths, not objects, and charging the sum of the sizes would make opening the
+/// files view cost the same as downloading everything in it.
+///
+/// A `head` that fails for one object reports that object as zero length rather
+/// than failing the listing: the file is there, and a view that showed nothing
+/// because one size was unreadable would be the less true answer.
+async fn handle_list(
+    state: &Arc<RelayState>,
+    session: &Session,
+    pool: &sqlx::PgPool,
+    group: &[u8],
+    rate: &RateLimiter,
+) -> Frame {
+    let workspace = match authorize_group(pool, session, group).await {
+        Ok(workspace) => workspace,
+        Err(code) => return Frame::Error(FrameError::new(code)),
+    };
+    let Some(device) = session.device_key() else {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    if !rate.allow_request(device, state.now_ms()).await {
+        return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
+    }
+    let Some(store) = &state.storage else {
+        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    };
+    let names = match store.list(&workspace, &hex(group)).await {
+        Ok(names) => names,
+        Err(error) if error.is_transient() => {
+            return Frame::Error(FrameError::new(ErrorCode::Backpressure))
+        }
+        Err(_) => return Frame::Error(FrameError::new(ErrorCode::Backpressure)),
+    };
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        let Ok(hash) = hex_bytes(&name) else { continue };
+        let Ok(key) = object_key(&workspace, group, &hash) else {
+            continue;
+        };
+        let len = match store.head(&key).await {
+            Ok(Some(info)) => info.len,
+            _ => 0,
+        };
+        entries.push((hash, len));
+    }
+    Frame::Blob {
+        payload: wire::Response::Listing { entries }.encode(),
+    }
+}
+
+/// The inverse of ``hex``, for the object names a listing comes back as.
+fn hex_bytes(text: &str) -> Result<Vec<u8>, ()> {
+    if text.len() % 2 != 0 {
+        return Err(());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| ()))
+        .collect()
 }
 
 fn parse_session_id(bytes: &[u8]) -> Option<uuid::Uuid> {

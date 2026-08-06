@@ -16,14 +16,33 @@ table or anywhere else. This closes that.
 
 ## Scope
 
-The client is macOS only, so v1 is local notifications plus a background
-connection, and there is no third-party push service at all.
+This file was written when the client was macOS only, and it said in as many
+words that there was no third-party push service at all. That sentence was true
+until protocol version 4 and it is not any more, so it is corrected here rather
+than left for a reader to trip over: `specs/backend/relay/push.md` is the
+normative half, `specs/backend/relay/ringer.md` is the component at the other end
+of it, and `specs/backend/contracts/decisions/ADR-0012-push-via-a-separate-ringer.md`
+is the decision. The product design is `specs/push-notifications.md`.
 
-That is worth stating as a decision rather than an accident, because it means
-the subprocessor list in `specs/backend/cloud/compliance.md` does not grow, and
-no external party learns when a workspace is active.
+What is still true, and is the more important half, is that **the local path
+below is unchanged and is still the only thing that renders a notification.** A
+wake carries a three-value category and nothing else; it is an instruction to go
+and look, never a thing to display. Every notification a person reads is still
+authored on their own machine from plaintext that was decrypted there.
 
-## v1: local, no push service
+Three deployments, and the first of them is the default:
+
+- **No push.** `WEALD_RELAY_PUSH=off`. The relay has no outbound leg, devices are
+  told so and never register, and this file's v1 section is the whole story. A
+  self-hoster on a private network keeps this, and the subprocessor list does not
+  grow for them.
+- **A shared ringer.** The relay points at a ringer holding the APNs key for the
+  app its users actually run. Apple and the ringer join the subprocessor table in
+  `specs/backend/cloud/compliance.md` the day this ships.
+- **Their own ringer.** An operator shipping a fork under their own bundle
+  identifier runs their own with their own key and changes one URL.
+
+## v1: local, and still the only thing that renders
 
 The Weald app holds its relay connections while running, including in the
 background. An envelope arrives, the app decrypts it, and if it matches a
@@ -45,32 +64,49 @@ launch-at-login and says why, once.
 ## When APNs becomes necessary
 
 An iOS client, or a macOS app that should notify while quit, needs Apple Push.
-The rules below are settled now so that they are not decided under shipping
-pressure later.
+These rules were settled here before anything was built, so that they were not
+decided under shipping pressure later. Four of the five held exactly as written.
+The one that did not is recorded rather than quietly amended, because the whole
+value of settling a rule early is being able to see what it was when it changes.
 
-**Payload.** A wake hint and an opaque group id. Never text, never a display
-name, never a channel name, never a sender. The push payload must be worthless
-to anyone who reads it, including Apple.
+**Payload.** A wake hint and nothing that identifies anything. Never text, never
+a display name, never a channel name, never a sender. The push payload must be
+worthless to anyone who reads it, including Apple. Held, and tightened: what
+crosses APNs is a three-value category and a dull placeholder body, and not even
+the handle, because the device knows its own handle and telling Apple which one
+was woken would put a stable identifier in the payload.
 
-**Group ids are pseudonymous.** The id in a push is a per-device rotating alias
-of the real group id, so an observer correlating pushes over months cannot build
-a stable map of a workspace's structure. The alias table lives on the client and
-in a small relay-side mapping that rotates weekly.
+**No group id at all, rotating or otherwise.** This rule used to read "group ids
+are pseudonymous", with a per-device rotating alias and a small relay-side alias
+table that rotated weekly. It is superseded by `push.md`, and the replacement is
+strictly stronger: there is no group in a wake, so there is no alias table, no
+rotation schedule and no mapping to keep. The reasoning against the old rule is
+worth keeping, because it is the shape of a mistake that recurs. A rotating alias
+is only unlinkable if the rotation actually happens, which makes a privacy
+property depend on a scheduled job continuing to run correctly for years, and it
+still leaks the structural fact that two pushes to one device concern the same
+conversation inside a rotation window. Sending no group avoids all of it, and the
+device reconciles to find out what changed.
 
-**Rendering.** A notification service extension wakes, fetches the envelope,
-decrypts with keys from a shared Keychain access group, and rewrites the
-notification with real content. If it cannot, the fallback text is the app name
-and nothing else. It is never a preview generated anywhere but on device.
+**Rendering.** A notification service extension wakes, fetches, decrypts with
+keys from a shared Keychain access group, and rewrites the notification with real
+content. If it cannot, the fallback is the placeholder and nothing else. It is
+never a preview generated anywhere but on device. Held exactly.
 
 **Disclosure.** Apple Push Notification service joins the subprocessor table the
-day this ships, with the data column reading "opaque wake hints and rotating
-group aliases, no content". `/security` gets the same sentence. Adding a
-subprocessor quietly would be worse than the feature is worth.
+day this ships, with the data column reading "opaque wake handles and a
+three-value category, no content, no identifiers", and the ringer joins as the
+party holding the handle-to-token mapping. `/security` gets the same sentence.
+Adding a subprocessor quietly would be worse than the feature is worth. Held, and
+push becomes a nineteenth surface in the `privacy-review` rotation on top, because
+it is the first time this product hands a routing signal to a third party.
 
-**Opt-out.** A workspace admin can disable push entirely for the workspace, and
-an individual can disable it for themselves. Both are one toggle, and the
+**Opt-out.** A workspace authorizer can disable push entirely for the workspace,
+and an individual can disable it for themselves. Both are one toggle, and the
 self-host docs note that disabling push removes the only component of the system
-that talks to a party outside the operator's control.
+that talks to a party outside the operator's control. Held, with a third opt-out
+underneath the two: an operator who never sets `WEALD_RELAY_PUSH=on` has no
+outbound leg at all, which is the default and is not a degraded state.
 
 ## Notification rules
 

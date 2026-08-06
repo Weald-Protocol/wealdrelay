@@ -13,7 +13,9 @@
 use proptest::prelude::*;
 use wealdrelay::calls::CallKind;
 use wealdrelay::config::{keys, Config, Values};
-use wealdrelay::frame::{ErrorCode, Frame, FrameError, FrameTag, KeysBody, PROTOCOL_VERSION};
+use wealdrelay::frame::{
+    ErrorCode, Frame, FrameError, FrameTag, KeysBody, WakeBody, PROTOCOL_VERSION,
+};
 use wealdrelay::session::{
     Reaction, Session, State, Work, CLOCK_SKEW_LIMIT_MS, MAX_GROUPS_PER_CONNECTION,
 };
@@ -43,6 +45,8 @@ const STREAM: [u8; 4] = [0, 0, 0, 1];
 const MEDIA_CT: &[u8] = &[18, 19];
 const MEDIA_SEQ: u64 = 42;
 const KEY_PACKAGE: &[u8] = &[14, 15];
+const WAKE_HANDLE: [u8; 16] = [0xA7; 16];
+const WAKE_EXPIRES: u64 = NOW + 7 * 24 * 60 * 60 * 1000;
 const JOIN_BODY: &[u8] = &[12];
 const INVITE_BODY: &[u8] = &[13];
 const FROM_SEQ: u64 = 5;
@@ -231,6 +235,11 @@ fn sample(tag: FrameTag) -> Frame {
             seq: MEDIA_SEQ,
             ct: MEDIA_CT.to_vec(),
         },
+        FrameTag::Wake => Frame::Wake(WakeBody::Register {
+            handle: WAKE_HANDLE.to_vec(),
+            categories: wealdrelay::push::ALL_CATEGORIES,
+            expires_at: WAKE_EXPIRES,
+        }),
     }
 }
 
@@ -337,6 +346,16 @@ fn expected(tag: FrameTag, state: State) -> Expected {
             stream: STREAM,
             seq: MEDIA_SEQ,
             ct: MEDIA_CT.to_vec(),
+        }),
+        // Ready only, like every frame except `JOIN`. A registration is a statement
+        // about an admitted principal, and the relay learns which principal from the
+        // authenticated session rather than from a field on the frame.
+        (State::Ready, FrameTag::Wake) => Expected::Deferred(Work::WakeRegistration {
+            body: WakeBody::Register {
+                handle: WAKE_HANDLE.to_vec(),
+                categories: wealdrelay::push::ALL_CATEGORIES,
+                expires_at: WAKE_EXPIRES,
+            },
         }),
         (State::Ready, FrameTag::Blob) => Expected::Deferred(Work::BlobTicket {
             payload: BLOB_PAYLOAD.to_vec(),

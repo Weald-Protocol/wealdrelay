@@ -108,6 +108,30 @@ pub fn enforce(config: &Config) -> Result<(), ConfigError> {
         ));
     }
 
+    // Push is permitted on the hosted tier, and it is the deployment the ringer was
+    // written for. What is forbidden here is the loopback exemption
+    // `Config::enforce_push` grants: `http://127.0.0.1/...` is legal on a self-hosted
+    // relay because that is how the local harness and `ci` run a ringer that reaches
+    // no vendor at all, and it is never legal here. A hosted relay's ringer is a
+    // service on the internet, so a plaintext wake url on this profile is either a
+    // configuration copied out of a harness or a destination inside somebody else's
+    // shared provider network, and both put a wake capability on the wire in
+    // cleartext (`specs/backend/relay/push.md` section 5).
+    for (key, url) in [
+        (keys::PUSH_URL, config.push_url.as_deref()),
+        (keys::PUSH_REGISTER_URL, config.push_register_url.as_deref()),
+    ] {
+        if url.is_some_and(|url| !url.starts_with("https://")) {
+            return Err(refused(
+                key,
+                "the hosted tier has no loopback ringer, so a plaintext wake \
+                 destination here is either a harness configuration copied by \
+                 accident or a host on a shared provider network. Both put a wake \
+                 capability on the wire in cleartext",
+            ));
+        }
+    }
+
     Ok(())
 }
 

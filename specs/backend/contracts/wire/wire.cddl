@@ -297,8 +297,16 @@ MediaRetainBody = {                      ; kind 0x0080
 ; QUIC can be added later without touching anything above layer 1.
 ; ---------------------------------------------------------------------------
 
+; Every tag this grammar names, in one place. LiveFrame, KeysFrame, CallFrame and
+; MediaFrame were specified below and never listed here, which made this union a
+; thing a validator could pass for the wrong reason: a frame absent from the union
+; is a frame `start` does not admit, and four of them had been on the wire since
+; version 2. Added with WakeFrame rather than after it, because the fix and the
+; addition are the same edit and splitting them would leave one release where the
+; union was still wrong.
 Frame = ConnectFrame / AuthFrame / AccessPublishFrame / SubFrame / ReconFrame
       / PushFrame / SendFrame / BlobFrame / ErrorFrame
+      / LiveFrame / KeysFrame / CallFrame / MediaFrame / WakeFrame
 
 ConnectFrame = { 0 => 1, 1 => protocol-version, 2 => [* group-id] }
 AuthFrame    = { 0 => 2, 1 => bstr, ? 2 => bstr .size 64, ? 3 => AuthState }
@@ -333,10 +341,18 @@ ErrorBody = {
   1 => error-class
   2 => tstr                 ; stable code. registries/error-codes.md
   ? 3 => bstr .size 32      ; current state hash, so the client can rebase
-  ? 4 => uint               ; retry-after, ms. Required for retry and quota.
+  ? 4 => uint               ; retry-after, ms. Required for retry, quota and limit.
 }
 
-error-class = "retry" / "reject" / "denied" / "quota" / "version"
+error-class = "retry" / "reject" / "denied" / "quota" / "version" / "limit"
+
+; `limit` arrived with protocol version 4 and is the one class this protocol has
+; ever added, which is a breaking change by the mechanical test in
+; contracts/governance.md section 3 and rides the same version bump the WAKE frame
+; does. It is a per-principal ceiling on a write the client can simply stop making,
+; which is neither a quota against a workspace's paid allowance nor a transient
+; retry, and clients branch on the class before the code. Like `retry` and `quota`
+; it carries retry-after. See registries/error-codes.md.
 
 ; ---------------------------------------------------------------------------
 ; Protocol version 2: the two frames added, and the two bodies they carry.
@@ -425,6 +441,61 @@ media-seq = uint                  ; per stream, client-side, uninterpreted
 media-ct  = bstr .size (0..1500)  ; AES-256-GCM frame. One Ethernet MTU, which is
                                   ; four hundred times a 20 ms AAC-ELD frame: it
                                   ; bounds an attacker rather than fitting a codec
+
+; ---------------------------------------------------------------------------
+; Protocol version 4: the WAKE frame. specs/backend/relay/push.md.
+; ---------------------------------------------------------------------------
+
+; Frame tag 25, the next free integer: tags are permanent and 21 through 24 went
+; to LIVE, KEYS, CALL and MEDIA. The frame is named WAKE and not PUSH because tag
+; 10 has been PUSH, the relay-to-client envelope delivery frame, since version 1,
+; and reusing the word in a second place would be a defect waiting for a reader.
+;
+; Six forms discriminated by a leading integer, the shape KEYS already uses,
+; because these are one conversation about one row. `Ready` only, like every frame
+; except JOIN. No form carries a device identifier, deliberately: the relay learns
+; which principal is registering from the authenticated session, and a field it
+; would have to trust is a field one admitted device could use to claim another's
+; wakes.
+;
+; The relay stores the handle and never a token. An APNs device token is a durable,
+; cross-installation, Apple-resolvable identifier and there is no field here or in
+; the relay's schema that could hold one; the component that talks to Apple is
+; separated and addressed by URL. See decisions/ADR-0012-push-via-a-separate-ringer.md.
+WakeFrame = [25, [wake-form, wake-fields]]
+
+wake-form   = 1 / 2 / 3 / 4 / 5 / 6
+wake-fields =
+    [handle, categories, expires-at]  ; 1 Register,   client to relay
+  / [expires-at]                      ; 2 Registered, relay to client
+  / []                                ; 3 Clear,      client to relay
+  / []                                ; 4 Cleared,    relay to client
+  / []                                ; 5 Query,      client to relay
+  / [enabled, register-url]           ; 6 Capability, relay to client
+
+handle       = bstr .size 16      ; minted by the ringer for one device in one
+                                  ; workspace, opaque to the relay, never derived
+                                  ; from a token, a device key or a workspace, and
+                                  ; never written to a log at any level
+categories   = uint .size 1       ; bitmask: 1 message, 2 call, 4 handshake. At
+                                  ; least one bit set and no undefined bit. The set
+                                  ; is closed, so a future client cannot widen what
+                                  ; a wake means without a version bump
+expires-at   = uint .size 8       ; ms since the unix epoch. Refused if already past
+enabled      = bool               ; false means push is off here, which is the
+                                  ; default and a supported deployment rather than
+                                  ; a degraded one
+register-url = tstr .size (0..512)   ; https only, and empty when enabled is false.
+                                  ; The relay states the ringer because a device
+                                  ; that guessed would register a self-hoster's
+                                  ; users with a ringer their operator never chose
+
+; A WAKE frame never exceeds 1024 bytes; longer is reject/envelope_too_large,
+; refused on the declared frame length before any field is read. A wrong-length
+; handle, an illegal bitmask, an elapsed expires-at or a register-url a client
+; would refuse are all reject/push_handle_malformed, a reject and not a denial
+; because each one is permanently wrong as sent. The conformance bytes for all six
+; forms and for every refusal named here are in ./vectors/push-frames.json.
 
 ; Kind 0x0022. Travels in the workspace root group as an ordinary envelope.
 ; The dm group id is deliberately absent: the joiner learns it from inside the

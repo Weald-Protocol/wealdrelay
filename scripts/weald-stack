@@ -12,6 +12,10 @@
 #   weald-stack dump envelopes
 #   weald-stack fixture [--seed N]
 #   weald-stack prove-blind
+#   weald-stack dump-db
+#   weald-stack agent-crossing [--out DIR]
+#   weald-stack agent-fold-crossing [--out DIR]
+#   weald-stack agent-card-crossing [--out DIR]
 #   weald-stack down [--volumes]
 #
 # Components that a later step builds are reported as such and exit 69
@@ -123,6 +127,70 @@ relay_answers() {
 # because a self-hoster's Phase 2 is a real deployment shape
 # (`specs/backend/relay/migration.md`) and the client's refusal has to be provable
 # against a relay that accepts plaintext as well as against one that does not.
+# Is the relay answering on our port the one this harness started?
+#
+# It matters more than it looks. `relay_start` used to see any answer on the port
+# and report "already serving", so a *foreign* relay listening there became the
+# relay every proof in every programme ran against: a published container image
+# from the self-host app, an older build left behind by another checkout, anything.
+# That is the shape of failure this whole loop exists to prevent, because the run
+# still goes green and the green is about a binary nobody chose. It surfaced as a
+# session refused with `version/protocol_unsupported` against a v0.1.5 image while
+# this tree speaks protocol 3.
+#
+# Ownership is the pid file: we started it, so we know its pid, and a live process
+# at that pid answering that port is ours. An overridden health URL is somebody
+# else's relay on purpose (step 13's hosted proof), so it is ours by declaration.
+relay_is_ours() {
+  [ -n "${WEALD_STACK_RELAY_HEALTH_URL:-}" ] && return 0
+  relay_pid >/dev/null
+}
+
+# Move to a free port when a stranger holds ours.
+#
+# Auto-selecting rather than failing, because a port number is not part of any
+# proof: group ids, envelopes and access sets are identical whichever port carried
+# them, and an unattended run that stopped here would be stopped by a neighbour's
+# container rather than by anything about this programme. What must not happen
+# silently is running *against* that neighbour, and that is what `relay_is_ours`
+# now refuses. The move is printed, so the log says which socket the proof used.
+# The port our own relay is already listening on, adopted before anything else.
+#
+# Every `weald-stack` invocation is a fresh process that starts from the default
+# port, so without this the second command of a session would find the neighbour on
+# the default, move off it, and start a *second* relay beside the one it already
+# had. The pid file is the harness's memory of its own relay; this reads that
+# process's actual socket back out, so one relay serves the whole session however
+# many commands drive it.
+relay_adopt_own_port() {
+  local pid; pid="$(relay_pid)" || return 0
+  local port
+  port="$(lsof -nP -aPi -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR>1 { split($9, a, ":"); print a[length(a)] }' | sort -n | head -1)"
+  [ -n "$port" ] || return 0
+  [ "$port" = "$WEALD_STACK_RELAY_PORT" ] && return 0
+  WEALD_STACK_RELAY_PORT="$port"
+  export WEALD_STACK_RELAY_PORT
+  RELAY_OBSERVABILITY_PORT=$(( WEALD_STACK_RELAY_PORT + 1 ))
+}
+
+relay_reclaim_port() {
+  local port="$WEALD_STACK_RELAY_PORT"
+  local limit=$((port + 20))
+  while [ "$port" -le "$limit" ]; do
+    if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      note "wealdrelay" "port $WEALD_STACK_RELAY_PORT is held by another process; using $port"
+      WEALD_STACK_RELAY_PORT="$port"
+      export WEALD_STACK_RELAY_PORT
+      RELAY_OBSERVABILITY_PORT=$(( WEALD_STACK_RELAY_PORT + 1 ))
+      return 0
+    fi
+    port=$((port + 2))
+  done
+  note "wealdrelay" "no free port between $WEALD_STACK_RELAY_PORT and $limit"
+  return 1
+}
+
 relay_start() {
   local bin
   bin="$(relay_binary)" || true
@@ -135,8 +203,12 @@ relay_start() {
     return 1
   fi
   if relay_answers; then
-    note "wealdrelay" "already serving on 127.0.0.1:$WEALD_STACK_RELAY_PORT"
-    return 0
+    if relay_is_ours; then
+      note "wealdrelay" "already serving on 127.0.0.1:$WEALD_STACK_RELAY_PORT"
+      return 0
+    fi
+    # Something else is on our port. Never adopt it: see `relay_is_ours`.
+    relay_reclaim_port || return 1
   fi
   mkdir -p "$STACK_STATE/blobs"
   # `--relay-db` is a database of the harness Postgres, created if absent. One
@@ -361,6 +433,34 @@ psql_relay() {
     return
   fi
   docker exec "$(dc ps -q postgres)" psql -U weald -d weald_relay_stack "$@"
+}
+
+# The relay's own database, dumped to stdout.
+#
+# `pg_dump` of the database the running relay writes to, after it has carried a
+# run's traffic. It exists so a gate can search the relay's storage for something
+# it must not be holding, which is the only honest form of a blindness claim: a
+# grep over a client's log or over a mocked table proves nothing about the server.
+#
+# Deliberately the whole database rather than one table. Blindness is a property of
+# everything the relay persists, and a dump narrowed to the table somebody expected
+# a leak in is a dump that cannot find one anywhere else.
+#
+# `scripts/prove-blind.py` is the thorough version and searches a binary COPY and
+# the on-disk heap as well, because a text dump can miss an encoding. This is the
+# cheap one, for gates that need a needle absent rather than a full analysis.
+cmd_dump_db() {
+  require_daemon
+  if [ -n "${WEALD_STACK_RELAY_PSQL_URL:-}" ]; then
+    pg_dump "$WEALD_STACK_RELAY_PSQL_URL"
+    return
+  fi
+  local container; container="$(dc ps -q postgres)"
+  [ -n "$container" ] || {
+    echo "weald-stack: postgres is not up. scripts/weald-stack up" >&2
+    return 1
+  }
+  docker exec "$container" pg_dump -U weald -d weald_relay_stack
 }
 
 # Register a workspace's groups with the relay, where the harness can reach its
@@ -2055,9 +2155,926 @@ cmd_prove_blind() {
     --work "$PROVE_BLIND_WORK"
 }
 
+# --- agent-crossing ----------------------------------------------------------
+#
+# Step 2's integration proof, from `specs/agents/networked/phases-protocol.md`:
+# "an invoke crosses a real relay between two real instances and verifies at the
+# far side".
+#
+# Two client processes, two directories, two device keys, one real relay backed by
+# real Postgres. Client 1 writes a chat message carrying a mention and the signed
+# `agent.invoke` beside it, exactly as the composer will; the relay carries both as
+# opaque ciphertext; client 2 opens the invoke, verifies its signature and runs the
+# admission checks step 2 owns.
+#
+# What makes it a crossing rather than a round trip: the verifying process never
+# held the signing key and never saw the plaintext until it decrypted what the relay
+# handed it. A single process doing both halves would be proving the codec, which the
+# unit tier already does over bytes it built itself.
+#
+# The sentinels are printed as `needle=` lines for the caller to grep the relay's
+# database for. Three of them, and each is a different kind of thing the relay must
+# not learn: who asked (the requester principal), who was asked (the mention alias),
+# and what was said (the message text).
+AGENT_CROSSING_OUT="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-02}"
+
+cmd_agent_crossing() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) AGENT_CROSSING_OUT="$2"; shift 2 ;;
+      *) echo "weald-stack agent-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$AGENT_CROSSING_OUT"
+  local out="$AGENT_CROSSING_OUT/invoke-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  local alias="researcher.p1.AI${nonce}"
+  local text="@${alias} summarise AISENT${nonce}BODY please"
+  local ticket="AI-$nonce"
+
+  # --fresh, so what crosses is this run's traffic. A verify that found the previous
+  # run's invoke would report a crossing that did not happen.
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  {
+    echo "# An agent.invoke crosses a real relay between two real instances"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "ticket    $ticket"
+    echo
+    echo "## client 1 authors the message and the invoke beside it"
+    wc_ c1 agent-invoke --alias "$alias" --id "$ticket" --body "$text"
+    echo
+    echo "## client 1 publishes, client 2 receives"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+    echo
+    echo "## client 2 opens, decodes, verifies and admits"
+    wc_ c2 agent-verify
+  } | tee "$out"
+
+  # `tee` in a pipeline hides the failure of everything left of it, and a verify that
+  # exited non-zero must not be recorded as a crossing. Re-run the one command whose
+  # exit status is the proof, quietly, and let its status be this command's.
+  wc_ c2 agent-verify >/dev/null || {
+    echo "weald-stack: client 2 did not verify the invoke that crossed" >&2
+    exit 1
+  }
+
+  # The two instances are two devices, and the crossing means nothing otherwise.
+  local d1 d2
+  d1="$(wc_ c1 device | field "$(wc_ c1 device)" device)"
+  d2="$(wc_ c2 device | field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+  {
+    echo
+    echo "## two devices, not one"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee -a "$out"
+
+  # The needles, read out of what actually crossed.
+  #
+  # Four, and the choice of them is the whole meaning of the blindness claim:
+  #
+  #   sig          the authorship of this request, sealed inside the payload
+  #   alias        who was asked for, which is a mention a person typed
+  #   body         what was said
+  #   invocation   the identity every lifecycle record will fold on
+  #
+  # The requester's *principal* is deliberately NOT a needle, and that is not a
+  # weakening. `specs/backend/relay/identity.md` has the relay hold the access set:
+  # it authenticates a connection by device key, so every device key allowed to
+  # write is in its database by design, and a grep for one would find it and would
+  # be finding the design rather than a leak. What the relay must not be able to do
+  # is attribute an envelope to one of those keys, and the signature is exactly that
+  # attribution. Its absence is the claim worth making.
+  # The control, which is the opposite claim and the reason the four above mean
+  # anything. A blindness grep that cannot go red is worth nothing, so the run also
+  # names one value the relay legitimately *does* hold, in the same dump, through the
+  # same search: client 1's device key, which the access set names because the relay
+  # authenticates connections by it. A gate that finds the four needles absent and
+  # the control absent as well has proven that its grep is broken, not that the relay
+  # is blind.
+  echo "control=$d1"
+  local verified; verified="$(wc_ c2 agent-verify)"
+  echo "needle=$(field "$verified" sig)"
+  echo "needle=$alias"
+  echo "needle=AISENT${nonce}BODY"
+  echo "needle=$(field "$verified" invocation)"
+}
+
+# --- agent-fold-crossing -----------------------------------------------------
+#
+# Step 3's integration proof: "two instances fold the same shuffled record set to
+# byte-identical state".
+#
+# Both clients write lifecycle records for one invocation, including a deliberate
+# split (two `accepted` from two hosts) and a terminal after a terminal, so the set
+# folded is one with anomalies in it rather than a happy path. Each client then folds
+# what it holds, in its own arrival order, and prints a digest. The digests must be
+# equal.
+#
+# The anomalies are the interesting half. A fold that dropped the second `accepted`
+# would agree with itself while the invocation had run twice, so the digest covers the
+# anomaly list and this run makes sure there is one to cover.
+cmd_agent_fold_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-03}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-fold-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/fold-crossing.txt"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  {
+    echo "# Two instances fold one record set to one digest"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo
+    echo "## client 1 accepts, runs and completes"
+    wc_ c1 agent-lifecycle --alias accepted
+    wc_ c1 agent-lifecycle --alias running
+    echo
+    echo "## client 2 accepts the same invocation, which is the split"
+    wc_ c2 agent-lifecycle --alias accepted
+    echo
+    echo "## client 1 completes, then writes a late failure that must be dropped"
+    wc_ c1 agent-lifecycle --alias completed
+    wc_ c1 agent-lifecycle --alias failed --body host.offline
+    echo
+    echo "## both sync, twice each way, so both hold every record"
+    wc_ c1 --seconds 30 sync >/dev/null
+    wc_ c2 --seconds 30 sync >/dev/null
+    wc_ c1 --seconds 30 sync >/dev/null
+    wc_ c2 --seconds 30 sync >/dev/null
+    echo "synced"
+    echo
+    echo "## client 1 folds"
+    wc_ c1 agent-fold
+    echo
+    echo "## client 2 folds"
+    wc_ c2 agent-fold
+  } | tee "$out"
+
+  local f1 f2
+  f1="$(wc_ c1 agent-fold)"
+  f2="$(wc_ c2 agent-fold)"
+  local d1 d2 n1 n2 r1 r2
+  d1="$(field "$f1" digest)"; d2="$(field "$f2" digest)"
+  n1="$(field "$f1" anomalies)"; n2="$(field "$f2" anomalies)"
+  r1="$(field "$f1" records)"; r2="$(field "$f2" records)"
+
+  {
+    echo
+    echo "## the comparison"
+    echo "c1 records $r1  anomalies $n1  digest $d1"
+    echo "c2 records $r2  anomalies $n2  digest $d2"
+  } | tee -a "$out"
+
+  [ -n "$d1" ] && [ "$d1" = "$d2" ] || {
+    echo "weald-stack: the two instances folded to different digests" >&2
+    exit 1
+  }
+  # A set with no anomalies would make the agreement cheap: two clients agreeing that
+  # nothing went wrong is not the claim. The split and the dropped terminal must both
+  # be in the folded state.
+  [ "$n1" -ge 2 ] || {
+    echo "weald-stack: the folded set carried $n1 anomalies and the proof needs the" >&2
+    echo "split and the dropped terminal, so at least 2." >&2
+    exit 1
+  }
+  [ "$r1" -ge 5 ] && [ "$r1" = "$r2" ] || {
+    echo "weald-stack: the two instances hold different record counts ($r1, $r2)" >&2
+    exit 1
+  }
+  echo "digest=$d1"
+  echo "anomalies=$n1"
+  echo "records=$r1"
+}
+
+# --- agent-card-crossing -----------------------------------------------------
+#
+# Step 5's integration proof, from `specs/agents/networked/phases-host.md`: "a
+# published card read back from a second instance contains only schema fields".
+#
+# Client 1 holds a bot with a planted secret in every private field, projects it
+# through `BotCardProjection`, signs the card and publishes it. The relay carries the
+# envelope as ciphertext. Client 2, a different process with a different device key in
+# a different directory, opens it, verifies the signature, and walks the encoded map
+# key by key without the decoder's schema filter, because a decoder that refuses
+# unknown keys can only ever report keys it accepts.
+#
+# Two things are asserted here and neither is provable inside one process. The far
+# side sees only schema keys, and the far side's whole output contains no planted
+# secret. The second is the one that matters: a projection that leaked would leak into
+# a field the schema allows, so "only schema fields" on its own would stay green.
+cmd_agent_card_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-05}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-card-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/card-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  # The slug is deliberately not already an alias: capitals, a space and a sigil, so
+  # what crosses proves the normalisation and not just the transport.
+  local slug="@Researcher P1 AC${nonce}"
+  local secret="ZQXCARD${nonce}"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  {
+    echo "# A published agent.card crosses a real relay and is walked at the far side"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "slug      $slug"
+    echo
+    echo "## client 1 projects a bot with a planted secret and publishes the card"
+    wc_ c1 agent-publish-card --alias "$slug" --title "Researcher AC${nonce}" --body "$secret"
+    echo
+    echo "## client 1 publishes, client 2 receives"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+    echo
+    echo "## client 2 verifies the card and walks its keys"
+    wc_ c2 agent-read-card
+  } | tee "$out"
+
+  # `tee` hides the exit status of everything left of it, and the read is the proof.
+  local read_out
+  read_out="$(wc_ c2 agent-read-card)" || {
+    echo "weald-stack: client 2 did not read the card that crossed" >&2
+    exit 1
+  }
+
+  local keys outside
+  keys="$(field "$read_out" keys)"
+  outside="$(field "$read_out" outside)"
+  [ "$outside" = "0" ] || {
+    echo "weald-stack: the card that crossed carried $outside key(s) outside the schema" >&2
+    exit 1
+  }
+  # A card with one key in it would satisfy "no key outside the schema" and prove
+  # nothing. A user card carries every slot but `org`, which is fourteen.
+  local key_count; key_count="$(awk -F, '{print NF}' <<<"$keys")"
+  [ "$key_count" -ge 14 ] || {
+    echo "weald-stack: the card that crossed carried $key_count keys; a user card has 14" >&2
+    exit 1
+  }
+
+  # The far side's entire output, grepped for the planted secret. Over the whole
+  # printed record rather than one field, because a leak that landed in the display
+  # name and a leak that landed in an alias are the same failure.
+  if grep -qi "$secret" <<<"$read_out"; then
+    echo "weald-stack: the planted secret reached the far side" >&2
+    exit 1
+  fi
+
+  # The two instances are two devices, or this is one player twice.
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+  {
+    echo
+    echo "## the comparison"
+    echo "keys      $keys"
+    echo "outside   $outside"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee -a "$out"
+
+  # The needles for the relay's own database. Each is a private field of the bot the
+  # card was projected from, and the control is client 1's device key, which the
+  # access set names by design and which the same grep must therefore find.
+  echo "control=$d1"
+  echo "needle=${secret}-systemprompt"
+  echo "needle=${secret}-goal"
+  echo "needle=${secret}-model"
+  echo "needle=${secret}-path"
+  echo "keys=$keys"
+}
+
+# Step 6's integration proof: two instances converge on one directory, and a
+# withdrawal removes the agent from both of them.
+#
+# The digest is what converged means here. Two processes cannot compare values, and
+# comparing printed rows line by line in shell would be a second implementation of
+# equality, so each side prints a digest over its own projected entries, statuses and
+# versions and the two are compared. Both sides are asserted at both moments, before
+# and after the withdrawal, because a run where only one side dropped the agent is
+# exactly the failure this step is about and inferring the second side from the first
+# would hide it.
+cmd_agent_card_directory_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-06}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-card-directory-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/directory-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  local slug="@Researcher P1 AD${nonce}"
+  local alias_norm; alias_norm="researcher-p1-ad$(tr 'A-Z' 'a-z' <<<"$nonce")"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# One published agent converges into two directories, and a withdrawal removes it from both"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "slug      $slug"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+    echo
+    echo "## client 1 publishes"
+  } | tee "$out"
+  # Outside the pipeline: a failure inside `{ ... } | tee` only kills the subshell,
+  # and a publish that failed must stop the proof rather than be projected as absent.
+  local share_out
+  share_out="$(wc_ c1 agent-share --alias "$slug")" || {
+    echo "weald-stack: client 1 could not publish the agent" >&2
+    exit 1
+  }
+  echo "$share_out" | tee -a "$out"
+
+  local published_dirs
+  published_dirs="$(directory_crossing_converged "$out" "published")" || exit 1
+  local pub_digest="${published_dirs%% *}"
+  local pub_offer="${published_dirs#* }"
+  case "$pub_offer" in
+    *"$alias_norm"*) : ;;
+    *) echo "weald-stack: the published agent is not offerable: '$pub_offer'" >&2; exit 1 ;;
+  esac
+
+  {
+    echo
+    echo "## client 1 withdraws the publication"
+  } | tee -a "$out"
+  local withdraw_out
+  withdraw_out="$(wc_ c1 agent-share --alias "$slug" --state unpublished)" || {
+    echo "weald-stack: client 1 could not withdraw the agent" >&2
+    exit 1
+  }
+  echo "$withdraw_out" | tee -a "$out"
+
+  local withdrawn_dirs
+  withdrawn_dirs="$(directory_crossing_converged "$out" "unpublished")" || exit 1
+  local wd_digest="${withdrawn_dirs%% *}"
+  local wd_offer="${withdrawn_dirs#* }"
+  [ -z "$wd_offer" ] || {
+    echo "weald-stack: the withdrawn agent is still offerable: '$wd_offer'" >&2
+    exit 1
+  }
+  [ "$pub_digest" != "$wd_digest" ] || {
+    echo "weald-stack: the directory did not change across the withdrawal" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "published  digest $pub_digest offerable $pub_offer"
+    echo "withdrawn  digest $wd_digest offerable ${wd_offer:-<none>}"
+  } | tee -a "$out"
+
+  echo "digest_published=$pub_digest"
+  echo "digest_withdrawn=$wd_digest"
+}
+
+# Sync both instances, project both directories, assert the two digests are equal,
+# and echo "<digest> <offerable>". Every append goes to the record so a failure can
+# be read after the fact.
+directory_crossing_converged() {
+  local out="$1" label="$2"
+  {
+    echo
+    echo "## both sync, both project ($label)"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+  } >>"$out" 2>&1
+
+  local o1 o2
+  o1="$(wc_ c1 agent-directory)" || { echo "weald-stack: c1 could not project" >&2; return 1; }
+  o2="$(wc_ c2 agent-directory)" || { echo "weald-stack: c2 could not project" >&2; return 1; }
+  { echo "### c1"; echo "$o1"; echo "### c2"; echo "$o2"; } >>"$out"
+
+  local g1 g2
+  g1="$(field "$o1" digest)"
+  g2="$(field "$o2" digest)"
+  [ -n "$g1" ] || { echo "weald-stack: c1 printed no digest" >&2; return 1; }
+  [ "$g1" = "$g2" ] || {
+    echo "weald-stack: the two directories disagree at '$label': $g1 vs $g2" >&2
+    return 1
+  }
+  local f1 f2
+  f1="$(field "$o1" offerable)"
+  f2="$(field "$o2" offerable)"
+  [ "$f1" = "$f2" ] || {
+    echo "weald-stack: the two offerable sets disagree at '$label': '$f1' vs '$f2'" >&2
+    return 1
+  }
+  echo "$g1 $f1"
+}
+
+# Step 7's integration proof: an agent's leaf joins one real MLS group over a real
+# relay, the other instance sees it, and a steward pass at expiry takes it out of both.
+#
+# The whole claim is about what the *other* member believes. An `Add` is a commit and a
+# commit is only true when everybody applies it, so a single process that added a leaf
+# and then counted its own members would be reading its own optimism. c1 commits and
+# publishes; c2 follows the handshake log and reports what its own MLS state says; the
+# two counts are compared at both moments.
+cmd_agent_leaf_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-07}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-leaf-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/leaf-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-al$nonce"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# An agent leaf joins a real MLS group over a real relay, and is evicted at expiry"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+    echo
+    echo "## both instances join the channel first"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+  } | tee "$out"
+
+  # The baseline, from c2's own state. Taken before anything is added, so the number the
+  # join is compared against is a number c2 computed rather than one this script assumed.
+  local before_out before_members
+  before_out="$(wc_ c2 agent-members)" || {
+    echo "weald-stack: c2 is not a member of the channel, so it can see nothing" >&2
+    exit 1
+  }
+  before_members="$(field "$before_out" members)"
+  { echo; echo "## c2 before"; echo "$before_out"; } >>"$out"
+
+  local join_out
+  join_out="$(wc_ c1 agent-leaf --alias "$alias" --seconds 120)" || {
+    echo "weald-stack: c1 could not admit the agent's leaf" >&2
+    exit 1
+  }
+  { echo; echo "## c1 admits the agent's leaf"; echo "$join_out"; } | tee -a "$out"
+
+  local leaf approval published joined_members
+  leaf="$(field "$join_out" leaf)"
+  approval="$(field "$join_out" approval)"
+  published="$(field "$join_out" published)"
+  joined_members="$(field "$join_out" members)"
+  [ "$approval" = "firstApproval" ] || {
+    echo "weald-stack: the first certificate was recorded as '$approval'" >&2
+    exit 1
+  }
+  [ "$leaf" != "-" ] || { echo "weald-stack: no leaf was added" >&2; exit 1; }
+  [ "${published:-0}" -ge 1 ] || {
+    echo "weald-stack: the commit was never published, so no other member can apply it" >&2
+    exit 1
+  }
+
+  wc_ c2 --seconds 30 sync >>"$out" 2>&1
+  local after_join after_join_members
+  after_join="$(wc_ c2 agent-members)" || exit 1
+  after_join_members="$(field "$after_join" members)"
+  { echo; echo "## c2 after the join"; echo "$after_join"; } | tee -a "$out"
+  [ "$after_join_members" = "$joined_members" ] || {
+    echo "weald-stack: c1 sees $joined_members members and c2 sees $after_join_members" >&2
+    exit 1
+  }
+  [ "$after_join_members" -gt "$before_members" ] || {
+    echo "weald-stack: c2's membership did not grow, so the leaf never crossed" >&2
+    exit 1
+  }
+
+  local evict_out
+  evict_out="$(wc_ c1 agent-leaf --alias "$alias" --state expired)" || {
+    echo "weald-stack: the steward pass failed" >&2
+    exit 1
+  }
+  { echo; echo "## c1 runs the steward pass at expiry"; echo "$evict_out"; } | tee -a "$out"
+  [ "$(field "$evict_out" evicted)" = "1" ] || {
+    echo "weald-stack: the pass evicted $(field "$evict_out" evicted) leaves, expected 1" >&2
+    exit 1
+  }
+  [ "$(field "$evict_out" withinOneEpoch)" = "true" ] || {
+    echo "weald-stack: the eviction did not land within one epoch" >&2
+    exit 1
+  }
+
+  wc_ c2 --seconds 30 sync >>"$out" 2>&1
+  local after_evict after_evict_members
+  after_evict="$(wc_ c2 agent-members)" || exit 1
+  after_evict_members="$(field "$after_evict" members)"
+  { echo; echo "## c2 after the eviction"; echo "$after_evict"; } | tee -a "$out"
+  [ "$after_evict_members" = "$before_members" ] || {
+    echo "weald-stack: c2 still sees $after_evict_members members after the eviction" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "before     c2 members $before_members"
+    echo "joined     c1 members $joined_members  c2 members $after_join_members  leaf $leaf"
+    echo "evicted    c1 members $(field "$evict_out" members)  c2 members $after_evict_members"
+    echo "lifecycle  $(field "$join_out" lifecycle) ;; $(field "$evict_out" lifecycle)"
+    echo "audit      $(field "$join_out" audit)"
+  } | tee -a "$out"
+
+  echo "leaf=$leaf"
+  echo "members_joined=$after_join_members"
+  echo "members_evicted=$after_evict_members"
+}
+
+# Step 8's integration proof: two instances race for one invocation over a real relay,
+# and exactly one of them executes.
+#
+# The claim is not "a lock works". It is that two machines holding the same agent and
+# seeing the same signed invoke produce one execution, and the thing that decides which
+# one is the lease, which has to cross the relay to decide anything. So c1 publishes a
+# lease at epoch 2 and the invoke beside it, both instances sync, and both are asked to
+# claim. Each answers from its own on-disk ledger with its own device key, and the two
+# answers are counted here: exactly one `run`, and the other a refusal with a reason.
+#
+# Then the replay half, which is the same claim over time rather than over machines: the
+# winner is asked again and must answer `replay` rather than running a second time.
+cmd_agent_claim_race() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-08}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-claim-race: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/claim-race.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-cl$nonce"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# Two instances race for one invocation over a real relay"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  # The lease, from c1, and the invoke beside it. Published in that order because a
+  # claim decided before the lease crossed would be a claim decided by absence.
+  local lease_out invoke_out
+  lease_out="$(wc_ c1 agent-lease --alias "$alias" --seconds 2)" || {
+    echo "weald-stack: c1 could not publish its lease" >&2; exit 1
+  }
+  invoke_out="$(wc_ c1 agent-invoke --alias "$alias")" || {
+    echo "weald-stack: c1 could not publish the invoke" >&2; exit 1
+  }
+  { echo; echo "## c1 publishes the lease and the invoke";
+    echo "$lease_out"; echo "$invoke_out"; } | tee -a "$out"
+
+  {
+    echo
+    echo "## both sync"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+  } >>"$out" 2>&1
+
+  # Both are asked. Neither is told what the other answered, and the loser exits zero
+  # with a reason, because refusing is the correct behaviour and a non-zero exit would
+  # make "the loser refused" indistinguishable from "the loser crashed".
+  local claim1 claim2
+  claim1="$(wc_ c1 agent-claim --alias "$alias")" || {
+    echo "weald-stack: c1 could not decide" >&2; exit 1
+  }
+  claim2="$(wc_ c2 agent-claim --alias "$alias")" || {
+    echo "weald-stack: c2 could not decide" >&2; exit 1
+  }
+  { echo; echo "## c1 claims"; echo "$claim1";
+    echo; echo "## c2 claims"; echo "$claim2"; } | tee -a "$out"
+
+  local o1 o2
+  o1="$(field "$claim1" outcome)"
+  o2="$(field "$claim2" outcome)"
+  local runs=0
+  [ "$o1" = "run" ] && runs=$((runs + 1))
+  [ "$o2" = "run" ] && runs=$((runs + 1))
+  [ "$runs" -eq 1 ] || {
+    echo "weald-stack: $runs instances executed one invocation, expected exactly 1" >&2
+    exit 1
+  }
+  # The loser refused rather than silently doing nothing, and it said why.
+  local loser_reason
+  if [ "$o1" = "run" ]; then loser_reason="$(field "$claim2" reason)"
+  else loser_reason="$(field "$claim1" reason)"; fi
+  [ "$loser_reason" = "leaseNotHeld" ] || {
+    echo "weald-stack: the loser refused as '$loser_reason', expected leaseNotHeld" >&2
+    exit 1
+  }
+  # Both folded the same lease from the same crossed records, which is what makes the
+  # refusal a decision about the lease rather than a difference of opinion about it.
+  [ "$(field "$claim1" holder)" = "$(field "$claim2" holder)" ] || {
+    echo "weald-stack: the two instances disagree about who holds the lease" >&2
+    exit 1
+  }
+  [ "$(field "$claim1" epoch)" = "$(field "$claim2" epoch)" ] || {
+    echo "weald-stack: the two instances disagree about the lease epoch" >&2
+    exit 1
+  }
+
+  # The replay half: the winner, asked again, answers from its ledger.
+  local winner; winner=c1
+  [ "$o1" = "run" ] || winner=c2
+  local again
+  again="$(wc_ "$winner" agent-claim --alias "$alias")" || {
+    echo "weald-stack: the winner could not answer a second time" >&2; exit 1
+  }
+  { echo; echo "## the winner is asked again"; echo "$again"; } | tee -a "$out"
+  [ "$(field "$again" outcome)" = "replay" ] || {
+    echo "weald-stack: the second ask produced '$(field "$again" outcome)', not a replay" >&2
+    exit 1
+  }
+  [ "$(field "$again" executions)" = "1" ] || {
+    echo "weald-stack: the winner's ledger holds $(field "$again" executions) executions" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "raced      c1 $o1  c2 $o2"
+    echo "executions 1"
+    echo "refused    $loser_reason"
+    echo "holder     $(field "$claim1" holder)"
+    echo "epoch      $(field "$claim1" epoch)"
+    echo "replayed   $(field "$again" outcome) of $(field "$again" reason)"
+    echo "digest     $winner $(field "$again" digest)"
+  } | tee -a "$out"
+
+  echo "executions=1"
+  echo "winner=$winner"
+}
+
+# Step 9's integration proof: Player 2 invokes, Player 1 executes, Player 2 receives a
+# signed terminal answer over a real relay.
+#
+# The direction is the point. c2 writes the invoke, and c2 is not the owner: it holds no
+# certificate, hosts no agent and has no agent key, so if c2 could ever produce the
+# answer the whole programme would be a local assistant with synced chat. So both
+# instances are asked to execute, and c2 must refuse silently, writing no record at all,
+# which is `protocol.md`'s check 1 and a privacy property rather than a nicety.
+#
+# The answer is then read back on c2 and verified there: the terminal record's signature,
+# the accepting host, the result id, and the author of the chat line, which must be the
+# agent's key and not c1's device.
+cmd_agent_execution_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-09}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-execution-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/execution-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-ex$nonce"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# Player 2 invokes, Player 1 executes, Player 2 verifies the answer"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  # c1 owns the agent: a certificate, a leaf in the real group, and the lease.
+  local leaf_out lease_out
+  leaf_out="$(wc_ c1 agent-leaf --alias "$alias" --seconds 3600)" || {
+    echo "weald-stack: c1 could not issue the agent's certificate" >&2; exit 1
+  }
+  lease_out="$(wc_ c1 agent-lease --alias "$alias" --seconds 2)" || {
+    echo "weald-stack: c1 could not publish its lease" >&2; exit 1
+  }
+  { echo; echo "## c1 owns the agent"; echo "$leaf_out"; echo "$lease_out"; } | tee -a "$out"
+
+  # c2 invokes. The requester is c2's device key, and c1 has to find it in the roster
+  # of the group rather than take the invoke's word for it.
+  local invoke_out
+  invoke_out="$(wc_ c2 agent-invoke --alias "$alias" --id WEALD-909)" || {
+    echo "weald-stack: c2 could not publish the invoke" >&2; exit 1
+  }
+  { echo; echo "## c2 invokes"; echo "$invoke_out"; } | tee -a "$out"
+  [ "$(field "$invoke_out" requester)" = "$d2" ] || {
+    echo "weald-stack: the invoke was not authored by c2" >&2; exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  # The instance that is not the owner is asked first, so a c1 that answered could not
+  # be mistaken for a c2 that had been prevented from trying.
+  local c2_exec
+  c2_exec="$(wc_ c2 agent-execute --alias "$alias")" || {
+    echo "weald-stack: c2's execute failed; it should refuse, not error" >&2; exit 1
+  }
+  { echo; echo "## c2 is asked to execute, and must say nothing"; echo "$c2_exec"; } \
+    | tee -a "$out"
+  [ "$(field "$c2_exec" outcome)" = "silent" ] || {
+    echo "weald-stack: c2 answered '$(field "$c2_exec" outcome)', expected silent" >&2
+    exit 1
+  }
+  [ "$(field "$c2_exec" records)" = "0" ] || {
+    echo "weald-stack: c2 wrote $(field "$c2_exec" records) records; check 1 writes none" >&2
+    exit 1
+  }
+  [ "$(field "$c2_exec" check)" = "1" ] || {
+    echo "weald-stack: c2 refused at check $(field "$c2_exec" check), expected 1" >&2
+    exit 1
+  }
+
+  local c1_exec
+  c1_exec="$(wc_ c1 agent-execute --alias "$alias" --body "the answer is 42")" || {
+    echo "weald-stack: c1 could not execute" >&2; exit 1
+  }
+  { echo; echo "## c1 executes"; echo "$c1_exec"; } | tee -a "$out"
+  [ "$(field "$c1_exec" outcome)" = "completed" ] || {
+    echo "weald-stack: c1 finished as '$(field "$c1_exec" outcome)'" >&2; exit 1
+  }
+  [ "$(field "$c1_exec" states)" = "accepted,running,completed" ] || {
+    echo "weald-stack: c1 wrote states '$(field "$c1_exec" states)'" >&2; exit 1
+  }
+
+  # c1 publishes what it just wrote, then c2 pulls it. Two syncs and not one: a write
+  # reaches the log locally and the relay on the next sync, so a proof that only synced
+  # the reader would be a proof that the records never left the owner's Mac.
+  { echo; echo "## c1 publishes, c2 syncs";
+    wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } >>"$out" 2>&1
+
+  local answer
+  answer="$(wc_ c2 agent-answer --alias "$alias")" || {
+    echo "weald-stack: c2 could not verify the answer" >&2; exit 1
+  }
+  { echo; echo "## c2 verifies"; echo "$answer"; } | tee -a "$out"
+  [ "$(field "$answer" verified)" = "yes" ] || {
+    echo "weald-stack: c2 did not verify the answer" >&2; exit 1
+  }
+  [ "$(field "$answer" state)" = "completed" ] || {
+    echo "weald-stack: c2 folded state '$(field "$answer" state)'" >&2; exit 1
+  }
+  [ "$(field "$answer" acceptedBy)" = "$d1" ] || {
+    echo "weald-stack: c2 says the accepting host is not c1" >&2; exit 1
+  }
+  [ "$(field "$answer" anomalies)" = "0" ] || {
+    echo "weald-stack: c2 folded $(field "$answer" anomalies) anomalies" >&2; exit 1
+  }
+  # The answer is the agent's, not the owner's device and not c2's.
+  local author; author="$(field "$answer" answerAuthor)"
+  [ "$author" = "$(field "$c1_exec" agentKey)" ] || {
+    echo "weald-stack: the answer was authored by $author, not by the agent" >&2; exit 1
+  }
+  [ "$author" != "$d1" ] && [ "$author" != "$d2" ] || {
+    echo "weald-stack: the answer was authored by a person's device key" >&2; exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "invoked    by c2 $d2"
+    echo "refused    c2 silent at check 1, records 0"
+    echo "executed   c1 $(field "$c1_exec" states)"
+    echo "verified   c2 state=$(field "$answer" state) anomalies=$(field "$answer" anomalies)"
+    echo "acceptedBy $(field "$answer" acceptedBy)"
+    echo "terminalSig $(field "$answer" terminalSig)"
+    echo "answerAuthor $author  (agent key, not $d1 and not $d2)"
+    echo "answerText $(field "$answer" answerText)"
+    echo "digest     $(field "$answer" digest)"
+  } | tee -a "$out"
+
+  echo "executed=c1"
+  echo "verified=c2"
+}
+
 main() {
   local cmd="${1:-status}"
   shift || true
+  # Before anything reads the port: if this session already has a relay, that
+  # relay's socket is the session's socket, whatever the default says.
+  relay_adopt_own_port
   case "$cmd" in
     up) cmd_up "$@" ;;
     status) cmd_status "$@" ;;
@@ -2072,6 +3089,14 @@ main() {
     fixture) cmd_fixture "$@" ;;
     enrol) cmd_enrol "$@" ;;
     prove-blind) cmd_prove_blind "$@" ;;
+    dump-db) cmd_dump_db "$@" ;;
+    agent-crossing) cmd_agent_crossing "$@" ;;
+    agent-fold-crossing) cmd_agent_fold_crossing "$@" ;;
+    agent-card-crossing) cmd_agent_card_crossing "$@" ;;
+    agent-card-directory-crossing) cmd_agent_card_directory_crossing "$@" ;;
+    agent-leaf-crossing) cmd_agent_leaf_crossing "$@" ;;
+    agent-claim-race) cmd_agent_claim_race "$@" ;;
+    agent-execution-crossing) cmd_agent_execution_crossing "$@" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "weald-stack: unknown command: $cmd" >&2; exit 64 ;;
   esac

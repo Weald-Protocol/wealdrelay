@@ -232,3 +232,120 @@ fn two_instances_with_process_fanout_refuse_to_start() {
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
     }
 }
+
+#[test]
+fn push_on_with_no_destination_refuses_to_start_and_names_the_variable() {
+    // The startup half of `push.md` section 5's first refusal, at the level that
+    // decides it. The operator's next action is to set one variable, so the message
+    // has to name it.
+    let mut pairs: Vec<(&str, &str)> = vec![
+        (keys::HOSTNAME, "relay.acme.com"),
+        (keys::DATABASE_URL, "postgres://weald:secret@db/relay"),
+        (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+        (keys::PUSH, "on"),
+    ];
+    let outcome = printed(startup(
+        Vec::<String>::new(),
+        &Values::from_pairs(pairs.clone()),
+    ));
+    assert_eq!(outcome.code, wealdrelay::EXIT_CONFIG);
+    assert!(
+        outcome.stderr.contains(keys::PUSH_URL),
+        "{}",
+        outcome.stderr
+    );
+    assert!(outcome.stdout.is_empty());
+
+    // With a destination it serves, and the wake path is on.
+    pairs.push((keys::PUSH_URL, "https://ringer.weald.team/v1/wake"));
+    match startup(Vec::<String>::new(), &Values::from_pairs(pairs.clone())) {
+        Startup::Serve(config) => assert_eq!(config.push_label(), "on"),
+        Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
+    }
+
+    // And a plaintext destination on a real host does not start, because a handle in
+    // cleartext is a wake capability anybody on the path can use.
+    pairs.retain(|(key, _)| *key != keys::PUSH_URL);
+    pairs.push((keys::PUSH_URL, "http://ringer.weald.team/v1/wake"));
+    let outcome = printed(startup(Vec::<String>::new(), &Values::from_pairs(pairs)));
+    assert_eq!(outcome.code, wealdrelay::EXIT_CONFIG);
+    assert!(
+        outcome.stderr.contains(keys::PUSH_URL),
+        "{}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn a_push_setting_with_push_off_refuses_to_start() {
+    // A configured-and-ignored outbound destination reads as working and is not.
+    let outcome = printed(startup(
+        Vec::<String>::new(),
+        &Values::from_pairs([
+            (keys::HOSTNAME, "relay.acme.com"),
+            (keys::DATABASE_URL, "postgres://weald:secret@db/relay"),
+            (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+            (keys::PUSH_TOKEN, "a-bearer-nobody-will-ever-present"),
+        ]),
+    ));
+    assert_eq!(outcome.code, wealdrelay::EXIT_CONFIG);
+    assert!(
+        outcome.stderr.contains(keys::PUSH_TOKEN),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        !outcome.stderr.contains("a-bearer-nobody-will-ever-present"),
+        "the refusal named the secret it was refusing: {}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn check_config_prints_the_wake_destination_and_never_the_bearer() {
+    // The one value on this surface an operator most needs to read back is which
+    // party is being handed their users' wake handles, so the url is printed. The
+    // bearer is a shared secret and `--check-config` output is the first thing
+    // anybody pastes into a support ticket, so it is `[set]` and nothing else.
+    let values = Values::from_pairs([
+        (keys::HOSTNAME, "relay.acme.com"),
+        (keys::DATABASE_URL, "postgres://weald@db/relay"),
+        (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.weald.team/v1/wake"),
+        (keys::PUSH_TOKEN, "sk-a-secret-nobody-should-paste"),
+        (keys::PUSH_COALESCE_MS, "500"),
+        (keys::PUSH_QUEUE, "64"),
+    ]);
+    let config = Config::resolve(&values).expect("the push configuration resolves");
+    let text = describe_config(&config, &values);
+
+    assert!(text.contains("https://ringer.weald.team/v1/wake"), "{text}");
+    assert!(
+        !text.contains("sk-a-secret-nobody-should-paste"),
+        "the bearer was printed: {text}"
+    );
+    assert!(text.contains("500"), "{text}");
+    assert!(text.contains("64"), "{text}");
+    // The registration url is resolved rather than echoed, so an operator sees what
+    // their devices are actually told rather than an empty column.
+    assert!(
+        text.contains("https://ringer.weald.team/v1/wake/v1/handles"),
+        "{text}"
+    );
+    for key in [
+        keys::PUSH,
+        keys::PUSH_URL,
+        keys::PUSH_TOKEN,
+        keys::PUSH_REGISTER_URL,
+        keys::PUSH_COALESCE_MS,
+        keys::PUSH_QUEUE,
+    ] {
+        assert!(text.contains(key), "{key} is missing from the description");
+    }
+
+    // And with push off, the two url lines say what the relay will do rather than
+    // leaving an operator to guess what an empty column means.
+    let text = describe_config(&Config::resolve(&complete()).unwrap(), &complete());
+    assert_eq!(text.matches("unset, push off").count(), 2, "{text}");
+}

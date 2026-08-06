@@ -23,6 +23,22 @@
 /// Major types, in the high three bits of the initial byte.
 const MAJOR_UINT: u8 = 0;
 const MAJOR_BYTES: u8 = 2;
+/// Text, and the one field that carries it.
+///
+/// The subset above says "no text strings", and that stayed true for every frame
+/// up to version 3 because every string on the wire was an opaque identifier and a
+/// byte string is the honest type for one. `WAKE`'s `register_url` is the
+/// exception, and it is an exception on purpose rather than an erosion: it is a URL
+/// a human pastes into an operator's configuration and a client parses as a URL, so
+/// the CDDL in `specs/backend/contracts/wire/` states it as `tstr` and this decoder
+/// has to agree byte for byte with that (`specs/backend/relay/push.md` section 3).
+///
+/// Determinism is unaffected, which is what made this admissible: a text string is
+/// a byte string with a different major and the same length rule, so there is still
+/// exactly one encoding of any value. The reader below refuses invalid UTF-8 rather
+/// than replacing it, because a lossy conversion would give two inputs one decoded
+/// value and that is precisely the property the whole module exists to protect.
+const MAJOR_TEXT: u8 = 3;
 const MAJOR_ARRAY: u8 = 4;
 const MAJOR_SIMPLE: u8 = 7;
 
@@ -67,6 +83,31 @@ pub fn bytes(value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `false` and `true`. Major 7, values 20 and 21.
+///
+/// Here for the same reason ``MAJOR_TEXT`` is, and with the same narrowness: one
+/// field on one frame (`WAKE`'s `Capability.enabled`) is a boolean in the CDDL,
+/// because "push is on here" is a two-state fact and a client branching on
+/// `uint == 1` would be a client that has to decide what `2` means. There is
+/// exactly one encoding of each value, so nothing about determinism changes.
+pub const FALSE: &[u8] = &[0xf4];
+pub const TRUE: &[u8] = &[0xf5];
+
+pub fn boolean(value: bool) -> Vec<u8> {
+    if value {
+        TRUE.to_vec()
+    } else {
+        FALSE.to_vec()
+    }
+}
+
+/// One text string. See ``MAJOR_TEXT`` for why the subset carries one at all.
+pub fn text(value: &str) -> Vec<u8> {
+    let mut out = head(MAJOR_TEXT, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
 pub fn array(items: &[Vec<u8>]) -> Vec<u8> {
     let mut out = head(MAJOR_ARRAY, items.len() as u64);
     for item in items {
@@ -107,6 +148,11 @@ pub enum CborError {
     OutOfRange(u64),
     #[error("{0} bytes remain after the last field")]
     TrailingBytes(usize),
+    /// A text string whose bytes are not UTF-8. Refused rather than replaced: a
+    /// lossy conversion would map two different inputs onto one decoded value,
+    /// which is the same determinism hole as a non-canonical integer.
+    #[error("text string is not valid UTF-8")]
+    InvalidUtf8,
 }
 
 /// A cursor over encoded bytes.
@@ -257,6 +303,64 @@ impl<'a> Reader<'a> {
             });
         }
         Ok(value)
+    }
+
+    /// One boolean, and nothing that merely looks like one.
+    ///
+    /// An integer here is a type mismatch rather than a truthy value, because a
+    /// decoder that accepted `1` for `true` would be a decoder with an opinion about
+    /// `2`, and two peers whose opinions differ is the drift this module exists to
+    /// prevent.
+    pub fn boolean(&mut self) -> Result<bool, CborError> {
+        let start = self.offset;
+        let (major, argument) = self.read_head()?;
+        if major != MAJOR_SIMPLE {
+            self.offset = start;
+            return Err(Self::mismatch(major, "boolean"));
+        }
+        match argument {
+            20 => Ok(false),
+            21 => Ok(true),
+            other => {
+                self.offset = start;
+                Err(CborError::UnsupportedSimple(
+                    u8::try_from(other).unwrap_or(u8::MAX),
+                ))
+            }
+        }
+    }
+
+    /// One text string, UTF-8 checked.
+    ///
+    /// The length rule and the truncation refusal are ``bytes``'s, copied rather
+    /// than shared because sharing them would mean reading a text string as a byte
+    /// string first and a caller could then get the bytes out of a field the wire
+    /// format says is text.
+    pub fn text(&mut self) -> Result<String, CborError> {
+        let start = self.offset;
+        let (major, argument) = self.read_head()?;
+        if major != MAJOR_TEXT {
+            self.offset = start;
+            return Err(Self::mismatch(major, "text string"));
+        }
+        if argument > self.remaining() as u64 {
+            self.offset = start;
+            return Err(CborError::Truncated);
+        }
+        let length = argument as usize;
+        let decoded = std::str::from_utf8(&self.data[self.offset..self.offset + length])
+            .map(str::to_string)
+            .map_err(|_| CborError::InvalidUtf8);
+        match decoded {
+            Ok(value) => {
+                self.offset += length;
+                Ok(value)
+            }
+            Err(error) => {
+                self.offset = start;
+                Err(error)
+            }
+        }
     }
 
     /// A byte string, or `null` for absence.

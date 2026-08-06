@@ -880,6 +880,14 @@ async fn publish_handshake(
                     crate::hub::MIN_FANOUT_VERSION,
                 )
                 .await;
+            // A commit that reaches every member or the group forks, so a member who
+            // is asleep is exactly the member who needs waking. After the append, off
+            // this task.
+            crate::push::dispatch::after_commit(
+                state,
+                handshake.group.clone(),
+                crate::push::Category::Handshake,
+            );
             queue_all(sender, vec![frame])
         }
         Err(store::StoreError::Refused(error)) => {
@@ -938,6 +946,123 @@ async fn key_packages(
 ) -> bool {
     let answer = crate::keys::handle(state, session, body).await;
     queue_all(sender, vec![answer])
+}
+
+/// One push-wake registration, clear or query.
+///
+/// The authorization is the same one every other frame gets and is deliberately not
+/// a new rule: the principal is the authenticated session's, named by the workspace's
+/// own salted entry hash, so a registration can only ever be made against the device
+/// that opened the socket. There is no field on the frame that could name another
+/// device and no code path here that would read one.
+async fn wake_registration(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    session: &Session,
+    body: crate::frame::WakeBody,
+    now_ms: u64,
+) -> bool {
+    let answer = wake_answer(state, session, body, now_ms).await;
+    queue_all(sender, vec![answer])
+}
+
+/// The answer itself, as one frame.
+///
+/// Split from the queueing for the reason `media::handle` is: a test drives this
+/// directly and sees exactly the frame the socket path queues, so the two cannot
+/// disagree about what a refusal looks like.
+pub async fn wake_answer(
+    state: &Arc<RelayState>,
+    session: &Session,
+    body: crate::frame::WakeBody,
+    now_ms: u64,
+) -> Frame {
+    use crate::frame::WakeBody;
+
+    // Answered before anything else, and without a database. `Query` is how a client
+    // learns whether to register at all, so a relay whose Postgres is unreachable
+    // must still be able to say "push is on here, and this is the ringer": the
+    // alternative is a client that treats an outage as push being unavailable and
+    // holds no registration afterwards.
+    if matches!(body, WakeBody::Query) {
+        return Frame::Wake(state.push.capability());
+    }
+    // Denied before the database is touched, because the answer does not depend on
+    // it. `denied` and not `reject`: the frame is well formed and the answer would
+    // change if the operator changed one variable, so the client re-reads state with
+    // `Query` rather than resending this.
+    if !state.push.enabled() {
+        return Frame::Error(FrameError::new(ErrorCode::PushNotConfigured));
+    }
+    let Some(database) = &state.database else {
+        return Frame::Error(FrameError::new(ErrorCode::PushBackpressure));
+    };
+    // The same refusal a stranger gets, and reachable the same way `keys::handle`'s
+    // is: with `WEALD_RELAY_ACCESS_SET=off`, the one mode that admits a session with
+    // no workspace claim. A registration belongs to a workspace.
+    let (Some(workspace), Some(device_key)) =
+        (session.authorized_workspace(), session.device_key())
+    else {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    let pool = database.pool();
+    let Ok(salt) = crate::access::store::salt(pool, workspace).await else {
+        return Frame::Error(FrameError::new(ErrorCode::PushBackpressure));
+    };
+    let entry = crate::access::entry_hash(device_key, &salt);
+
+    match body {
+        WakeBody::Register {
+            handle,
+            categories,
+            expires_at,
+        } => {
+            // The ceiling is charged before the write, because the write is what it
+            // exists to protect. Per principal rather than per connection, so a device
+            // that reconnects does not get a fresh allowance.
+            if !state.push_rate.allow(&entry, now_ms).await {
+                return Frame::Error(
+                    FrameError::new(ErrorCode::PushRegistrationRate)
+                        .retry_after(3600)
+                        .detail(u64::from(crate::push::REGISTRATIONS_PER_HOUR).to_be_bytes()),
+                );
+            }
+            match crate::push::store::register(
+                pool, workspace, &entry, &handle, categories, expires_at,
+            )
+            .await
+            {
+                Ok(crate::push::store::Registered::Stored) => {
+                    Frame::Wake(WakeBody::Registered { expires_at })
+                }
+                // Another principal holds this handle. A reject, because the bytes are
+                // permanently wrong for this principal however the relay is
+                // configured: the client's fix is to ask the ringer for a handle of
+                // its own, never to resend this one. The answer is the same whether
+                // the other claimant is in this workspace or another, so it is not an
+                // oracle for who else has registered.
+                Ok(crate::push::store::Registered::HandleTaken) => {
+                    Frame::Error(FrameError::new(ErrorCode::PushHandleMalformed))
+                }
+                Err(_) => Frame::Error(FrameError::new(ErrorCode::PushBackpressure)),
+            }
+        }
+        // `Cleared` whether a row was there or not. The client's desired state has
+        // been reached either way, and a distinguishable answer would turn this into
+        // an oracle for whether a principal had registered.
+        WakeBody::Clear => match crate::push::store::clear(pool, workspace, &entry).await {
+            Ok(_) => Frame::Wake(WakeBody::Cleared),
+            Err(_) => Frame::Error(FrameError::new(ErrorCode::PushBackpressure)),
+        },
+        // `session.rs` refuses the relay-to-client forms and `Query` is answered
+        // above, so nothing reaches here. This arm exists because the type is one enum
+        // in both directions; it gives the same answer the session table gives, so the
+        // two cannot disagree.
+        WakeBody::Registered { .. }
+        | WakeBody::Cleared
+        | WakeBody::Query
+        | WakeBody::Capability { .. } => Frame::Error(FrameError::new(ErrorCode::MalformedHeader)),
+    }
 }
 
 /// Answer the state query: the workspace salt and the head of the set chain.
@@ -1157,6 +1282,19 @@ pub async fn perform(
                     // pushing it again would double a retry on every other screen.
                     if let Accepted::Stored { seq } = outcome {
                         crate::sync::deliver(state, &decoded, seq, now_ms, connection).await;
+                        // And the wake, for the admitted principals of this group who
+                        // are not holding a socket. After the commit and off this
+                        // task, so a `SEND_ACK` is never delayed by one and a ringer
+                        // that hangs is invisible from here
+                        // (`crate::push::dispatch`). Only a fresh store, never a
+                        // duplicate: a retry is an envelope everybody has already been
+                        // told about, and waking a phone for it twice is the same
+                        // defect as pushing it twice.
+                        crate::push::dispatch::after_commit(
+                            state,
+                            decoded.group.clone(),
+                            crate::push::Category::Message,
+                        );
                     }
                     // Both outcomes carry a sequence number, and the client cannot
                     // tell them apart. That is deliberate: a retry is answered with
@@ -1229,6 +1367,9 @@ pub async fn perform(
                 .await
         }
         Work::KeyPackages { body } => key_packages(sender, state, session, body).await,
+        Work::WakeRegistration { body } => {
+            wake_registration(sender, state, session, body, now_ms).await
+        }
         Work::BlobTicket { payload } => {
             let answer = crate::media::handle(state, session, payload, &state.media_rate).await;
             queue_all(sender, vec![answer])

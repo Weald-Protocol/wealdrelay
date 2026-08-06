@@ -35,6 +35,37 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// Which layer of the receive path a vector's outcome belongs to.
+///
+/// `protocol.md` draws this line and the corpus has to carry it, because the two
+/// layers refuse with two different closed vocabularies. A card carrying an unknown
+/// key is malformed: no reading of it is a card, and the reason is a `codec.` one.
+/// An invoke whose deadline has passed is *perfectly formed* and must decode
+/// cleanly; what refuses it is an admission check and the reason is
+/// `deadline.passed`.
+///
+/// The tolerant direction is the dangerous one. If an expired invoke were allowed
+/// to fail at decode, an implementation could pass the corpus while being unable to
+/// tell "these bytes are not an invoke" from "this invoke arrived too late", and the
+/// second is a state the product has to render to a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The codec must refuse the bytes.
+    Decode,
+    /// The codec must accept them and the admission check must refuse them.
+    Admit,
+}
+
+impl Stage {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "decode" => Some(Stage::Decode),
+            "admit" => Some(Stage::Admit),
+            _ => None,
+        }
+    }
+}
+
 /// What a conforming codec must do with a vector's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expectation {
@@ -51,6 +82,8 @@ pub struct Vector {
     pub name: String,
     pub kind: String,
     pub file: String,
+    /// Which layer must produce the outcome. See `Stage`.
+    pub stage: Stage,
     pub expectation: Expectation,
     pub bytes: Vec<u8>,
 }
@@ -189,6 +222,21 @@ pub fn load(root: &Path) -> Result<Corpus, CorpusError> {
             return Err(CorpusError::DuplicateName(entry.name));
         }
 
+        let stage_raw = entry.stage.as_deref().unwrap_or("decode");
+        let stage = match Stage::parse(stage_raw) {
+            Some(stage) => stage,
+            None => return Err(CorpusError::UnknownStage(entry.name, stage_raw.to_string())),
+        };
+        // An `accept` names no stage: the bytes pass every layer, so there is
+        // nothing to locate, and allowing one would let a row read as though a layer
+        // had been exercised when it had not.
+        if entry.expect == "accept" && entry.stage.is_some() {
+            return Err(CorpusError::AcceptCarriesStage(
+                entry.name,
+                stage_raw.to_string(),
+            ));
+        }
+
         let expectation = match (entry.expect.as_str(), entry.reason.as_deref()) {
             ("accept", None) => Expectation::Accept,
             ("accept", Some(reason)) => {
@@ -218,6 +266,7 @@ pub fn load(root: &Path) -> Result<Corpus, CorpusError> {
             name: entry.name,
             kind: entry.kind,
             file: entry.file,
+            stage,
             expectation,
             bytes,
         });
@@ -252,10 +301,16 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Every `.cbor` under `root` must be named by the manifest.
 ///
-/// The adversarial corpus is a corpus in its own right with its own manifest, so
-/// walking into it from the golden root would report every hostile vector as an
-/// orphan. It is skipped by name for that reason, not because nested directories
-/// are uninteresting.
+/// A nested corpus is a corpus in its own right with its own manifest, so walking
+/// into it from the root above would report every one of its vectors as an orphan.
+/// Such a directory is skipped for that reason, not because nested directories are
+/// uninteresting.
+///
+/// The rule is "it carries a `manifest.json`" rather than "it is called
+/// adversarial", which is what it was until step 10 added the gateway corpus
+/// underneath the adversarial one. A second hard-coded name would have been a third
+/// one waiting, and the property that actually matters is that something else is
+/// already asserting completeness over those bytes.
 fn assert_no_orphans(root: &Path, named: &BTreeSet<PathBuf>) -> Result<(), CorpusError> {
     let mut orphans: Vec<String> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -277,7 +332,7 @@ fn assert_no_orphans(root: &Path, named: &BTreeSet<PathBuf>) -> Result<(), Corpu
                 continue;
             }
             if path.is_dir() {
-                if name == "adversarial" {
+                if path.join("manifest.json").is_file() {
                     continue;
                 }
                 stack.push(path);
@@ -315,6 +370,11 @@ struct Entry {
     expect: String,
     #[serde(default)]
     reason: Option<String>,
+    /// Absent means `decode`. Defaulted rather than required so the step 1
+    /// manifests did not have to be rewritten to say the only thing they could
+    /// have said.
+    #[serde(default)]
+    stage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +388,8 @@ pub enum CorpusError {
     MissingVectorFile(String, PathBuf),
     OrphanedVectors(Vec<String>),
     Unwalkable(PathBuf),
+    UnknownStage(String, String),
+    AcceptCarriesStage(String, String),
 }
 
 impl fmt::Display for CorpusError {
@@ -371,6 +433,15 @@ impl fmt::Display for CorpusError {
                  An unlisted vector runs against nothing and proves nothing.",
                 files.len(),
                 files.join(", ")
+            ),
+            CorpusError::UnknownStage(name, stage) => write!(
+                f,
+                "vector '{name}' names stage '{stage}'. Only 'decode' and 'admit' exist."
+            ),
+            CorpusError::AcceptCarriesStage(name, stage) => write!(
+                f,
+                "vector '{name}' accepts and names stage '{stage}'. An accepted vector \
+                 passes every layer, so there is no stage to name."
             ),
             CorpusError::Unwalkable(p) => {
                 write!(f, "cannot enumerate the corpus at {}.", p.display())
@@ -495,8 +566,22 @@ mod tests {
     fn a_nested_adversarial_corpus_is_not_walked() {
         let s = Scratch::new();
         s.manifest(&manifest_with(""))
+            .vector("adversarial/manifest.json", br#"{"corpus":"a"}"#)
             .vector("adversarial/vectors/hostile.cbor", b"hostile");
         load(&s.root()).expect("the adversarial corpus owns its own manifest");
+    }
+
+    /// The other half of the rule, and the half that keeps it honest: a nested
+    /// directory carrying no manifest is nobody's corpus, so its vectors are this
+    /// one's and are orphans. Without this, "skip a subdirectory" would be a hole a
+    /// vector could be hidden in by putting it one level down.
+    #[test]
+    fn a_nested_directory_without_a_manifest_is_walked() {
+        let s = Scratch::new();
+        s.manifest(&manifest_with(""))
+            .vector("spare/hostile.cbor", b"hostile");
+        let err = load(&s.root()).expect_err("must refuse");
+        assert!(matches!(err, CorpusError::OrphanedVectors(names) if names == ["hostile.cbor"]));
     }
 
     // ------------------------------------------------------------------ refusals
@@ -590,6 +675,62 @@ mod tests {
         assert_eq!(
             load(&s.root()).expect_err("must refuse"),
             CorpusError::RejectMissingReason("a".into())
+        );
+    }
+
+    #[test]
+    fn a_reject_defaults_to_the_decode_stage() {
+        let s = Scratch::new();
+        s.manifest(&manifest_with(
+            r#"{"name":"a","kind":"k","file":"vectors/a.cbor","expect":"reject","reason":"codec.truncated"}"#,
+        ))
+        .vector("vectors/a.cbor", b"a");
+        assert_eq!(
+            load(&s.root()).expect("load").vectors[0].stage,
+            Stage::Decode
+        );
+    }
+
+    #[test]
+    fn the_admit_stage_is_carried_through() {
+        let s = Scratch::new();
+        s.manifest(&manifest_with(
+            r#"{"name":"a","kind":"k","file":"vectors/a.cbor","expect":"reject",
+                "reason":"deadline.passed","stage":"admit"}"#,
+        ))
+        .vector("vectors/a.cbor", b"a");
+        assert_eq!(
+            load(&s.root()).expect("load").vectors[0].stage,
+            Stage::Admit
+        );
+    }
+
+    #[test]
+    fn an_unknown_stage_is_refused() {
+        let s = Scratch::new();
+        s.manifest(&manifest_with(
+            r#"{"name":"a","kind":"k","file":"vectors/a.cbor","expect":"reject",
+                "reason":"codec.truncated","stage":"maybe"}"#,
+        ))
+        .vector("vectors/a.cbor", b"a");
+        assert_eq!(
+            load(&s.root()).expect_err("must refuse"),
+            CorpusError::UnknownStage("a".into(), "maybe".into())
+        );
+    }
+
+    /// An accepted vector passes every layer, so naming one would let the row read
+    /// as though a layer had been exercised when it had not.
+    #[test]
+    fn accept_with_a_stage_is_refused() {
+        let s = Scratch::new();
+        s.manifest(&manifest_with(
+            r#"{"name":"a","kind":"k","file":"vectors/a.cbor","expect":"accept","stage":"decode"}"#,
+        ))
+        .vector("vectors/a.cbor", b"a");
+        assert_eq!(
+            load(&s.root()).expect_err("must refuse"),
+            CorpusError::AcceptCarriesStage("a".into(), "decode".into())
         );
     }
 
@@ -786,6 +927,8 @@ mod tests {
             CorpusError::MissingVectorFile("a".into(), p.clone()).to_string(),
             CorpusError::OrphanedVectors(vec!["a.cbor".into()]).to_string(),
             CorpusError::Unwalkable(p).to_string(),
+            CorpusError::UnknownStage("a".into(), "maybe".into()).to_string(),
+            CorpusError::AcceptCarriesStage("a".into(), "decode".into()).to_string(),
         ];
         for message in messages {
             assert!(!message.is_empty());

@@ -58,6 +58,14 @@ const SENSITIVE_KEYS: &[&str] = &[
     "cookie",
     "private_key",
     "credential",
+    // A push wake handle. Sixteen bytes of hex is thirty two characters and, unlike a
+    // key, it can be all lowercase letters, so `scrub_long_runs` would not claim it:
+    // that pass needs a digit or an uppercase letter to avoid eating every long word.
+    // Nothing in this crate ever formats a handle (`crate::push`), so this is the
+    // second line of defence rather than the first, and it is here because the failure
+    // mode is a handle arriving inside an error message from a library nobody audited.
+    "handle",
+    "push_handle",
 ];
 
 /// Remove anything that looks like a credential from one line of text.

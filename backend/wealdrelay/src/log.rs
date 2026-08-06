@@ -18,28 +18,28 @@
 //!
 //! ## Why the item set is loaded whole for a group
 //!
-//! ``items`` reads every `(seq, hash)` pair for one group, which is 40 bytes a row.
-//! A hundred thousand envelopes is four megabytes, and the alternative, streaming one
-//! range per round trip, would hold a transaction open across a client's think time.
-//! The bound that matters is `MAX_ITEMS_PER_RECONCILE` below: past it the relay
-//! reconciles the newest window and tells the client, rather than loading an
-//! unbounded set into memory because a peer asked it to.
+//! ``items`` reads every `(seq, hash)` pair for one group, which is 40 bytes a row
+//! plus the vector's own per-item overhead. The alternative, streaming one range
+//! per round trip, would hold a transaction open across a client's think time.
 //!
-//! This comment used to claim the read was "one index-only scan of
-//! `relay_envelope_group_seq_idx`". It is not, and the correction is worth keeping
-//! rather than quietly deleting. That index is `(group_id, seq)` and the query also
-//! selects `hash`, which is not in it, so the planner has to visit the heap per row
-//! or take the `(group_id, hash)` primary key and sort. `ct` is TOASTed out of line,
-//! so the main tuples stay narrow and the visit is cheaper than the column list
-//! suggests, but it is a heap visit and the difference is not nothing at a hundred
-//! thousand rows. `include (hash)` on the seq index would make the original claim
-//! true; whether that is the right change, or whether the whole-group reload should
-//! go, is WEALD-210, which wants a measurement on the reference machine first.
+//! The bound that matters is `MAX_ITEMS_PER_RECONCILE` below, and it is a bound on
+//! the relay's resident memory as much as on the database's work: the set is
+//! materialised whole, in the relay process, once per reconciliation round. Past
+//! the bound the relay reconciles the newest window and the older tail is reached
+//! by `SUB` with an explicit cursor, rather than loading an unbounded set into
+//! memory because a peer asked it to.
 //!
-//! The cost that made this worth filing is not one read. It is that the read happens
-//! on **every** reconciliation round, three to five times per reconnecting client,
-//! against a pool of sixteen connections, so a relay restart turns it into a herd.
+//! The read is one index-only scan of `relay_envelope_group_seq_hash_idx`, which is
+//! `(group_id, seq) include (hash)`. That was not true until migration
+//! `0008_envelope_read_path`: the index was `(group_id, seq)` alone and the query
+//! also selects `hash`, so the planner visited the heap per row or took the
+//! `(group_id, hash)` primary key and sorted. The correction is worth keeping in
+//! writing rather than quietly deleting, because the cost it describes is not one
+//! read: the read happens on **every** reconciliation round, three to five times
+//! per reconnecting client, against a small pool, so a relay restart turns it into
+//! a herd.
 
+use futures_util::TryStreamExt as _;
 use sqlx::{PgPool, Row};
 
 use crate::envelope::{Encryption, Envelope};
@@ -47,12 +47,18 @@ use crate::negentropy::Item;
 
 /// The most items one reconciliation round will load for a group.
 ///
-/// A million, which at 40 bytes a row is 40 MB and covers a corpus far past
-/// anything `specs/backend/build/local-harness.md` describes. A group past it
-/// reconciles over its newest million and the older tail is reached by
-/// `SUB` with an explicit cursor, which is the case compaction
+/// A hundred thousand. This was a million, which is 40 MB of pairs before the
+/// `Vec<Item>` overhead, held in the relay process, per concurrent reconciliation.
+/// That is not a bound a 512 MB relay survives being asked for twice at once, and
+/// the number was chosen against the size of a plausible corpus rather than
+/// against the memory of the machine reconciling it.
+///
+/// A hundred thousand is four megabytes of pairs and still covers a corpus far
+/// past anything `specs/backend/build/local-harness.md` describes. A group past it
+/// reconciles over its newest window and the older tail is reached by `SUB` with
+/// an explicit cursor, which is the case compaction
 /// (`specs/backend/relay/lifecycle.md`) is supposed to prevent from ever arising.
-pub const MAX_ITEMS_PER_RECONCILE: i64 = 1_000_000;
+pub const MAX_ITEMS_PER_RECONCILE: i64 = 100_000;
 
 /// The most envelopes one `SUB` reads before the client is told to reconcile
 /// instead.
@@ -79,20 +85,25 @@ fn log_error(error: sqlx::Error) -> LogError {
 
 /// Every `(seq, hash)` the group holds, ascending by `seq`.
 pub async fn items(pool: &PgPool, group: &[u8]) -> Result<Vec<Item>, LogError> {
-    let rows = sqlx::query(
+    // Newest first out of the database so the bound keeps the newest window, then
+    // reversed at the end: everything downstream binary-searches this slice and
+    // needs it ascending.
+    //
+    // Streamed rather than `fetch_all`, so the driver's own `Vec<PgRow>` is not a
+    // second, wider copy of the set alive at the same time as the `Vec<Item>`
+    // being built from it. A row carries its own buffer; an item is 40 bytes.
+    let mut rows = sqlx::query(
         "select seq, hash from relay_envelope where group_id = $1 \
          order by seq desc limit $2",
     )
     .bind(group)
     .bind(MAX_ITEMS_PER_RECONCILE)
-    .fetch_all(pool)
-    .await
-    .map_err(log_error)?;
+    .fetch(pool);
 
-    // Newest first out of the database so the bound keeps the newest window, then
-    // reversed: everything downstream binary-searches this slice and needs it
-    // ascending.
-    let mut items: Vec<Item> = rows.iter().map(row_to_item).collect();
+    let mut items: Vec<Item> = Vec::new();
+    while let Some(row) = rows.try_next().await.map_err(log_error)? {
+        items.push(row_to_item(&row));
+    }
     items.reverse();
     Ok(items)
 }

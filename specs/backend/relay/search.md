@@ -17,6 +17,34 @@ The user-facing stake: the first ten minutes on a new laptop decide whether
 someone believes this product works. A search box that returns nothing while a
 progress bar crawls is indistinguishable from a broken app.
 
+## Status: designed, built, deliberately not wired
+
+Everything below is the design, and the pieces named in it exist in
+`Sources/Sync/` (`SearchIndex`, `SearchStore`, `SearchKeyVault`,
+`SearchLocalState`, `SearchDocument`) with their cold start and rebuild paths
+covered by `Tests/ColdStartTests.swift`. Nothing in a shipped build opens one.
+`EnvelopeProjection.index` is nil at both production call sites
+(`RelayConnection`, `RelayTransport`), and no query surface reads the index
+either: the board's search box is `Sources/Core/BoardSearch.swift` over tickets
+already in memory (`specs/board-search.md`).
+
+So the "cannot drift" sentence below is a property of the design and not yet a
+property of the product, and no gate may rest on it. Two consequences, stated
+here because the answer was previously nowhere:
+
+- **Nobody owns the index's lifetime.** When it is wired, the owner is
+  `RelayTransport`, on the same setup path that resolves the seal and builds the
+  publisher: it opens the workspace's index once via `SearchIndex.open(store:)`,
+  runs cold start when `wasEmpty`, and hands the index to both
+  `EnvelopeProjection` constructions the way the seal is handed over. An index
+  that will not open is not fatal; projection continues with nil and the failure
+  is recorded on the status.
+- **The write half ships with the read half or not at all.** Wiring projection
+  alone buys a user nothing and costs every workspace a cold-start rebuild, so
+  the ordering is a query surface first, then the index behind it. Whether cold
+  start runs on first launch or is deferred to the first search is a product call
+  and is decided here before either lands.
+
 ## Index model
 
 One local index per workspace, built at decrypt time rather than query time.

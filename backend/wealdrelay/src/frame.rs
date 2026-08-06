@@ -36,7 +36,16 @@ use crate::cbor::{self, CborError, Reader};
 /// (``FrameTag::Call`` and ``FrameTag::Media``) and changes neither an envelope
 /// nor an existing frame. A client of any earlier version keeps working and
 /// simply never receives a frame it does not know.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// Version 4 adds exactly one frame, ``FrameTag::Wake``, and changes no envelope,
+/// no envelope kind and no existing frame. It is a version bump rather than an
+/// additive change because `../contracts/governance.md`'s mechanical test is about
+/// disagreement rather than about damage: a version 3 relay and a version 4 client
+/// cannot agree on what tag 25 means, so the number that decides it has to move
+/// (`specs/backend/relay/push.md`). A version 3 client keeps working, never sends
+/// a `WAKE`, and therefore never receives a push, which is the same posture as a
+/// relay with push switched off.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The lowest protocol version this build will still serve.
 ///
@@ -96,18 +105,37 @@ pub enum ErrorCode {
     Backpressure,
     LockTimeout,
     Failover,
+    /// No database on the wake-registration path. Fails closed like every other
+    /// admission path: a relay that cannot write a registration must not answer as
+    /// though it had, because the client would then believe it holds a wake
+    /// capability it does not (`specs/backend/relay/push.md` section 3).
+    PushBackpressure,
     // reject
     MalformedHeader,
     NoncanonicalCbor,
     HashMismatch,
     EnvelopeTooLarge,
     UnknownRequiredField,
+    /// A `WAKE` registration the relay will never accept as sent: a handle that is
+    /// not exactly sixteen bytes, a `categories` bitmask that is zero or sets an
+    /// undefined bit, an `expires_at` already in the past, or a `register_url` a
+    /// client would refuse. A reject and not a denial, because none of those becomes
+    /// acceptable if the operator changes a variable: the bytes are wrong.
+    PushHandleMalformed,
     // denied
     PlaintextRefused,
     WriterNotInAccessSet,
     GroupUnknown,
     ServiceReadOnly,
     GroupFrozen,
+    /// A `Register` sent to a relay with `WEALD_RELAY_PUSH=off`.
+    ///
+    /// Denied rather than rejected, and the distinction is the client's next move.
+    /// The frame is well formed and the answer would change if the operator changed
+    /// one variable, so the correct response is to re-read the state by sending
+    /// `Query` and to hold no registration meanwhile, never to resend the same
+    /// `Register` against a relay that has said no.
+    PushNotConfigured,
     /// A recovery wrap that does not advance its slot's epoch. Denied rather
     /// than rejected: the bytes are well formed and would have been accepted one
     /// epoch ago, which is exactly the replay the monotonicity rule refuses
@@ -119,6 +147,14 @@ pub enum ErrorCode {
     RateLimited,
     SeatsExhausted,
     GroupIngressLimited,
+    /// More than ``crate::push::REGISTRATIONS_PER_HOUR`` registrations from one
+    /// principal in an hour.
+    ///
+    /// `quota` because that is the class this taxonomy has for "over a limit, retry
+    /// after the interval named". `push.md` writes the code as `limit/...` in prose;
+    /// the five classes in `operations.md` are closed and `quota` is the one that
+    /// means what the prose means, so the wire carries `quota`.
+    PushRegistrationRate,
     // version
     ProtocolUnsupported,
     BelowClientFloor,
@@ -130,22 +166,27 @@ impl ErrorCode {
     /// one of them.
     pub fn class(self) -> ErrorClass {
         match self {
-            Self::Backpressure | Self::LockTimeout | Self::Failover => ErrorClass::Retry,
+            Self::Backpressure | Self::LockTimeout | Self::Failover | Self::PushBackpressure => {
+                ErrorClass::Retry
+            }
             Self::MalformedHeader
             | Self::NoncanonicalCbor
             | Self::HashMismatch
             | Self::EnvelopeTooLarge
-            | Self::UnknownRequiredField => ErrorClass::Reject,
+            | Self::UnknownRequiredField
+            | Self::PushHandleMalformed => ErrorClass::Reject,
             Self::PlaintextRefused
             | Self::WriterNotInAccessSet
             | Self::GroupUnknown
             | Self::ServiceReadOnly
             | Self::GroupFrozen
-            | Self::WrapNotNewer => ErrorClass::Denied,
+            | Self::WrapNotNewer
+            | Self::PushNotConfigured => ErrorClass::Denied,
             Self::StorageExhausted
             | Self::RateLimited
             | Self::SeatsExhausted
-            | Self::GroupIngressLimited => ErrorClass::Quota,
+            | Self::GroupIngressLimited
+            | Self::PushRegistrationRate => ErrorClass::Quota,
             Self::ProtocolUnsupported | Self::BelowClientFloor => ErrorClass::Version,
         }
     }
@@ -156,21 +197,25 @@ impl ErrorCode {
             Self::Backpressure => "backpressure",
             Self::LockTimeout => "lock_timeout",
             Self::Failover => "failover",
+            Self::PushBackpressure => "push_backpressure",
             Self::MalformedHeader => "malformed_header",
             Self::NoncanonicalCbor => "noncanonical_cbor",
             Self::HashMismatch => "hash_mismatch",
             Self::EnvelopeTooLarge => "envelope_too_large",
             Self::UnknownRequiredField => "unknown_required_field",
+            Self::PushHandleMalformed => "push_handle_malformed",
             Self::PlaintextRefused => "plaintext_refused",
             Self::WriterNotInAccessSet => "writer_not_in_access_set",
             Self::GroupUnknown => "group_unknown",
             Self::ServiceReadOnly => "service_read_only",
             Self::GroupFrozen => "group_frozen",
+            Self::PushNotConfigured => "push_not_configured",
             Self::WrapNotNewer => "wrap_not_newer",
             Self::StorageExhausted => "storage_exhausted",
             Self::RateLimited => "rate_limited",
             Self::SeatsExhausted => "seats_exhausted",
             Self::GroupIngressLimited => "group_ingress_limited",
+            Self::PushRegistrationRate => "push_registration_rate",
             Self::ProtocolUnsupported => "protocol_unsupported",
             Self::BelowClientFloor => "below_client_floor",
         }
@@ -186,21 +231,25 @@ impl ErrorCode {
         Self::Backpressure,
         Self::LockTimeout,
         Self::Failover,
+        Self::PushBackpressure,
         Self::MalformedHeader,
         Self::NoncanonicalCbor,
         Self::HashMismatch,
         Self::EnvelopeTooLarge,
         Self::UnknownRequiredField,
+        Self::PushHandleMalformed,
         Self::PlaintextRefused,
         Self::WriterNotInAccessSet,
         Self::GroupUnknown,
         Self::ServiceReadOnly,
         Self::GroupFrozen,
+        Self::PushNotConfigured,
         Self::WrapNotNewer,
         Self::StorageExhausted,
         Self::RateLimited,
         Self::SeatsExhausted,
         Self::GroupIngressLimited,
+        Self::PushRegistrationRate,
         Self::ProtocolUnsupported,
         Self::BelowClientFloor,
     ];
@@ -343,6 +392,21 @@ pub enum FrameTag {
     /// admitted to. Folding them into one tag would have put the expensive check
     /// on the cheap path.
     Media = 24,
+    /// One push-wake registration, either direction.
+    ///
+    /// Named `WAKE` and not `PUSH`, and the reason is a reader six months from now
+    /// rather than taste: tag 10 has been ``FrameTag::Push``, the relay-to-client
+    /// envelope delivery frame, since version 1. Tags are permanent, so the word
+    /// `PUSH` is permanently spoken for, and using it a second time for the
+    /// unrelated business of waking a sleeping device would be a defect waiting for
+    /// somebody to grep.
+    ///
+    /// The frame carries no device identifier at all. A registration is a statement
+    /// about the authenticated principal, and the relay learns which principal from
+    /// the session rather than from a field, which is what stops one device
+    /// registering a wake capability against another (`specs/backend/relay/push.md`
+    /// section 3).
+    Wake = 25,
 }
 
 impl FrameTag {
@@ -372,6 +436,7 @@ impl FrameTag {
             22 => Self::Keys,
             23 => Self::Call,
             24 => Self::Media,
+            25 => Self::Wake,
             _ => return None,
         })
     }
@@ -401,6 +466,7 @@ impl FrameTag {
         Self::Keys,
         Self::Call,
         Self::Media,
+        Self::Wake,
     ];
 }
 
@@ -412,6 +478,15 @@ impl FrameTag {
 /// one would let an attacker make the relay allocate before it has checked
 /// anything.
 pub const MAX_FRAME_BYTES: usize = (1 << 20) + 4096;
+
+/// The largest `WAKE` frame the relay will read.
+///
+/// One kibibyte, which `specs/backend/relay/push.md` section 3 fixes. Every field
+/// is fixed and small: sixteen bytes of handle, one byte of mask, two integers and
+/// a url bounded at 512 bytes. A frame near this bound is already implausible and a
+/// frame over it is a peer spending the relay's read budget on a question whose
+/// answer cannot depend on the bytes past here.
+pub const MAX_WAKE_BYTES: usize = 1024;
 
 /// Why a frame could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -426,6 +501,21 @@ pub enum FrameDecodeError {
     UnsupportedVersion(u16),
     #[error("frame field {field} is not what the frame set says it is")]
     BadField { field: &'static str },
+    /// A `WAKE` field that is wrong in a way the push registry has its own code
+    /// for. Separate from ``BadField`` so the client is told
+    /// `reject/push_handle_malformed` and knows the registration was refused, rather
+    /// than `reject/malformed_header`, which reads as a framing bug and would send a
+    /// client looking at its encoder. The field name is `&'static str` and never the
+    /// value: a variant carrying the handle would put it in every error message.
+    #[error("WAKE field {field} is not what the frame set says it is")]
+    BadWakeField { field: &'static str },
+    /// A `WAKE` frame over its own kilobyte ceiling, which is far below
+    /// ``MAX_FRAME_BYTES``. Its own variant because its own bound: every field is
+    /// fixed and small, so a large one is not a big registration but a peer making
+    /// the relay read a megabyte to answer a sixteen byte question. Answered with the
+    /// code every other over-size frame is answered with, because that is what it is.
+    #[error("WAKE frame is {0} bytes, over the {MAX_WAKE_BYTES} byte limit")]
+    TooLargeWake(usize),
 }
 
 impl FrameDecodeError {
@@ -437,8 +527,32 @@ impl FrameDecodeError {
             Self::TooLarge(_) => ErrorCode::EnvelopeTooLarge,
             Self::Cbor(_) => ErrorCode::NoncanonicalCbor,
             Self::UnknownTag(_) | Self::BadField { .. } => ErrorCode::MalformedHeader,
+            Self::BadWakeField { .. } => ErrorCode::PushHandleMalformed,
+            Self::TooLargeWake(_) => ErrorCode::EnvelopeTooLarge,
             Self::UnsupportedVersion(_) => ErrorCode::ProtocolUnsupported,
         }
+    }
+}
+
+/// Split a `WAKE` codec failure into "the wrong shape" and "not canonical".
+///
+/// Every other frame answers both with `reject/noncanonical_cbor`, through
+/// ``FrameDecodeError::code``, and that is a shared mapping across twenty five tags
+/// which this change is not going to move. `WAKE` is the first frame with a
+/// hand-computed vector corpus that distinguishes the two
+/// (`specs/backend/contracts/wire/vectors/push-frames.json`), and the distinction is
+/// worth having where it exists: a map where an array belongs is a peer that
+/// disagrees about the frame's shape, which is `malformed_header`, while an
+/// indefinite length or a non-shortest integer is a peer whose encoder is not
+/// deterministic, which is `noncanonical_cbor` and names the rule it broke.
+fn wake_shape(error: CborError, field: &'static str) -> FrameDecodeError {
+    match error {
+        // The canonicity rules, which are about the encoding rather than the frame.
+        CborError::NonCanonicalInteger
+        | CborError::ReservedAdditionalInfo(_)
+        | CborError::TrailingBytes(_) => FrameDecodeError::Cbor(error),
+        // Everything else is a field that is not what the frame set says it is.
+        _ => FrameDecodeError::BadField { field },
     }
 }
 
@@ -634,6 +748,102 @@ pub enum Frame {
         seq: u64,
         ct: Vec<u8>,
     },
+    /// One push-wake conversation, in either direction.
+    ///
+    /// Six forms in one frame, the shape `KEYS` already uses, because they are one
+    /// conversation about one row: a client that could clear a registration it had no
+    /// way to make would be a client with a different frame set
+    /// (`specs/backend/relay/push.md` section 3).
+    Wake(WakeBody),
+}
+
+/// The `WAKE` forms. `specs/backend/relay/push.md`.
+///
+/// No `Debug` derive that could print a handle: see the hand-written implementation
+/// below. The handle is the one field in this crate that is a capability to reach a
+/// human's device, and the negative proof the gate runs is that it never reaches a
+/// log line at any level, including inside an error.
+#[derive(Clone, PartialEq, Eq)]
+pub enum WakeBody {
+    /// Client to relay: store this against me, in this workspace.
+    Register {
+        /// Sixteen random bytes the ringer minted to this device. Opaque here and
+        /// never derived from anything the relay holds.
+        handle: Vec<u8>,
+        /// The bitmask from ``crate::push::Category``. At least one bit, no bit
+        /// above 4.
+        categories: u8,
+        /// The ringer's stated expiry, in milliseconds since the epoch.
+        expires_at: u64,
+    },
+    /// Relay to client: stored, and this is when the relay will forget it.
+    Registered { expires_at: u64 },
+    /// Client to relay: forget my registration in this workspace.
+    Clear,
+    /// Relay to client: forgotten. A `Clear` with no row is also this, because the
+    /// client's desired state has been reached either way and a distinguishable
+    /// answer would tell a caller whether a row existed.
+    Cleared,
+    /// Client to relay: where do I register, if anywhere?
+    Query,
+    /// Relay to client: push is on or off here, and this is the ringer.
+    ///
+    /// The form that makes a self-hosted deployment work with a shipped client and
+    /// no client-side configuration. The device must not guess a ringer, because
+    /// guessing ours would mean a self-hoster's users registering with a party their
+    /// operator did not choose, so the relay states it.
+    Capability { enabled: bool, register_url: String },
+}
+
+impl WakeBody {
+    /// The leading discriminant on the wire. Fixed numbers for the same reason a
+    /// frame tag is fixed.
+    pub fn form(&self) -> u8 {
+        match self {
+            Self::Register { .. } => 1,
+            Self::Registered { .. } => 2,
+            Self::Clear => 3,
+            Self::Cleared => 4,
+            Self::Query => 5,
+            Self::Capability { .. } => 6,
+        }
+    }
+
+    /// What holding this body costs, in bytes, for the queue budget.
+    ///
+    /// Every form is small and fixed except the url, which is bounded by
+    /// ``MAX_REGISTER_URL_BYTES``. Counted anyway, for the reason ``KeysBody``
+    /// counts its packages: the allowance in ``Frame::queued_bytes`` is a fixed
+    /// header estimate, and a field that can be half a kilobyte is not a header.
+    pub fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Register { handle, .. } => handle.len(),
+            Self::Capability { register_url, .. } => register_url.len(),
+            Self::Registered { .. } | Self::Clear | Self::Cleared | Self::Query => 0,
+        }
+    }
+}
+
+/// Hand written, so a handle cannot reach a log through a derived `Debug`.
+///
+/// `specs/backend/relay/push.md` section 2 makes three absences load-bearing and
+/// this is the mechanism behind the first of them. A derived implementation would
+/// print the bytes anywhere a frame is formatted, including inside a panic message
+/// or a `tracing` field, and "nobody formats a frame" is a rule a reviewer enforces
+/// rather than the compiler. The form is printed because the form is not a secret
+/// and an operator debugging a registration needs to know which one arrived.
+impl std::fmt::Debug for WakeBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Register { .. } => "Register",
+            Self::Registered { .. } => "Registered",
+            Self::Clear => "Clear",
+            Self::Cleared => "Cleared",
+            Self::Query => "Query",
+            Self::Capability { .. } => "Capability",
+        };
+        write!(f, "WakeBody::{name}({})", crate::logging::REDACTED)
+    }
 }
 
 /// The `KEYS` forms. `specs/backend/relay/private-messaging.md`.
@@ -702,6 +912,7 @@ impl Frame {
             Self::Keys(_) => FrameTag::Keys,
             Self::Call { .. } => FrameTag::Call,
             Self::Media { .. } => FrameTag::Media,
+            Self::Wake(_) => FrameTag::Wake,
             Self::Error(_) => FrameTag::Error,
         }
     }
@@ -740,6 +951,7 @@ impl Frame {
             Self::Call { body, .. } => body.len(),
             Self::Media { ct, .. } => ct.len(),
             Self::Keys(body) => body.queued_bytes(),
+            Self::Wake(body) => body.queued_bytes(),
             // Everything else is headers and integers, covered by the allowance.
             _ => 0,
         };
@@ -848,6 +1060,26 @@ impl Frame {
                         cbor::array(&[cbor::bytes(device), cbor::uint(u64::from(*count))])
                     }
                     KeysBody::None => cbor::array(&[]),
+                };
+                cbor::array(&[cbor::uint(u64::from(body.form())), fields])
+            }
+            Self::Wake(body) => {
+                let fields = match body {
+                    WakeBody::Register {
+                        handle,
+                        categories,
+                        expires_at,
+                    } => cbor::array(&[
+                        cbor::bytes(handle),
+                        cbor::uint(u64::from(*categories)),
+                        cbor::uint(*expires_at),
+                    ]),
+                    WakeBody::Registered { expires_at } => cbor::array(&[cbor::uint(*expires_at)]),
+                    WakeBody::Clear | WakeBody::Cleared | WakeBody::Query => cbor::array(&[]),
+                    WakeBody::Capability {
+                        enabled,
+                        register_url,
+                    } => cbor::array(&[cbor::boolean(*enabled), cbor::text(register_url)]),
                 };
                 cbor::array(&[cbor::uint(u64::from(body.form())), fields])
             }
@@ -1089,6 +1321,86 @@ impl Frame {
                     _ => return Err(FrameDecodeError::BadField { field: "form" }),
                 };
                 Self::Keys(body)
+            }
+            FrameTag::Wake => {
+                if bytes.len() > MAX_WAKE_BYTES {
+                    return Err(FrameDecodeError::TooLargeWake(bytes.len()));
+                }
+                reader.array(2).map_err(|e| wake_shape(e, "wake"))?;
+                let form = reader.u8().map_err(|e| wake_shape(e, "form"))?;
+                let body = match form {
+                    1 => {
+                        reader.array(3).map_err(|e| wake_shape(e, "register"))?;
+                        // Read as a variable-length byte string and measured here,
+                        // rather than as a fixed sixteen through `bytes_of`. The
+                        // difference is the code the client is told: a wrong-length
+                        // handle is `reject/push_handle_malformed`, which names the
+                        // field that was wrong, where the codec's own length refusal
+                        // would surface as a framing complaint and send a client
+                        // looking at its encoder.
+                        let handle = reader.bytes().map_err(|e| wake_shape(e, "handle"))?;
+                        if handle.len() != crate::push::HANDLE_BYTES {
+                            return Err(FrameDecodeError::BadWakeField { field: "handle" });
+                        }
+                        let categories = reader.u8().map_err(|e| wake_shape(e, "categories"))?;
+                        if !crate::push::is_valid_mask(categories) {
+                            return Err(FrameDecodeError::BadWakeField {
+                                field: "categories",
+                            });
+                        }
+                        WakeBody::Register {
+                            handle,
+                            categories,
+                            expires_at: reader.uint().map_err(|e| wake_shape(e, "expires_at"))?,
+                        }
+                    }
+                    2 => {
+                        reader.array(1).map_err(|e| wake_shape(e, "registered"))?;
+                        WakeBody::Registered {
+                            expires_at: reader.uint().map_err(|e| wake_shape(e, "expires_at"))?,
+                        }
+                    }
+                    3 | 4 | 5 => {
+                        reader.array(0).map_err(|e| wake_shape(e, "fields"))?;
+                        match form {
+                            3 => WakeBody::Clear,
+                            4 => WakeBody::Cleared,
+                            // The remaining arm, and the only one left: the outer
+                            // match admits exactly these three numbers here.
+                            _ => WakeBody::Query,
+                        }
+                    }
+                    6 => {
+                        reader.array(2).map_err(|e| wake_shape(e, "capability"))?;
+                        let enabled = reader.boolean().map_err(|e| wake_shape(e, "enabled"))?;
+                        let register_url =
+                            reader.text().map_err(|e| wake_shape(e, "register_url"))?;
+                        // Length in bytes and not in characters, because the bound is
+                        // on the wire rather than on the display: `tstr .size (0..512)`
+                        // is a byte count, and a client refusing at 512 characters
+                        // would refuse a url this relay considers legal. The scheme is
+                        // checked by the same rule the configuration applies, so a url
+                        // a client would refuse is one this codec refuses too rather
+                        // than one the relay states and the device silently ignores.
+                        if register_url.len() > crate::push::MAX_REGISTER_URL_BYTES
+                            || !crate::push::is_acceptable_register_url(&register_url)
+                        {
+                            return Err(FrameDecodeError::BadWakeField {
+                                field: "register_url",
+                            });
+                        }
+                        WakeBody::Capability {
+                            enabled,
+                            register_url,
+                        }
+                    }
+                    // Not one of the six. `BadField` and not `BadWakeField`, because
+                    // this is a peer that disagrees about the frame set rather than
+                    // one whose registration is wrong, which is the same answer
+                    // `KEYS` gives an unknown form of its own.
+                    _ => return Err(FrameDecodeError::BadField { field: "form" }),
+                };
+                Self::Wake(body)
             }
             FrameTag::Error => {
                 reader.array(4)?;

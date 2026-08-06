@@ -396,6 +396,17 @@ pub enum Request {
     MultipartAbort {
         session_id: Vec<u8>,
     },
+    /// Every stored object for one group of the caller's own workspace.
+    ///
+    /// The listing exists so a member can see what their workspace is holding in
+    /// the bucket. It names hashes and sizes and nothing else: the relay never
+    /// held a key, so it has no filename, no mime type and no author to report,
+    /// and a listing that invented any of those would be the relay claiming to
+    /// know something about content it cannot read.
+    List {
+        workspace: Vec<u8>,
+        group: Vec<u8>,
+    },
     RetentionControl(RetentionControl),
     RetentionManifest(RetentionManifest),
     RetentionPolicy(RetentionPolicy),
@@ -411,6 +422,7 @@ const TAG_RETENTION_CONTROL: u64 = 6;
 const TAG_RETENTION_MANIFEST: u64 = 7;
 const TAG_RETENTION_POLICY: u64 = 8;
 const TAG_RETENTION_DESTRUCTION: u64 = 9;
+const TAG_LIST: u64 = 10;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -470,6 +482,10 @@ impl Request {
             Self::MultipartAbort { session_id } => {
                 (TAG_MULTIPART_ABORT, cbor::array(&[cbor::bytes(session_id)]))
             }
+            Self::List { workspace, group } => (
+                TAG_LIST,
+                cbor::array(&[cbor::bytes(workspace), cbor::bytes(group)]),
+            ),
             Self::RetentionControl(record) => (TAG_RETENTION_CONTROL, record.encode()),
             Self::RetentionManifest(record) => (TAG_RETENTION_MANIFEST, record.encode()),
             Self::RetentionPolicy(record) => (TAG_RETENTION_POLICY, record.encode()),
@@ -544,6 +560,13 @@ impl Request {
                 reader.finish()?;
                 Self::MultipartAbort { session_id }
             }
+            TAG_LIST => {
+                reader.array(2)?;
+                let workspace = reader.bytes()?;
+                let group = reader.bytes_of(HASH_BYTES)?;
+                reader.finish()?;
+                Self::List { workspace, group }
+            }
             TAG_RETENTION_CONTROL => {
                 let record = RetentionControl::decode_from(&mut reader)?;
                 reader.finish()?;
@@ -599,6 +622,12 @@ pub enum Response {
     RetentionAck {
         digest: Vec<u8>,
     },
+    /// The answer to ``Request::List``: one entry per stored object, each a
+    /// ciphertext hash and the stored byte length, in the order the store
+    /// returned them.
+    Listing {
+        entries: Vec<(Vec<u8>, u64)>,
+    },
 }
 
 const RTAG_UPLOAD: u64 = 1;
@@ -610,6 +639,7 @@ const RTAG_MULTIPART_PART_UPLOAD: u64 = 6;
 const RTAG_MULTIPART_COMPLETED: u64 = 7;
 const RTAG_MULTIPART_ABORTED: u64 = 8;
 const RTAG_RETENTION_ACK: u64 = 9;
+const RTAG_LISTING: u64 = 10;
 
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
@@ -654,6 +684,15 @@ impl Response {
             Self::RetentionAck { digest } => {
                 (RTAG_RETENTION_ACK, cbor::array(&[cbor::bytes(digest)]))
             }
+            Self::Listing { entries } => (
+                RTAG_LISTING,
+                cbor::array(&[cbor::array(
+                    &entries
+                        .iter()
+                        .map(|(hash, len)| cbor::array(&[cbor::bytes(hash), cbor::uint(*len)]))
+                        .collect::<Vec<_>>(),
+                )]),
+            ),
         };
         cbor::array(&[cbor::uint(tag), body])
     }
@@ -721,6 +760,22 @@ impl Response {
                 let digest = reader.bytes()?;
                 reader.finish()?;
                 Self::RetentionAck { digest }
+            }
+            RTAG_LISTING => {
+                reader.array(1)?;
+                let count = reader.array_header()?;
+                if count > MAX_LIST {
+                    return Err(MediaWireError::TooManyEntries);
+                }
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    reader.array(2)?;
+                    let hash = reader.bytes()?;
+                    let len = reader.uint()?;
+                    entries.push((hash, len));
+                }
+                reader.finish()?;
+                Self::Listing { entries }
             }
             other => return Err(MediaWireError::UnknownTag(other)),
         })

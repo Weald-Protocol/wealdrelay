@@ -242,6 +242,18 @@ the cleartext frame header, which binds sequence and timestamp the way
 This adds zero cryptographic dependencies on either side and keeps the property
 the product sells: the relay forwards opaque bytes and holds no key.
 
+**One correction, made by building it on Android first.** The exporter form above
+is not computable on a device that is not an MLS member, which is exactly the
+case the phone companions exist to serve: a device holding a `BridgeRelayGrant`
+holds the per-epoch secret and no group handle. So the shipped derivation takes
+the per-epoch secret as the input keying material and puts the label, the group,
+the epoch and the call id in the HKDF info. The security claim is unchanged,
+because holding that secret already grants read of every message in the epoch, so
+the call key reaches exactly the devices that could already read the room. The
+Mac holds the same secret, so when step 37 lands it must derive the same way or
+the two ends will connect and be silent. `specs/android-voice-calls.md` carries
+the exact inputs.
+
 ### Codec
 
 `kAudioFormatMPEG4AAC_ELD` through `AudioToolbox`'s `AudioConverter`. AAC-ELD is

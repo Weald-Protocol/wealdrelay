@@ -755,6 +755,63 @@ pub async fn make_group_in(
     group
 }
 
+/// Publish the next access set for a workspace, dropping the named devices.
+///
+/// The real offboarding path: `access::store::publish` judges it, applies it in one
+/// transaction and returns the entries it removed, which is the list whose sockets
+/// are closed and whose push registrations are deleted. A test that deleted the
+/// registration directly would prove nothing about the transaction it has to be in.
+pub async fn publish_set_without(
+    state: &Arc<RelayState>,
+    workspace: &str,
+    signer: &SigningKey,
+    dropped: &[SigningKey],
+) {
+    let pool = state.database.as_ref().expect("a database").pool();
+    let salt = wealdrelay::access::store::salt(pool, workspace)
+        .await
+        .expect("a workspace salt");
+    let prior = wealdrelay::access::store::current(pool, workspace)
+        .await
+        .expect("read the current access set")
+        .prior
+        .expect("a genesis set to build on");
+    let going: Vec<Vec<u8>> = dropped
+        .iter()
+        .map(|device| wealdrelay::access::entry_hash(&device.verifying_key().to_bytes(), &salt))
+        .collect();
+    let mut next = AccessSet {
+        workspace: vec![0u8; 32],
+        version: prior.version + 1,
+        prev_hash: prior.digest.clone(),
+        issued_at: 0,
+        entries: prior
+            .entries
+            .iter()
+            .filter(|entry| !going.contains(entry))
+            .cloned()
+            .collect(),
+        authorizers: prior.authorizers.clone(),
+        recovery: prior.recovery.clone(),
+        quorum: None,
+        pending: Vec::new(),
+        signer: signer.verifying_key().to_bytes().to_vec(),
+        sig: vec![0u8; 64],
+    };
+    next.sig = Signer::sign(signer, &next.digest_input())
+        .to_bytes()
+        .to_vec();
+    let body = next.encode();
+    let accepted = wealdrelay::access::store::publish(pool, workspace, &next, &body)
+        .await
+        .expect("the publication is accepted");
+    assert_eq!(
+        accepted.disconnect.len(),
+        going.len(),
+        "the publication removed exactly the devices it was asked to"
+    );
+}
+
 /// A 32-byte blob hash from one seed byte, so a failure names the blob.
 pub fn blob_hash(seed: u8) -> Vec<u8> {
     vec![seed; 32]
@@ -937,6 +994,212 @@ pub async fn http_request(
         .and_then(|code| code.parse().ok())
         .unwrap_or(0);
     (status, response[split + 4..].to_vec())
+}
+
+// MARK: Step 37, the ringer
+//
+// Nothing here is a mock of the ringer. It is a real TCP listener on loopback
+// speaking real HTTP/1.1, which is what `specs/backend/relay/ringer.md` route 3
+// specifies and what the relay's own pooled client actually talks to. The relay is
+// under test; the party on the other end is a listener whose answers a test chooses,
+// which is the same shape `tests/media_*` uses for MinIO.
+
+/// A ringer that records what it was asked and answers with a chosen status.
+pub struct RecordingRinger {
+    pub address: std::net::SocketAddr,
+    requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingRinger {
+    /// Answer every wake with `202` and no body, which is the ordinary case.
+    pub async fn accepting() -> Self {
+        Self::answering(202, None).await
+    }
+
+    /// Answer every wake with a chosen status, and optionally a `Retry-After`.
+    pub async fn answering(status: u16, retry_after: Option<u64>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a ringer");
+        let address = listener.local_addr().expect("a ringer address");
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let request = read_http_request(&mut stream).await;
+                    recorded.lock().await.push(request);
+                    let extra = match retry_after {
+                        Some(seconds) => format!("Retry-After: {seconds}\r\n"),
+                        None => String::new(),
+                    };
+                    let response =
+                        format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n{extra}\r\n");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    // Held open briefly so the relay's pooled connection is reused
+                    // rather than reset under it, which is what a real ringer does.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                });
+            }
+        });
+        Self {
+            address,
+            requests,
+            task,
+        }
+    }
+
+    /// The url `WEALD_RELAY_PUSH_URL` is set to. `ringer.md` route 3's path.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1/wake", self.address.port())
+    }
+
+    /// Every request body it has been sent, oldest first.
+    pub async fn requests(&self) -> Vec<String> {
+        self.requests.lock().await.clone()
+    }
+
+    /// Wait until at least `count` requests have arrived, or give up.
+    ///
+    /// A bounded wait rather than a sleep, so a passing test is fast and a failing one
+    /// says how many arrived instead of timing out the whole suite.
+    pub async fn wait_for(&self, count: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let seen = self.requests().await;
+            if seen.len() >= count {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.requests().await
+    }
+
+    pub fn stop(self) {
+        self.task.abort();
+    }
+}
+
+/// A ringer that accepts a connection and then says nothing at all.
+///
+/// The listener `push.md` section 4's requirement is stated against: "a ringer that
+/// accepts a connection and then hangs for thirty seconds adds no measurable latency
+/// to `SEND` on the same process". It holds the accepted stream so the relay sees an
+/// open connection rather than a reset.
+pub struct HangingRinger {
+    pub address: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HangingRinger {
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a hanging ringer");
+        let address = listener.local_addr().expect("an address");
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Kept, never read, never answered. Dropping it would send a FIN and
+                // the relay would learn the answer immediately, which is the opposite
+                // of the case being proved.
+                held.push(stream);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        Self { address, task }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1/wake", self.address.port())
+    }
+
+    pub fn stop(self) {
+        self.task.abort();
+    }
+}
+
+/// Read one HTTP/1.1 request off a socket and return its body.
+///
+/// Deliberately small: headers to the terminator, then exactly `Content-Length`
+/// bytes. The relay is the only client, it always sends a length, and a test listener
+/// that implemented chunked encoding would be testing itself.
+async fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte).await {
+            Ok(1) => head.push(byte[0]),
+            // The peer went away mid-request, which is a test tearing down. An empty
+            // body is the honest record of it.
+            _ => return String::new(),
+        }
+    }
+    let headers = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    let length = headers
+        .split("content-length:")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n").next())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if length > 0 && stream.read_exact(&mut body).await.is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&body).to_string()
+}
+
+/// A relay with push on, pointed at `wake_url`.
+///
+/// A helper of its own rather than a flag on `config_for`, for the reason
+/// `config_for_calls` is one: `WEALD_RELAY_PUSH` is off by default and every suite
+/// that is not about push should run against the default posture. `coalesce_ms` is a
+/// parameter because the window is what several of the queue rules are about, and a
+/// test proving one would otherwise have to wait two seconds to see it.
+pub fn config_for_push(
+    scratch: &Scratch,
+    blobs: &std::path::Path,
+    wake_url: &str,
+    coalesce_ms: u64,
+) -> Config {
+    config_with(
+        scratch,
+        blobs,
+        [
+            (keys::PUSH, "on".to_string()),
+            (keys::PUSH_URL, wake_url.to_string()),
+            (keys::PUSH_COALESCE_MS, coalesce_ms.to_string()),
+        ],
+    )
+}
+
+/// A 16-byte wake handle from one seed byte, so a failure names the handle without
+/// anything having to print it.
+pub fn wake_handle(seed: u8) -> Vec<u8> {
+    vec![seed; wealdrelay::push::HANDLE_BYTES]
+}
+
+/// A stated expiry a week out from the relay's clock, which is the rotation period
+/// `push.md` assumes.
+pub fn wake_expiry(now_ms: u64) -> u64 {
+    now_ms + 7 * 24 * 60 * 60 * 1000
+}
+
+/// The salted entry hash for one device in one workspace, which is the only name the
+/// relay has for a principal and the key the registration table uses.
+pub async fn entry_hash_of(pool: &sqlx::PgPool, workspace: &str, device: &SigningKey) -> Vec<u8> {
+    let salt = wealdrelay::access::store::salt(pool, workspace)
+        .await
+        .expect("a workspace salt");
+    wealdrelay::access::entry_hash(&device.verifying_key().to_bytes(), &salt)
 }
 
 /// The path and query of a presigned URL, which is all a test needs: the host in

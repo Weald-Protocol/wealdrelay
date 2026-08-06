@@ -31,6 +31,15 @@ services:
       - synchronous_commit=off
       - -c
       - full_page_writes=off
+      # Above the stock 100, because the relay's integration tiers are the
+      # heaviest connection users in the programme: each test creates its own
+      # database and its own pool, `cargo test` runs them across every core, and
+      # the coverage run runs all of them at once. At 100 the suite failed with
+      # "pool timed out while waiting for an open connection", which reads like a
+      # relay defect and is a harness that ran out of sockets. This volume is
+      # disposable and nothing here is a production setting.
+      - -c
+      - max_connections=400
     ports:
       - "${WEALD_STACK_PG_PORT:-54032}:5432"
     volumes:

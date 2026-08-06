@@ -1,7 +1,7 @@
 # Weald Relay Protocol
 
 **Protocol identifier:** `weald-relay`  
-**Current protocol version:** `2`, and version 1 is still served  
+**Current protocol version:** `4`, and versions 1 through 3 are still served  
 **Status:** Production specification  
 **Normative language:** The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **NOT RECOMMENDED**, **MAY**, and **OPTIONAL** in this document are to be interpreted as described in RFC 2119 and RFC 8174.
 
@@ -100,7 +100,7 @@ keys, signed roster state, and the verified workspace genesis record.
 
 ## 5. Cryptographic profile
 
-The following algorithms are mandatory for version 1:
+The following algorithms are mandatory for every protocol version, 1 through 4:
 
 | Function | Algorithm |
 | --- | --- |
@@ -112,8 +112,15 @@ The following algorithms are mandatory for version 1:
 | Wire serialization | Deterministic CBOR |
 | Transport confidentiality | TLS 1.3 or later |
 
-Version 1 pins one ciphersuite, one MLS protocol version, one credential type and
-an empty set of Weald-defined MLS extensions. There is no ciphersuite negotiation
+The pin is one ciphersuite, one MLS protocol version, one credential type and an
+empty set of Weald-defined MLS extensions, and it has not moved since version 1.
+Three version bumps have gone past it without touching a row: version 2 added the
+`LIVE` and `KEYS` frames, version 3 the `CALL` and `MEDIA` frames, version 4 the
+`WAKE` frame, and none of them is a cryptographic change. That is the table doing
+its job rather than an accident, and it is why this section says "every version"
+where it once said "version 1": a reader who found the older sentence beside a
+current version of 4 would reasonably wonder which suite versions 2 through 4
+pinned. There is no ciphersuite negotiation
 and no configuration field that selects one, because two implementations that can
 negotiate can be steered into a combination nobody tested. A second ciphersuite,
 a second credential type or any MLS extension is a protocol version change and
@@ -544,7 +551,16 @@ Adding a frame tag is a compatible extension, and a relay MUST NOT send a frame
 introduced after the negotiated version: an unrecognized tag is a decode failure
 rather than something a conforming client can ignore. Version 2 adds two frames
 and one event kind and changes no envelope field, so a version 1 client
-interoperates with a version 2 relay unchanged.
+interoperates with a version 2 relay unchanged. Version 3 adds the `CALL` and
+`MEDIA` frames and version 4 adds `WAKE`, on the same terms and with the same
+consequence one and two versions up.
+
+A client that never sends `WAKE` never receives a push, which is exactly the
+posture of a relay whose operator configured none. That equivalence is worth
+stating rather than deriving, because it is what makes version 4 cheap for every
+party: an old client is not degraded, it is in a configuration the protocol
+supports and expects, and a relay does not have to know which of the two reasons it
+is in.
 
 Clients MUST fail closed on unknown required protocol capabilities. Relays MUST
 report their supported versions and encryption floor during session setup. A

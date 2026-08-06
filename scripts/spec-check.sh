@@ -131,7 +131,12 @@ fi
 # --------------------------------------------------------------------------
 MAN="$C/wire/vectors/manifest.json"
 if [ -f "$MAN" ] && [ -f "$REG" ]; then
-  CODES=$(grep -oE '^\| `(retry|reject|denied|quota|version)/[a-z_]+`' "$REG" \
+  # `limit` joined the classes with protocol version 4 and the WAKE frame. Listed
+  # here in the same commit, because a class this pattern does not name is a class
+  # whose codes are invisible to the very check that exists to catch an
+  # unregistered code, which is the exact failure error-codes.md records against
+  # quota/group_ingress_limited.
+  CODES=$(grep -oE '^\| `(retry|reject|denied|quota|version|limit)/[a-z_]+`' "$REG" \
     | sed 's/^| `//; s/`$//' | sort -u)
   if have jq; then
     COVERED=$(jq -r '.vectors[].expect' "$MAN" | sort -u)

@@ -208,6 +208,46 @@ points at something in `specs/backend/cloud/` is a trust boundary change, becaus
 it would mean the hosted binary differs from the audited binary and a self-hoster
 runs something we do not.
 
+### The relay's outbound configuration keys
+
+The rule above is about a key pointing at something of ours. It is not a rule that
+the relay may never reach outward, and the difference has to be written down or the
+next person to need an outbound leg will either break the rule or abandon a feature
+for the wrong reason. Every outbound destination the relay has is listed here, with
+what it points at and what its absence means, and the list is exhaustive: a key not
+on it does not exist.
+
+| Key | Points at | Absent means |
+| --- | --- | --- |
+| `WEALD_RELAY_DATABASE_URL` | the relay's own Postgres | boot failure. Required |
+| `WEALD_RELAY_STORAGE_URL` | the relay's own object store, ciphertext only | boot failure. Required |
+| `WEALD_RELAY_REDIS_URL` | a declared second instance | one process, which is the ordinary shape |
+| `WEALD_RELAY_PUSH_URL` | a ringer's wake route, chosen by the operator | no outbound wake leg. This is the default |
+| `WEALD_RELAY_PUSH_REGISTER_URL` | a ringer's registration route, stated to clients | the wake url's host with the contract's registration path |
+
+`WEALD_RELAY_SMTP_URL` is deliberately not in that table. It is refused in
+production rather than merely unset, because relay-sent invite mail would put a
+list of humans inside the blind half, and it is named here so that its absence from
+the table reads as a decision rather than an oversight.
+
+The two push keys arrived with protocol version 4 and are the first outbound
+destination on this component that is not its own storage, so they got the review
+this section demands: `../contracts/decisions/ADR-0012-push-via-a-separate-ringer.md`
+is that review, and it is published. The finding, in short, is that the destination
+is a URL the operator supplies with no default ever, that a relay with
+`WEALD_RELAY_PUSH=off` has no outbound leg at all and that off is the default, that
+the ringer's contract has no account concept to attach a licence to, and that the
+hosted binary is still the audited binary with a different profile. A self-hosted
+relay can point at our ringer and wake our App Store build without asking us for
+anything, which is the property that would have been lost by any design where the
+relay held the key.
+
+The refusals are what hold that rather than describe it, and they are startup
+refusals rather than runtime ones: `PUSH=on` with no `PUSH_URL` will not start,
+a non-`https` destination will not start outside `local` and `ci`, and `PUSH=off`
+with any other `PUSH_*` variable set will not start, because a
+configured-and-ignored outbound destination reads as working and is not.
+
 The direction of every integration is one-way: the control plane polls private
 `/readyz` and `/metrics`, and the relay never initiates. The public listener
 serves only `/healthz` and gives no state beyond liveness; detailed readiness and
