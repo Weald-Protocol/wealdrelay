@@ -3069,6 +3069,530 @@ cmd_agent_execution_crossing() {
   echo "verified=c2"
 }
 
+# Step 14's crossing: one composed message produces exactly one invoke per resolved
+# agent, an ordinary message carrying the same text produces none, and a name two
+# agents answer to produces none either.
+#
+# The three cases are one scenario rather than three, because the only thing that makes
+# the negative worth anything is that it runs against the same directory, the same
+# alias and the same text as the positive. A negative proved in a workspace where the
+# alias resolved to nothing would be a proof that nothing happens when nothing was
+# asked for.
+#
+# The ambiguity is c2's own local bot against c1's published card, which is the
+# same-slug case in the form it actually reaches people: not a stranger's forgery, but
+# two people who both called a bot `researcher`. c2's own card would not do, because a
+# device's own published agent is answered locally by construction (see
+# `AgentMentionResolution`), so it would produce one candidate and prove nothing.
+cmd_agent_mention_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-14}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-mention-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/mention-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-mn$nonce"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# A composed mention emits one invoke; plain text emits none; two agents emit none"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  # c1 publishes the agent, and both instances sync so c2 resolves against a card that
+  # actually crossed rather than one it was handed.
+  local card_out
+  card_out="$(wc_ c1 agent-publish-card --alias "$alias")" || {
+    echo "weald-stack: c1 could not publish its card" >&2; exit 1
+  }
+  { echo; echo "## c1 publishes the agent"; echo "$card_out"; } | tee -a "$out"
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  # The positive. One message, one resolved agent, one invoke.
+  local mention_out
+  mention_out="$(wc_ c2 agent-mention --body "@$alias please look at the migration")" || {
+    echo "weald-stack: c2 could not send the mention" >&2; exit 1
+  }
+  { echo; echo "## c2 composes a mention"; echo "$mention_out"; } | tee -a "$out"
+  [ "$(field "$mention_out" outcome)" = "sent" ] || {
+    echo "weald-stack: c2's mention was '$(field "$mention_out" outcome)', expected sent" >&2
+    exit 1
+  }
+  [ "$(field "$mention_out" messages)" = "1" ] || {
+    echo "weald-stack: c2 wrote $(field "$mention_out" messages) messages, expected 1" >&2
+    exit 1
+  }
+  [ "$(field "$mention_out" invokes)" = "1" ] || {
+    echo "weald-stack: c2 wrote $(field "$mention_out" invokes) invokes, expected 1" >&2
+    exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local scan_one
+  scan_one="$(wc_ c1 agent-mention-scan --alias "$alias")" || {
+    echo "weald-stack: c1 could not scan" >&2; exit 1
+  }
+  { echo; echo "## what c1 holds after the mention"; echo "$scan_one"; } | tee -a "$out"
+  [ "$(field "$scan_one" invokes)" = "1" ] || {
+    echo "weald-stack: c1 holds $(field "$scan_one" invokes) invokes, expected 1" >&2
+    exit 1
+  }
+  [ "$(field "$scan_one" messages)" = "1" ] || {
+    echo "weald-stack: c1 holds $(field "$scan_one" messages) messages, expected 1" >&2
+    exit 1
+  }
+  [ "$(field "$scan_one" executions)" = "0" ] || {
+    echo "weald-stack: c1 executed $(field "$scan_one" executions) times off a mention" >&2
+    exit 1
+  }
+
+  # The negative. The same words, sent as ordinary chat.
+  local say_out
+  say_out="$(wc_ c2 agent-say --body "@$alias just thinking out loud")" || {
+    echo "weald-stack: c2 could not send the plain message" >&2; exit 1
+  }
+  { echo; echo "## c2 sends the same text as ordinary chat"; echo "$say_out"; } | tee -a "$out"
+  [ "$(field "$say_out" invokes)" = "0" ] || {
+    echo "weald-stack: an ordinary message emitted $(field "$say_out" invokes) invokes" >&2
+    exit 1
+  }
+  [ -n "$(field "$say_out" wouldResolve)" ] || {
+    echo "weald-stack: the plain text resolved to nothing, so the negative is vacuous" >&2
+    exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local scan_two
+  scan_two="$(wc_ c1 agent-mention-scan --alias "$alias")" || {
+    echo "weald-stack: c1 could not scan after the plain message" >&2; exit 1
+  }
+  { echo; echo "## what c1 holds after the plain message"; echo "$scan_two"; } | tee -a "$out"
+  [ "$(field "$scan_two" messages)" = "2" ] || {
+    echo "weald-stack: c1 holds $(field "$scan_two" messages) messages, expected 2" >&2
+    exit 1
+  }
+  [ "$(field "$scan_two" invokes)" = "1" ] || {
+    echo "weald-stack: the plain message moved the invoke count to $(field "$scan_two" invokes)" >&2
+    exit 1
+  }
+  [ "$(field "$scan_two" executions)" = "0" ] || {
+    echo "weald-stack: c1 executed $(field "$scan_two" executions) times, expected 0" >&2
+    exit 1
+  }
+
+  # The adversarial. c2 names a local bot of its own with the same slug, so the alias
+  # answers to two agents and the composer must ask rather than pick.
+  local ambiguous_out status
+  set +e
+  ambiguous_out="$(wc_ c2 agent-mention --local "$alias" \
+    --body "@$alias and now which of you is it" 2>&1)"
+  status=$?
+  set -e
+  { echo; echo "## c2's own bot shares the name"; echo "$ambiguous_out"; } | tee -a "$out"
+  [ "$status" -ne 0 ] || {
+    echo "weald-stack: an ambiguous mention was sent instead of opening a picker" >&2
+    exit 1
+  }
+  grep -q 'outcome=ambiguous' <<<"$ambiguous_out" || {
+    echo "weald-stack: c2 refused the ambiguous mention for the wrong reason" >&2
+    exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local scan_three
+  scan_three="$(wc_ c1 agent-mention-scan --alias "$alias")" || {
+    echo "weald-stack: c1 could not scan after the ambiguous mention" >&2; exit 1
+  }
+  { echo; echo "## what c1 holds after the ambiguous mention"; echo "$scan_three"; } \
+    | tee -a "$out"
+  [ "$(field "$scan_three" invokes)" = "1" ] || {
+    echo "weald-stack: the ambiguous mention emitted an invoke" >&2; exit 1
+  }
+  [ "$(field "$scan_three" messages)" = "2" ] || {
+    echo "weald-stack: the ambiguous mention wrote a message" >&2; exit 1
+  }
+  [ "$(field "$scan_three" executions)" = "0" ] || {
+    echo "weald-stack: c1 executed $(field "$scan_three" executions) times, expected 0" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "composed   1 message, $(field "$mention_out" invokes) invoke"
+    echo "pairs      $(field "$mention_out" pairs)"
+    echo "plaintext  1 message, $(field "$say_out" invokes) invokes"
+    echo "ambiguous  0 messages, 0 invokes, picker opened"
+    echo "received   messages=$(field "$scan_three" messages) invokes=$(field "$scan_three" invokes)"
+    echo "executions $(field "$scan_three" executions)"
+  } | tee -a "$out"
+
+  echo "emitted=1"
+  echo "executions=0"
+}
+
+# Step 15's crossing: the host goes away mid-invocation, the requester sees a state
+# with a deadline rather than a spinner, and the two converge once the host is back.
+#
+# "Quits" is modelled by the host's lease lapsing, which is what a quit actually looks
+# like from the other side: a Mac that stopped republishing. The lease is given two
+# seconds and nothing sleeps waiting for it; the syncs either side take longer than
+# that on their own, so the lapse is real elapsed time rather than a guessed interval.
+# `agent-status` explains why a lease is the availability source until step 21 gives
+# presence a beat of its own.
+cmd_agent_offline_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-15}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-offline-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/offline-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-of$nonce"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# The host goes away mid-invocation and comes back; the requester never spins"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  # c1 owns the agent and is alive: a certificate, a leaf, and a lease that will lapse
+  # while the rest of this runs.
+  local leaf_out lease_out
+  leaf_out="$(wc_ c1 agent-leaf --alias "$alias" --seconds 3600)" || {
+    echo "weald-stack: c1 could not issue the agent's certificate" >&2; exit 1
+  }
+  lease_out="$(wc_ c1 agent-lease --alias "$alias" --seconds 1 --ttl 2)" || {
+    echo "weald-stack: c1 could not publish its lease" >&2; exit 1
+  }
+  { echo; echo "## c1 owns the agent and is alive"; echo "$leaf_out"; echo "$lease_out"; } \
+    | tee -a "$out"
+
+  local invoke_out
+  invoke_out="$(wc_ c2 agent-invoke --alias "$alias" --id WEALD-915)" || {
+    echo "weald-stack: c2 could not publish the invoke" >&2; exit 1
+  }
+  { echo; echo "## c2 invokes"; echo "$invoke_out"; } | tee -a "$out"
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  # c1 is gone. Its lease has lapsed by now: the two syncs above take longer than the
+  # two seconds it was given, and nothing here slept to arrange that.
+  local away
+  away="$(wc_ c2 agent-status --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the status" >&2; exit 1
+  }
+  { echo; echo "## what c2 sees while c1 is away"; echo "$away"; } | tee -a "$out"
+  [ "$(field "$away" phase)" = "queued-offline" ] || {
+    echo "weald-stack: c2 shows '$(field "$away" phase)', expected queued-offline" >&2
+    exit 1
+  }
+  [ -n "$(field "$away" deadline)" ] || {
+    echo "weald-stack: the queued state carried no deadline, which is the spinner" >&2
+    exit 1
+  }
+  [ "$(field "$away" deadline)" = "$(field "$away" invokeDeadline)" ] || {
+    echo "weald-stack: the displayed deadline is not the one the requester signed" >&2
+    exit 1
+  }
+  [ "$(field "$away" terminal)" = "no" ] || {
+    echo "weald-stack: a queued invocation reported itself terminal" >&2; exit 1
+  }
+  [ "$(field "$away" online)" = "no" ] || {
+    echo "weald-stack: c2 thinks the host is still up, so this proves nothing" >&2; exit 1
+  }
+  [ "$(field "$away" records)" = "0" ] || {
+    echo "weald-stack: the relay produced $(field "$away" records) lifecycle records" >&2
+    echo "for an invocation nobody executed. The relay does not execute." >&2
+    exit 1
+  }
+
+  # c1 comes back: a fresh lease at a higher epoch, then it executes.
+  local back_out c1_exec
+  back_out="$(wc_ c1 agent-lease --alias "$alias" --seconds 2 --ttl 600)" || {
+    echo "weald-stack: c1 could not republish its lease" >&2; exit 1
+  }
+  c1_exec="$(wc_ c1 agent-execute --alias "$alias" --body "back, and here is the answer")" || {
+    echo "weald-stack: c1 could not execute after returning" >&2; exit 1
+  }
+  { echo; echo "## c1 comes back"; echo "$back_out"; echo "$c1_exec"; } | tee -a "$out"
+  [ "$(field "$c1_exec" outcome)" = "completed" ] || {
+    echo "weald-stack: c1 finished as '$(field "$c1_exec" outcome)'" >&2; exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local settled c1_view
+  settled="$(wc_ c2 agent-status --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the settled status" >&2; exit 1
+  }
+  c1_view="$(wc_ c1 agent-status --alias "$alias")" || {
+    echo "weald-stack: c1 could not read its own status" >&2; exit 1
+  }
+  { echo; echo "## what both see afterwards"; echo "$settled"; echo; echo "$c1_view"; } \
+    | tee -a "$out"
+  [ "$(field "$settled" phase)" = "completed" ] || {
+    echo "weald-stack: c2 shows '$(field "$settled" phase)' after the host returned" >&2
+    exit 1
+  }
+  [ "$(field "$settled" terminal)" = "yes" ] || {
+    echo "weald-stack: a completed invocation did not report itself terminal" >&2; exit 1
+  }
+  [ -z "$(field "$settled" deadline)" ] || {
+    echo "weald-stack: a completed invocation is still counting down" >&2; exit 1
+  }
+  [ "$(field "$settled" responder)" = "$d1" ] || {
+    echo "weald-stack: c2 attributes the answer to $(field "$settled" responder), not c1" >&2
+    exit 1
+  }
+  [ "$(field "$settled" anomalies)" = "0" ] || {
+    echo "weald-stack: c2 folded $(field "$settled" anomalies) anomalies" >&2; exit 1
+  }
+  # Convergence is the digest and not the word: two clients agreeing that something
+  # completed while holding different record sets is not agreement.
+  [ "$(field "$settled" digest)" = "$(field "$c1_view" digest)" ] || {
+    echo "weald-stack: the two instances folded different states" >&2; exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "away       phase=$(field "$away" phase) deadline=$(field "$away" deadline) \
+online=$(field "$away" online) records=$(field "$away" records)"
+    echo "affordance $(field "$away" affordances)"
+    echo "headline   $(field "$away" headline)"
+    echo "detail     $(field "$away" detail)"
+    echo "settled    phase=$(field "$settled" phase) terminal=$(field "$settled" terminal)"
+    echo "responder  $(field "$settled" responder)"
+    echo "digest     $(field "$settled" digest)"
+    echo "converged  c1 and c2 folded one digest"
+  } | tee -a "$out"
+
+  echo "queued=offline"
+  echo "converged=yes"
+}
+
+# Step 16's crossing: a remote ticket ask executes only on the published owner and
+# survives a reconnect without a second answer.
+#
+# The reconnect is modelled as the thing a reconnect actually does, which is deliver a
+# record again and ask a host to consider it again. So c1 is asked to execute twice with
+# a sync in between: the second call must reach its recorded result rather than start a
+# second run, and the count of terminal records must not move.
+cmd_agent_ticket_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-16}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-ticket-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/ticket-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-tk$nonce"
+  local ticket="WEALD-916"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  {
+    echo "# A ticket ask runs on the owner only, and a reconnect does not double it"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "ticket    $ticket"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  local leaf_out lease_out
+  leaf_out="$(wc_ c1 agent-leaf --alias "$alias" --seconds 3600)" || {
+    echo "weald-stack: c1 could not issue the agent's certificate" >&2; exit 1
+  }
+  lease_out="$(wc_ c1 agent-lease --alias "$alias" --seconds 1 --ttl 600)" || {
+    echo "weald-stack: c1 could not publish its lease" >&2; exit 1
+  }
+  { echo; echo "## c1 owns the agent"; echo "$leaf_out"; echo "$lease_out"; } | tee -a "$out"
+
+  # The ask, from the ticket surface: an invoke carrying the ticket it belongs to.
+  local invoke_out
+  invoke_out="$(wc_ c2 agent-invoke --alias "$alias" --id "$ticket")" || {
+    echo "weald-stack: c2 could not publish the ticket ask" >&2; exit 1
+  }
+  { echo; echo "## c2 asks from a ticket"; echo "$invoke_out"; } | tee -a "$out"
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  # The ticket reference survived the crossing, which is the thing the migration owes.
+  local scan_two
+  scan_two="$(wc_ c1 agent-mention-scan --alias "$alias")" || {
+    echo "weald-stack: c1 could not scan" >&2; exit 1
+  }
+  { echo; echo "## what c1 holds"; echo "$scan_two"; } | tee -a "$out"
+  [ "$(field "$scan_two" tickets)" = "$ticket" ] || {
+    echo "weald-stack: the ask reached c1 as ticket '$(field "$scan_two" tickets)'" >&2
+    exit 1
+  }
+
+  # The requester's own machine is asked first, so a c1 that answered could not be
+  # mistaken for a c2 that had been prevented from trying.
+  local c2_exec
+  c2_exec="$(wc_ c2 agent-execute --alias "$alias")" || {
+    echo "weald-stack: c2's execute failed; it should refuse, not error" >&2; exit 1
+  }
+  { echo; echo "## c2 is asked to answer its own ticket ask"; echo "$c2_exec"; } | tee -a "$out"
+  [ "$(field "$c2_exec" outcome)" = "silent" ] || {
+    echo "weald-stack: c2 answered '$(field "$c2_exec" outcome)' for an agent it does not host" >&2
+    exit 1
+  }
+  [ "$(field "$c2_exec" records)" = "0" ] || {
+    echo "weald-stack: c2 wrote $(field "$c2_exec" records) records" >&2; exit 1
+  }
+
+  local first_run
+  first_run="$(wc_ c1 agent-execute --alias "$alias" --body "the ticket answer")" || {
+    echo "weald-stack: c1 could not execute" >&2; exit 1
+  }
+  { echo; echo "## c1 answers"; echo "$first_run"; } | tee -a "$out"
+  [ "$(field "$first_run" outcome)" = "completed" ] || {
+    echo "weald-stack: c1 finished as '$(field "$first_run" outcome)'" >&2; exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local after_first
+  after_first="$(wc_ c2 agent-status --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the status" >&2; exit 1
+  }
+  [ "$(field "$after_first" phase)" = "completed" ] || {
+    echo "weald-stack: c2 shows '$(field "$after_first" phase)' after the answer" >&2; exit 1
+  }
+  local answered_records; answered_records="$(field "$after_first" records)"
+
+  # The reconnect: the same host is asked again about the same invocation.
+  local second_run
+  second_run="$(wc_ c1 agent-execute --alias "$alias" --body "a second answer")" || {
+    echo "weald-stack: c1's second execute errored; it should decline, not fail" >&2; exit 1
+  }
+  { echo; echo "## the reconnect asks c1 again"; echo "$second_run"; } | tee -a "$out"
+  [ "$(field "$second_run" outcome)" != "completed" ] || {
+    echo "weald-stack: c1 answered the same ticket ask twice" >&2; exit 1
+  }
+
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  local settled
+  settled="$(wc_ c2 agent-status --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the settled status" >&2; exit 1
+  }
+  { echo; echo "## what c2 sees afterwards"; echo "$settled"; } | tee -a "$out"
+  [ "$(field "$settled" phase)" = "completed" ] || {
+    echo "weald-stack: c2 shows '$(field "$settled" phase)' after the reconnect" >&2; exit 1
+  }
+  [ "$(field "$settled" responder)" = "$d1" ] || {
+    echo "weald-stack: c2 attributes the answer to $(field "$settled" responder), not c1" >&2
+    exit 1
+  }
+  [ "$(field "$settled" anomalies)" = "0" ] || {
+    echo "weald-stack: the reconnect produced $(field "$settled" anomalies) anomalies" >&2
+    exit 1
+  }
+  [ "$(field "$settled" records)" = "$answered_records" ] || {
+    echo "weald-stack: the record count moved from $answered_records to \
+$(field "$settled" records); the reconnect answered again" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "ticket     $(field "$scan_two" tickets)"
+    echo "refused    c2 silent, records 0"
+    echo "answered   c1 $(field "$first_run" states)"
+    echo "reconnect  c1 $(field "$second_run" outcome) $(field "$second_run" reason)"
+    echo "records    $answered_records before, $(field "$settled" records) after"
+    echo "responder  $(field "$settled" responder)"
+    echo "answers    1"
+  } | tee -a "$out"
+
+  echo "answers=1"
+  echo "ticket=$ticket"
+}
+
 main() {
   local cmd="${1:-status}"
   shift || true
@@ -3097,6 +3621,9 @@ main() {
     agent-leaf-crossing) cmd_agent_leaf_crossing "$@" ;;
     agent-claim-race) cmd_agent_claim_race "$@" ;;
     agent-execution-crossing) cmd_agent_execution_crossing "$@" ;;
+    agent-mention-crossing) cmd_agent_mention_crossing "$@" ;;
+    agent-offline-crossing) cmd_agent_offline_crossing "$@" ;;
+    agent-ticket-crossing) cmd_agent_ticket_crossing "$@" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "weald-stack: unknown command: $cmd" >&2; exit 64 ;;
   esac

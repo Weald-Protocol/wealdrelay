@@ -42,7 +42,11 @@ path stays boring.
 3. Client PUTs the ciphertext directly to object storage.
 4. Client publishes a signed **retention manifest** that includes the hash, then
    emits a `media.ref` payload inside the group, carrying the ciphertext hash,
-   per-blob key, mime type, size and dimensions. The client retries this ordered
+   per-blob key, name, mime type, size and dimensions. The name is carried here
+   because this is the only record in the system that can hold one: the bucket
+   stores opaque objects under their content address, so a workspace that did not
+   seal a name beside the hash could never show its own members anything but
+   digests. Sealed, so the relay is no better off than before. The client retries this ordered
    pair until both receipts are durable. Only group members can read the ref and
    learn the key.
 

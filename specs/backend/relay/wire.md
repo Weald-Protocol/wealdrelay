@@ -308,7 +308,7 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0020` | `roster.update` | Roster document change. Workspace group only. |
 | `0x0021` | `roster.revoke` | Revocation plus the epoch change that enforces it. |
 | `0x0022` | `dm.welcome` | One MLS Welcome into a two-person group, addressed by a blinded tag over the target key package reference and carrying no group id, published in the workspace root group because the two devices share no other. See `specs/backend/relay/private-messaging.md`. |
-| `0x0030` | `media.ref` | Ciphertext hash, per-blob key, mime, size, dimensions. |
+| `0x0030` | `media.ref` | Ciphertext hash, per-blob key, name, mime, size, dimensions. The name is here and nowhere else: it is sealed with the rest of the record, so members read it and the relay never can. See `specs/backend/relay/media.md`. |
 | `0x0040` | `git.patch` | Patch bytes, base commit, target ticket. Proposal only, never applied by the receiver. |
 | `0x0041` | `git.status` | CI or review status for a patch. |
 | `0x0050` | `tombstone` | Target hash plus reason. Paired with an epoch advance. |
