@@ -89,15 +89,43 @@ impl Scratch {
     }
 }
 
+/// The deadlines every suite runs with, and why they are not the production ones.
+///
+/// `WEALD_RELAY_HANDSHAKE_TIMEOUT_MS` defaults to ten seconds, which is right for a
+/// relay on the internet and wrong for a test binary sharing a runner with the
+/// harness containers and every other suite. On the 0.1.9 release runner a
+/// handshake that would normally complete in milliseconds was reaped mid-`CONNECT`
+/// and the client read `quota/rate_limited` where it expected a `ConnectAck`,
+/// failing a test about device revocation that has nothing to do with deadlines.
+/// A single test file took 223 seconds of wall clock in that run, so ten seconds
+/// of scheduling delay is not an outlandish thing to hit.
+///
+/// Ten minutes here. Nothing is weakened by it: the deadlines are proven by
+/// `tests/deadline_socket.rs`, which sets its own short ones deliberately, and by
+/// `tests/deadline_unit.rs`, which resolves configuration through its own helper
+/// and still asserts the production defaults are what an operator gets. What this
+/// removes is a clock running underneath thirty suites that are testing something
+/// else.
+fn deadline_pairs() -> [(&'static str, String); 2] {
+    [
+        (keys::HANDSHAKE_TIMEOUT_MS, "600000".to_string()),
+        (keys::IDLE_TIMEOUT_MS, "600000".to_string()),
+    ]
+}
+
 pub fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
-    Config::resolve(&Values::from_pairs([
-        (keys::HOSTNAME, "localhost".to_string()),
-        (keys::DATABASE_URL, scratch.url.clone()),
-        (keys::STORAGE_URL, format!("file://{}", blobs.display())),
-        (keys::LISTEN, "127.0.0.1:0".to_string()),
-        (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
-        (keys::RELEASE_CHECK, "off".to_string()),
-    ]))
+    Config::resolve(&Values::from_pairs(
+        [
+            (keys::HOSTNAME, "localhost".to_string()),
+            (keys::DATABASE_URL, scratch.url.clone()),
+            (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+            (keys::LISTEN, "127.0.0.1:0".to_string()),
+            (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+            (keys::RELEASE_CHECK, "off".to_string()),
+        ]
+        .into_iter()
+        .chain(deadline_pairs()),
+    ))
     .expect("the integration configuration resolves")
 }
 
@@ -113,16 +141,20 @@ pub fn config_for(scratch: &Scratch, blobs: &std::path::Path) -> Config {
 /// are about, and a test that wanted to prove one would otherwise have to open
 /// the configured number of calls first.
 pub fn config_for_calls(scratch: &Scratch, blobs: &std::path::Path, max_calls: u32) -> Config {
-    Config::resolve(&Values::from_pairs([
-        (keys::HOSTNAME, "localhost".to_string()),
-        (keys::DATABASE_URL, scratch.url.clone()),
-        (keys::STORAGE_URL, format!("file://{}", blobs.display())),
-        (keys::LISTEN, "127.0.0.1:0".to_string()),
-        (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
-        (keys::RELEASE_CHECK, "off".to_string()),
-        (keys::CALLS, "on".to_string()),
-        (keys::MAX_CONCURRENT_CALLS, max_calls.to_string()),
-    ]))
+    Config::resolve(&Values::from_pairs(
+        [
+            (keys::HOSTNAME, "localhost".to_string()),
+            (keys::DATABASE_URL, scratch.url.clone()),
+            (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+            (keys::LISTEN, "127.0.0.1:0".to_string()),
+            (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+            (keys::RELEASE_CHECK, "off".to_string()),
+            (keys::CALLS, "on".to_string()),
+            (keys::MAX_CONCURRENT_CALLS, max_calls.to_string()),
+        ]
+        .into_iter()
+        .chain(deadline_pairs()),
+    ))
     .expect("the call configuration resolves")
 }
 
@@ -723,6 +755,8 @@ pub fn config_with(
         (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
         (keys::RELEASE_CHECK, "off".to_string()),
     ];
+    pairs.extend(deadline_pairs());
+    // After the deadlines, so a caller that means to set a short one still can.
     pairs.extend(extra);
     Config::resolve(&Values::from_pairs(pairs)).expect("the integration configuration resolves")
 }

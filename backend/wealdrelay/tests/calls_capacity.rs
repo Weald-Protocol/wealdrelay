@@ -187,17 +187,12 @@ async fn an_operator_may_remove_the_cap_deliberately() {
     let blobs = tempfile::tempdir().unwrap();
     let mut config = config_for_calls(&scratch, blobs.path(), 4);
     config.max_connections = wealdrelay::config::Limit::Unlimited;
-    // The handshake deadline is raised because this test deliberately holds
-    // sockets that never handshake, and the two features otherwise contradict
-    // each other on a slow machine. Eight connects then a count read back six,
-    // twice, and waiting made it worse rather than better: the sockets were not
-    // late being admitted, they were admitted and then reaped, because opening
-    // eight against a loaded runner took longer than the ten second default and
-    // `deadline::Expiry::Handshake` closed the earliest ones. What this test is
-    // about is admission under `Unlimited`, so the deadline is moved out of the
-    // way rather than the assertion being weakened. The reaper itself is proven
-    // by `tests/deadline_socket.rs`, which is where it belongs.
-    config.handshake_timeout_ms = 600_000;
+    // This test deliberately holds eight sockets that never handshake, so it is the
+    // one that first ran into the handshake deadline reaping them: eight connects
+    // read back six, and waiting made it worse rather than better, because the
+    // sockets were not late being admitted, they were admitted and then closed.
+    // The deadline now comes from `support::deadline_pairs`, which gives every
+    // suite ten minutes for the reasons recorded there, so nothing is set here.
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
     let group = make_group(&relay.state, 0x51).await;
 
