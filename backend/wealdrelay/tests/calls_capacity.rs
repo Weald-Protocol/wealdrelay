@@ -150,14 +150,17 @@ async fn the_relay_refuses_a_connection_past_its_cap_and_takes_it_back_when_one_
     // And the slot comes back when a socket ends, however it ends: this one is
     // dropped without a close, which is what a lost network looks like.
     drop(second);
-    // Thirty seconds rather than five. The assertion is unchanged and a genuine
-    // leak still fails it, because a leaked slot never comes back however long
-    // this waits; what the shorter deadline was actually measuring was how
-    // quickly a loaded machine schedules the reader task that notices a dropped
-    // peer. It failed once on a shared runner at exactly five seconds, having
-    // passed every local run, which is the signature of a timeout standing in for
-    // an assertion rather than of the thing under test.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Two minutes rather than thirty seconds, which was itself five before a
+    // shared runner rejected it. The assertion is unchanged and a genuine leak
+    // still fails it, because a leaked slot never comes back however long this
+    // waits; what the deadline actually measures is how quickly a loaded machine
+    // schedules the reader task that notices a dropped peer, which is not the
+    // thing under test. Thirty seconds failed on the 0.1.8 release runner, where
+    // this one test file took 292 seconds wall clock with the harness containers
+    // and every other suite competing for the same cores, and passed six for six
+    // locally in isolation. Raising the patience is the honest response to a
+    // timeout standing in for an assertion; lowering the bar would not be.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while relay.state.open_connections() > 1 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -209,7 +212,7 @@ async fn an_operator_may_remove_the_cap_deliberately() {
     // The assertion is unchanged, because a cap that is not in fact unlimited
     // refuses the later sockets and the count never reaches eight however long
     // this waits.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while relay.state.open_connections() < 8 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
