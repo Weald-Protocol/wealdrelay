@@ -247,13 +247,64 @@ same content. What is visible: a joiner cannot verify author chains beneath a
 checkpoint they were not present for, and the member list shows exactly that,
 as "history verified from <date>".
 
+### The workspace byte budget
+
+`WEALD_RELAY_MAX_LOG_GB` is a per-workspace ceiling on the bytes of `ct` the
+envelope log holds for one workspace, across every group that workspace owns. It
+exists because nothing else bounded that log. `WEALD_RELAY_MAX_STORAGE_GB` counts
+finalized blob bytes in object storage and nothing else, and
+`WEALD_RELAY_RETENTION_DAYS` is the warning threshold described below, which by
+construction does nothing at all inside its own window. Between them one
+workspace could fill a relay's database while sitting inside every limit the
+relay enforced, on the store that costs twenty times what the bucket costs
+(`../cloud/instance-sizing.md`).
+
+The accounting is a counter per workspace, maintained by a database trigger on
+the envelope table rather than by the accept path, so it cannot drift from the
+rows it describes and cannot be bypassed by a statement written later. The
+workspace is resolved from the group's own row, never from anything a client
+sends.
+
+**Reaching the budget refuses writes. It never compacts.** This is the boundary
+between the budget and retention and it is decided in favour of the refusal, for
+the reason this whole document exists:
+
+- Compaction is client-driven, signed, and authorized by the group, because the
+  relay cannot read content and therefore cannot decide what is safe to drop. A
+  budget that compacted to make room would be the relay deleting history on its
+  own initiative, choosing the victim itself, under load, without the checkpoint
+  that makes what remains verifiable. That is the exact power the section below
+  says the relay does not have, arriving through a side door.
+- A refusal is recoverable and a deletion is not. The frozen-chain rule already
+  makes that trade in as many words: the failure mode is a storage bill, which is
+  recoverable, rather than history somebody arranged to have deleted, which is
+  not. The budget makes the same trade.
+
+So the three mechanisms meet without overlapping: retention **warns**, the budget
+**refuses**, and a signed `drop_before` behind an accepted checkpoint is the only
+thing that **deletes**.
+
+An over-budget `SEND` is answered `quota/log_budget_exhausted` carrying the limit
+in bytes. It carries no interval, because waiting does not clear this one: the
+levers are compaction and a larger plan, and an error that named a retry interval
+would send a client back on a loop that can only fail. It is never a silent drop.
+An envelope the relay discarded after acknowledging it would be a hole in an
+author chain that every receiving client detects and none can repair, so the
+write stays the client's own to retry once it has compacted.
+
+One consequence is worth planning for rather than discovering: a workspace
+already at its ceiling cannot write the checkpoint and snapshot envelopes that
+would let it compact. A client tracks its own usage from the errors and the
+workspace binder and checkpoints ahead of the ceiling, not at it.
+
 ### What the relay never does
 
 The relay never drops an envelope on its own initiative, never expires by
 policy, and has no retention configuration that acts without a signed
 instruction. `WEALD_RELAY_RETENTION_DAYS` sets a warning threshold, not a
-deletion. An operator who could quietly delete a customer's history would be an
-operator with a power the trust boundary says they do not have.
+deletion, and `WEALD_RELAY_MAX_LOG_GB` refuses writes rather than making room. An
+operator who could quietly delete a customer's history would be an operator with
+a power the trust boundary says they do not have.
 
 ## Ongoing health
 

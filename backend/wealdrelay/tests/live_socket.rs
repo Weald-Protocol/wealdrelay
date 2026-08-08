@@ -149,6 +149,72 @@ async fn a_beat_reaches_another_member_and_changes_no_row_in_any_table() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_durable_write_reaches_two_other_connections_once_and_in_order() {
+    // `operations.md` requires a subscribed client to receive accepted envelopes
+    // without polling. This three-connection case proves the customer-visible
+    // multiplayer behavior over the real relay: one writer, two independently
+    // subscribed readers, no echo back to the writer, and relay-assigned order.
+    let scratch = Scratch::new("durable_three_connections").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = make_group(&relay.state, 0x35).await;
+
+    let mut writer = Client::connect(relay.address).await;
+    writer.handshake(vec![group.clone()], CLOCK).await;
+    let mut first_reader = Client::connect(relay.address).await;
+    first_reader
+        .handshake_as(&other_device(), vec![group.clone()], CLOCK)
+        .await;
+    let mut second_reader = Client::connect(relay.address).await;
+    // A second device connection is still a separate multiplayer recipient: hub
+    // exclusion is by connection id, never by device identity.
+    second_reader.handshake(vec![group.clone()], CLOCK).await;
+
+    for reader in [&mut first_reader, &mut second_reader] {
+        reader
+            .send_frame(&Frame::Sub {
+                group: group.clone(),
+                from_seq: 0,
+            })
+            .await;
+        assert!(matches!(
+            reader.recv_frame().await,
+            Frame::SubAck { head_seq: 0, .. }
+        ));
+    }
+
+    for (expected_seq, body) in [
+        (1, b"first multiplayer line".as_slice()),
+        (2, b"second multiplayer line"),
+    ] {
+        let envelope = support::envelope_for(&group, body);
+        writer
+            .send_frame(&Frame::Send {
+                envelope: envelope.encode(),
+            })
+            .await;
+        assert!(
+            matches!(writer.recv_frame().await, Frame::SendAck { seq, .. } if seq == expected_seq)
+        );
+
+        for reader in [&mut first_reader, &mut second_reader] {
+            match reader.recv_frame().await {
+                Frame::Push { envelope: bytes } => {
+                    let pushed =
+                        wealdrelay::envelope::Envelope::decode(&bytes).expect("a pushed envelope");
+                    assert_eq!(pushed.hash, envelope.hash);
+                    assert_eq!(pushed.seq, expected_seq);
+                }
+                other => panic!("expected ordered multiplayer push, got {other:?}"),
+            }
+        }
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_device_outside_the_access_set_cannot_beat_into_a_group() {
     // The same refusal `SEND` gives, produced by the same function. A beat is a
     // claim about a person's presence in a room, and a stranger must not be able to

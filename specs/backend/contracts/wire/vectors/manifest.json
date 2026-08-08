@@ -201,6 +201,15 @@
       "replays": "env-valid-mls-first-link"
     },
     {
+      "id": "env-quota-log-budget-exhausted",
+      "expect": "quota/log_budget_exhausted",
+      "note": "The workspace's envelope log is at WEALD_RELAY_MAX_LOG_GB. Must carry the limit and must never carry an interval: waiting does not clear this one, a signed drop_before behind an accepted checkpoint does. Must never be a silent accept and must never be a silent drop, because a dropped envelope is a hole in an author chain the client was told nothing about. Distinct from quota/storage_exhausted, which is the media bucket and a different lever.",
+      "relay_config": {
+        "log_budget_full": true
+      },
+      "replays": "env-valid-mls-first-link"
+    },
+    {
       "id": "env-retry-backpressure",
       "expect": "retry/backpressure",
       "note": "Receive queue full. The relay must stop reading the socket and push back through TCP rather than accepting and discarding, because a dropped envelope is a hole in an author chain and therefore a security alarm on somebody else's screen. Must carry retry-after.",

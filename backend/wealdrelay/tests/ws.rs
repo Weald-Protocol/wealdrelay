@@ -28,7 +28,8 @@ use tokio::io::AsyncWriteExt as _;
 use wealdrelay::frame::{ErrorCode, Frame, FrameTag, PROTOCOL_VERSION};
 use wealdrelay::health::Clock;
 
-use support::{config_for, envelope_for, make_group, Client, Running, Scratch};
+use support::{config_for, config_with, envelope_for, make_group, Client, Running, Scratch};
+use wealdrelay::config::keys;
 
 // MARK: The proof
 
@@ -872,7 +873,29 @@ async fn a_client_that_vanishes_with_frames_still_queued_ends_its_writer() {
     // afterwards and shuts down cleanly, neither of which a leaked writer would allow.
     let scratch = Scratch::new("vanish").await;
     let blobs = tempfile::tempdir().unwrap();
-    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(1)).await;
+    // The inbound budget is configured out of the way, and this is the one test in
+    // the suite that needs it said out loud. The property under test is the writer
+    // queue filling, which takes an unbounded flood of writes by construction, and
+    // the shipped per-device `SEND` budget (`crate::send_budget`) would answer that
+    // flood with `quota/rate_limited` long before the queue saturated. Both
+    // behaviours are correct and they are about different resources: the budget
+    // bounds how fast one device may spend the relay's write capacity, and this
+    // test is about what happens to a socket after the relay has already accepted
+    // more than the peer will read. Raising the budget here isolates the second
+    // from the first rather than weakening either. `send_budget_socket.rs` proves
+    // the budget itself, against a running relay, at the shipped default.
+    let relay = Running::start(
+        config_with(
+            &scratch,
+            blobs.path(),
+            [
+                (keys::SEND_FRAMES_PER_MINUTE, u32::MAX.to_string()),
+                (keys::SEND_BYTES_PER_MINUTE, u32::MAX.to_string()),
+            ],
+        ),
+        Clock::Fixed(1),
+    )
+    .await;
     let group = make_group(&relay.state, 0x49).await;
 
     let mut vanishing = Client::connect_by_a_client_that_will_die_badly(relay.address).await;

@@ -533,7 +533,7 @@ async fn handle_list(
 
 /// The inverse of ``hex``, for the object names a listing comes back as.
 fn hex_bytes(text: &str) -> Result<Vec<u8>, ()> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(());
     }
     (0..text.len())

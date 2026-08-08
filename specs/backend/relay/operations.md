@@ -96,6 +96,14 @@ else's screen.
   consumers degrade to polling instead of stalling the fanout for everyone.
 - Storage and database saturation return `quota` and `retry` respectively, never
   a silent accept.
+- A workspace at `WEALD_RELAY_MAX_LOG_GB` returns `quota/log_budget_exhausted` on
+  `SEND`, carrying the limit and no interval, and stores nothing. The budget is
+  per workspace and is charged from the group's own workspace row, so a workspace
+  at its ceiling refuses nobody else's writes and no workspace's bytes are ever
+  charged to another. The check is inside the accept transaction and after the
+  insert, so the ceiling is exact under concurrent writers rather than
+  overshootable by one envelope per writer. Reaching it never triggers
+  compaction: `lifecycle.md` holds that decision and its reasons.
 
 The per-connection budget bounds one slow client's blast radius, and since
 protocol version 3 there is a process-wide ceiling behind it:
@@ -118,6 +126,49 @@ a new name.
 so an operator can see the ceiling binding rather than infer it from a support
 ticket.
 
+### Connection deadlines
+
+A slot is taken at the upgrade and given back when the reader loop ends, so
+until protocol version 4 the cap above bounded how many sockets could be open
+and bounded nothing about how long one could stay open having said nothing.
+That made the cap the attack rather than the control: an unauthenticated
+stranger could take every slot on a customer's relay by opening sockets and
+sending no bytes, at the cost of one file descriptor each. Two deadlines close
+it.
+
+| Deadline | Variable | Default | Bounds |
+| --- | --- | --- | --- |
+| Handshake | `WEALD_RELAY_HANDSHAKE_TIMEOUT_MS` | 10000 | Upgrade to `AUTH_ACK`. The honest path is one signature; nothing legitimate needs ten seconds. |
+| Idle | `WEALD_RELAY_IDLE_TIMEOUT_MS` | 300000 | Silence on an authenticated connection, before the liveness exchange below. Long on purpose: a quiet workspace is the ordinary case. |
+
+Both are refused at `0` by the rule that refuses `WEALD_RELAY_MAX_CONNECTIONS=0`,
+and neither takes `unlimited`, because unlimited is precisely the behaviour being
+replaced.
+
+The idle deadline is enforced by an **application-level** exchange and not by
+TCP. When the interval elapses the relay sends a WebSocket ping and waits ten
+seconds for anything at all to come back; any inbound message, including a ping
+or a close, resets the interval and cancels an outstanding probe. TCP is the
+wrong instrument here for the same reason it is the wrong instrument in the
+replay drain above: the kernel on the other side goes on acknowledging segments
+for a process that has stopped reading, so a socket that looks alive is not a
+peer that is there, and the whole point of both mechanisms is to tell a slow peer
+from a gone one. The full argument is in `transport-security.md`.
+
+A connection closed on either deadline is sent `quota/rate_limited` carrying
+`retry-after` and then closed, which is the close path a refusal already takes:
+a client never gets a dropped connection without a frame, because it cannot
+otherwise tell a decision from a network failure.
+
+`/readyz` reports `call_stats.connections_closed_handshake_deadline` and
+`call_stats.connections_closed_idle_deadline` beside `connections_refused`. An
+operator needs to tell a deadline from a crash, and needs to tell the two
+deadlines apart: refusals rising means the ceiling is binding, handshake closes
+rising against a low connection count means somebody is parked on the connection
+table, and idle closes rising is ordinary attrition from laptops closing and
+mobile networks dropping connections without a FIN. They are counts with no
+labels, like every other number on this surface.
+
 ## Abuse and denial of service
 
 The relay has three surfaces reachable without workspace membership, and each is
@@ -127,12 +178,52 @@ bounded independently:
 | --- | --- |
 | `/join/<token>` landing page and static assets | Cached, no database read, per-IP rate limited. |
 | Invite reserve and code attempt | 5 attempts per token, 100 per source IP per hour, Argon2id cost tuned so guessing is expensive for the attacker and unnoticeable for the joiner (`specs/backend/relay/invites.md`). |
-| `CONNECT` and `AUTH` | Per-IP connection rate limit, a signature check before any database work beyond the access-set lookup, and a hard cap on unauthenticated connection lifetime. |
+| `CONNECT` and `AUTH` | Per-IP connection rate limit, a signature check before any database work beyond the access-set lookup, and a hard cap on unauthenticated connection lifetime: `WEALD_RELAY_HANDSHAKE_TIMEOUT_MS`, ten seconds by default, under "Connection deadlines" above. That clause described an intention rather than an implementation until protocol version 4, which is how a socket that never authenticated could hold a connection slot for as long as it liked. |
 
 Everything else requires a key in the access set. An attacker who holds one can
 consume bandwidth and quota and can read nothing, which is stated in
 `specs/backend/relay/auth.md` and is why the limits above are sized for cost
 control rather than for confidentiality.
+
+### The inbound budget on `SEND`
+
+Consuming bandwidth and quota is not free, and the envelope path is where it is
+cheapest for an attacker and most expensive for the relay: a `SEND` costs a
+decode, an authorization read and a Postgres transaction. So every `SEND` is
+charged against a per-device budget, in frames and in bytes, over a one minute
+window: `WEALD_RELAY_SEND_FRAMES_PER_MINUTE` and
+`WEALD_RELAY_SEND_BYTES_PER_MINUTE`, sized in the Limits table of
+`specs/backend/relay/wire.md`. The charge happens before the decode and
+therefore before the transaction opens, because a budget charged after the
+database has already done the work measures the damage rather than preventing
+it.
+
+Keyed by the authenticated device key rather than by connection, so a flooding
+client cannot clear its allowance by reconnecting, and process-local, so it
+bounds this instance's load rather than claiming a cluster-wide guarantee.
+
+A frame over either limit is answered `quota/rate_limited`, carrying
+`retry-after` in seconds and the limit that was met in `detail`, **and the
+socket stays up**. That is the difference between this refusal and the deadline
+closes above, and it is deliberate. A client that is merely fast is the ordinary
+case on this path rather than the adversarial one, because a client flushing a
+backlog writes its whole outbox in one pass; closing the socket would turn an
+ordinary cold start into a reconnect storm, and would stop that connection's
+`SUB`, `RECON` and `PUSH` traffic over a limit that was only ever about its
+writes. `quota` is the class whose published client behaviour is exactly right:
+wait the named interval, then come back.
+
+The interval travels in `retry-after` and never in `detail`, which carries the
+limit. A client must not treat the interval as the exact moment the window turns
+over; it is a fixed window and the true wait is somewhere inside it, stated as a
+full window on purpose so that a refused fleet does not synchronise onto one
+instant.
+
+Because the refusal names no envelope, a client must make **every**
+unacknowledged envelope sendable again when it receives one, not only the frame
+it believes was refused. Re-offering an envelope that was in fact accepted is
+free and safe: a duplicate `hash` is answered with the `seq` the original was
+given, so no cursor moves backwards.
 
 Hosted instances sit behind the provider's own edge protection. Self-hosters get
 the same in-process limits and a documented recommendation, not a requirement,

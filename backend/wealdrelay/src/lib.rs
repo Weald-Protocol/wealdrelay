@@ -21,6 +21,7 @@ pub mod calls;
 pub mod cbor;
 pub mod config;
 pub mod db;
+pub mod deadline;
 pub mod envelope;
 pub mod frame;
 pub mod handshake;
@@ -30,12 +31,14 @@ pub mod invite;
 pub mod keys;
 pub mod lifecycle;
 pub mod log;
+pub mod log_budget;
 pub mod logging;
 pub mod media;
 pub mod negentropy;
 pub mod profile;
 pub mod push;
 pub mod recovery;
+pub mod send_budget;
 pub mod serve;
 pub mod session;
 pub mod storage;
@@ -305,6 +308,7 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
         keys::MAX_STORAGE_GB,
         describe_limit(resolved.max_storage_gb),
     );
+    row(keys::MAX_LOG_GB, describe_limit(resolved.max_log_gb));
     row(
         keys::RETENTION_DAYS,
         describe_limit(resolved.retention_days),
@@ -343,6 +347,19 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
     row(
         keys::MAX_CONNECTIONS,
         describe_limit(resolved.max_connections),
+    );
+    row(
+        keys::HANDSHAKE_TIMEOUT_MS,
+        resolved.handshake_timeout_ms.to_string(),
+    );
+    row(keys::IDLE_TIMEOUT_MS, resolved.idle_timeout_ms.to_string());
+    row(
+        keys::SEND_FRAMES_PER_MINUTE,
+        resolved.send_frames_per_minute.to_string(),
+    );
+    row(
+        keys::SEND_BYTES_PER_MINUTE,
+        resolved.send_bytes_per_minute.to_string(),
     );
     row(
         keys::SMTP_URL,

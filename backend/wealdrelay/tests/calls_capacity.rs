@@ -184,6 +184,17 @@ async fn an_operator_may_remove_the_cap_deliberately() {
     let blobs = tempfile::tempdir().unwrap();
     let mut config = config_for_calls(&scratch, blobs.path(), 4);
     config.max_connections = wealdrelay::config::Limit::Unlimited;
+    // The handshake deadline is raised because this test deliberately holds
+    // sockets that never handshake, and the two features otherwise contradict
+    // each other on a slow machine. Eight connects then a count read back six,
+    // twice, and waiting made it worse rather than better: the sockets were not
+    // late being admitted, they were admitted and then reaped, because opening
+    // eight against a loaded runner took longer than the ten second default and
+    // `deadline::Expiry::Handshake` closed the earliest ones. What this test is
+    // about is admission under `Unlimited`, so the deadline is moved out of the
+    // way rather than the assertion being weakened. The reaper itself is proven
+    // by `tests/deadline_socket.rs`, which is where it belongs.
+    config.handshake_timeout_ms = 600_000;
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
     let group = make_group(&relay.state, 0x51).await;
 
@@ -191,7 +202,22 @@ async fn an_operator_may_remove_the_cap_deliberately() {
     for _ in 0..8 {
         held.push(Client::connect(relay.address).await);
     }
-    assert_eq!(relay.state.open_connections(), 8);
+    // Waited for rather than read once, for the reason the dropped-socket
+    // assertion above already records: `Client::connect` returns when the TCP
+    // connect completes and the count is raised by the relay's accept task, so
+    // reading it on the next line measures whether that task has been scheduled.
+    // The assertion is unchanged, because a cap that is not in fact unlimited
+    // refuses the later sockets and the count never reaches eight however long
+    // this waits.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while relay.state.open_connections() < 8 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.state.open_connections(),
+        8,
+        "an unlimited cap must admit every socket offered to it"
+    );
     held[0].handshake(vec![group.clone()], CLOCK).await;
 
     relay.shutdown().await;

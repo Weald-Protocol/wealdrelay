@@ -261,12 +261,17 @@ fn a_field_of_the_wrong_major_type_is_refused() {
 }
 
 #[test]
-fn an_unknown_tag_beyond_the_two_new_ones_is_refused_as_a_malformed_header() {
-    // 25 is the next number nobody has allocated. It has to be refused rather than
+fn an_unknown_tag_past_the_allocated_ones_is_refused_as_a_malformed_header() {
+    // 26 is the next number nobody has allocated. It has to be refused rather than
     // ignored, because a tag this build cannot name is a frame it cannot bound.
-    let bytes = cbor::array(&[cbor::uint(25), cbor::array(&[])]);
-    let error = Frame::decode(&bytes).expect_err("tag 25 is not one this build speaks");
-    assert!(matches!(error, FrameDecodeError::UnknownTag(25)));
+    //
+    // It was 25 until `FrameTag::Wake` took that number, at which point this test
+    // asserted that an allocated tag was unknown and failed, which is the intended
+    // behaviour of writing the number down: allocating a tag has to come past this
+    // line. Whoever allocates 26 moves this to 27.
+    let bytes = cbor::array(&[cbor::uint(26), cbor::array(&[])]);
+    let error = Frame::decode(&bytes).expect_err("tag 26 is not one this build speaks");
+    assert!(matches!(error, FrameDecodeError::UnknownTag(26)));
     assert_eq!(error.code(), ErrorCode::MalformedHeader);
 }
 

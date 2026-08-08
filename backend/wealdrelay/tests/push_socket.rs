@@ -365,16 +365,16 @@ async fn a_device_in_another_workspace_cannot_claim_a_registered_handle() {
         &relay.state,
         "ws-a",
         0x58,
-        &[ada_key.clone()],
-        &[ada_key.clone()],
+        std::slice::from_ref(&ada_key),
+        std::slice::from_ref(&ada_key),
     )
     .await;
     let second = make_group_in(
         &relay.state,
         "ws-b",
         0x59,
-        &[bo_key.clone()],
-        &[bo_key.clone()],
+        std::slice::from_ref(&bo_key),
+        std::slice::from_ref(&bo_key),
     )
     .await;
 

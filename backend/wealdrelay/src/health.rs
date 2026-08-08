@@ -178,6 +178,29 @@ pub struct CallStats {
     /// start.
     pub connections: u64,
     pub connections_refused: u64,
+    /// Connections closed because they never authenticated inside
+    /// `WEALD_RELAY_HANDSHAKE_TIMEOUT_MS`, since start.
+    ///
+    /// Beside `connections_refused` rather than folded into it, because the two
+    /// say opposite things about the same relay. A rising `connections_refused`
+    /// is a relay at its ceiling, which an operator answers by raising the
+    /// ceiling or adding an instance. A rising
+    /// `connections_closed_handshake_deadline` against a connection count that is
+    /// nowhere near the ceiling is somebody parking on the connection table, which
+    /// an operator answers at the edge and never by raising anything. Without the
+    /// counter both look identical from outside: connections that ended, which is
+    /// also what a crash looks like.
+    pub connections_closed_handshake_deadline: u64,
+    /// Connections closed because an authenticated peer went silent for
+    /// `WEALD_RELAY_IDLE_TIMEOUT_MS` and then did not answer the liveness ping,
+    /// since start.
+    ///
+    /// Expected to be non-zero on any real deployment: laptops close and mobile
+    /// networks drop connections without a FIN, and this is the count of sockets
+    /// reclaimed from peers that had already gone. It is a fleet-health signal
+    /// rather than an alarm, and it is what distinguishes that ordinary attrition
+    /// from the deliberate case the counter above records.
+    pub connections_closed_idle_deadline: u64,
 }
 
 /// Everything the readiness document needs, gathered once per request.
@@ -215,6 +238,11 @@ pub struct RelayState {
     /// (`specs/backend/relay/media.md`, "Bandwidth"), process-local and shared by
     /// every connection this relay serves.
     pub media_rate: crate::media::RateLimiter,
+    /// The per-device inbound budget on `SEND` (`crate::send_budget`), process-local
+    /// and shared by every connection this relay serves. Beside `media_rate`
+    /// rather than inside it, because they bound different paths with different
+    /// windows and merging them would have made one limiter answer two questions.
+    pub send_budget: crate::send_budget::SendBudget,
     /// The calls this process is carrying, and the only place call state lives.
     ///
     /// Beside the hub rather than inside it, because the hub's map is group to
@@ -234,6 +262,14 @@ pub struct RelayState {
     /// How many connections were refused because the cap was reached. An operator
     /// counter with no label: capacity, never identity.
     pub connections_refused: std::sync::atomic::AtomicU64,
+    /// Connections closed on the handshake deadline, and on the idle deadline.
+    ///
+    /// Counters with no label, exactly like `connections_refused`: capacity and
+    /// liveness, never identity. A per-source breakdown would be the address the
+    /// invite path goes out of its way to hash before it reaches a table, kept in
+    /// memory and served on an operator surface, so there is a number and no map.
+    pub handshake_deadline_closes: std::sync::atomic::AtomicU64,
+    pub idle_deadline_closes: std::sync::atomic::AtomicU64,
     /// The wake path: the bounded queue, the settings and the counters
     /// (`crate::push`). Present whether push is on or off, because a relay with push
     /// off still has to answer a `Query` with `enabled: false` and still has to say
@@ -261,6 +297,9 @@ impl RelayState {
         // Built before `config` is moved, for the reason the call ceiling is read
         // first: this reads six of its fields and the struct owns it afterwards.
         let push = crate::push::Push::from_config(&config);
+        // Built before `config` moves, for the reason `push` is: it reads two of
+        // its fields and the struct owns it afterwards.
+        let send_budget = crate::send_budget::budget_from(&config);
         Self {
             config,
             database,
@@ -271,9 +310,12 @@ impl RelayState {
             hub: crate::hub::Hub::new(),
             media_presign_secret: random_secret(),
             media_rate: crate::media::default_rate_limiter(),
+            send_budget,
             calls: crate::calls::CallRegistry::new(max_concurrent_calls),
             connections: std::sync::atomic::AtomicUsize::new(0),
             connections_refused: std::sync::atomic::AtomicU64::new(0),
+            handshake_deadline_closes: std::sync::atomic::AtomicU64::new(0),
+            idle_deadline_closes: std::sync::atomic::AtomicU64::new(0),
             push,
             push_rate: crate::push::store::RateLimiter::new(),
         }
@@ -320,6 +362,33 @@ impl RelayState {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
                 Some(open.saturating_sub(1))
             });
+    }
+
+    /// Record that a connection was closed because a deadline elapsed.
+    ///
+    /// One function rather than two public counters bumped at the call site, so
+    /// `crate::deadline::Expiry` is the only thing that decides which number
+    /// moves and a new deadline cannot be added without deciding where it is
+    /// counted.
+    pub fn record_deadline(&self, expiry: crate::deadline::Expiry) {
+        use std::sync::atomic::Ordering;
+
+        match expiry {
+            crate::deadline::Expiry::Handshake => &self.handshake_deadline_closes,
+            crate::deadline::Expiry::Idle => &self.idle_deadline_closes,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many connections each deadline has closed. For `/readyz` and the tests.
+    pub fn deadline_closes(&self, expiry: crate::deadline::Expiry) -> u64 {
+        use std::sync::atomic::Ordering;
+
+        match expiry {
+            crate::deadline::Expiry::Handshake => &self.handshake_deadline_closes,
+            crate::deadline::Expiry::Idle => &self.idle_deadline_closes,
+        }
+        .load(Ordering::Relaxed)
     }
 
     /// Sockets open right now. For `/readyz` and the tests.
@@ -393,6 +462,10 @@ impl RelayState {
                 connections_refused: self
                     .connections_refused
                     .load(std::sync::atomic::Ordering::Relaxed),
+                connections_closed_handshake_deadline: self
+                    .deadline_closes(crate::deadline::Expiry::Handshake),
+                connections_closed_idle_deadline: self
+                    .deadline_closes(crate::deadline::Expiry::Idle),
             },
             db_pool: self.pool_stats(),
             ready,

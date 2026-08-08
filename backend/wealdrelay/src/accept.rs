@@ -17,6 +17,13 @@
 //!   Reconciliation runs over the space that exists rather than over a dense
 //!   range, and nothing above layer 2 reads `seq` for correctness.
 //!
+//! - **The workspace's byte budget is checked after the insert and inside the
+//!   same transaction.** `crate::log_budget` carries the argument for the order and
+//!   for why reaching the budget refuses the write rather than compacting to make
+//!   room. What matters here is that the refusal is an error frame: an envelope
+//!   the relay dropped quietly would be a hole in an author chain, and the client
+//!   would have been told its write succeeded.
+//!
 //! `seq` is a sync cursor and nothing more. Ordering lives in the Automerge change
 //! graph and integrity lives in the author chain, both inside the ciphertext where
 //! the relay cannot reach them.
@@ -58,6 +65,10 @@ pub enum AcceptError {
     GroupFrozen,
     #[error("denied/service_read_only")]
     ReadOnly,
+    /// The workspace's envelope log is at `WEALD_RELAY_MAX_LOG_GB`. Carries the
+    /// limit in bytes, which is what the error frame shows the client.
+    #[error("quota/log_budget_exhausted: {limit} bytes")]
+    LogBudgetExhausted { limit: i64 },
     #[error("retry/backpressure: {0}")]
     Backpressure(String),
 }
@@ -69,6 +80,7 @@ impl AcceptError {
             Self::GroupUnknown => ErrorCode::GroupUnknown,
             Self::GroupFrozen => ErrorCode::GroupFrozen,
             Self::ReadOnly => ErrorCode::ServiceReadOnly,
+            Self::LogBudgetExhausted { .. } => ErrorCode::LogBudgetExhausted,
             Self::Backpressure(_) => ErrorCode::Backpressure,
         }
     }
@@ -76,8 +88,18 @@ impl AcceptError {
     /// The frame the client receives. `group_frozen` carries the state hash the
     /// registry says it carries; the others carry nothing content derived, because
     /// there is nothing here that is not opaque.
+    ///
+    /// The budget refusal carries its limit, which `operations.md` permits for
+    /// the `quota` class and which a client needs in order to say anything useful:
+    /// "over the limit" with no limit is a message a person cannot act on. It is a
+    /// number an operator configured, so it is not content derived.
     pub fn to_frame(&self) -> FrameError {
-        FrameError::new(self.code())
+        match self {
+            Self::LogBudgetExhausted { limit } => {
+                FrameError::new(self.code()).detail(crate::log_budget::limit_detail(*limit))
+            }
+            _ => FrameError::new(self.code()),
+        }
     }
 }
 
@@ -115,7 +137,7 @@ pub async fn accept(
     // existence check would be a read the insert could then race.
     let claimed = sqlx::query(
         "update relay_group set next_seq = next_seq + 1 \
-         where group_id = $1 returning next_seq - 1 as seq, frozen_reason",
+         where group_id = $1 returning next_seq - 1 as seq, frozen_reason, workspace_id",
     )
     .bind(&envelope.group)
     .fetch_optional(&mut *transaction)
@@ -167,6 +189,45 @@ pub async fn accept(
             // after conflicting, which cannot happen in one statement.
             .unwrap_or(seq as u64);
         return Ok(Accepted::Duplicate { seq });
+    }
+
+    // The budget, checked after the insert and inside the same transaction.
+    //
+    // Deliberately in that order, and it is the only order that is exact. The
+    // counter is maintained by a trigger on this very insert
+    // (`migrations/0010_envelope_budget.sql`), so reading it here reads the total
+    // this envelope produced, and the row it updated is locked until this
+    // transaction ends. Two writers racing for a workspace's last few bytes
+    // therefore serialize on that row and the second one sees the first one's
+    // bytes, which is the property a check-then-insert cannot have at any
+    // isolation level Postgres offers by default.
+    //
+    // The cost of being exact is that an over-budget write does the insert work
+    // and then rolls it back. That is the cheap side of the trade: the workspace
+    // is at its ceiling, so the path is not hot, and the alternative is a
+    // workspace that overshoots by one megabyte per concurrent writer.
+    //
+    // Skipped entirely when unlimited, which is the self-hoster's default: no
+    // limit means no read, so nobody pays for a ceiling they did not set.
+    if let Some(limit) = crate::log_budget::limit_bytes(config) {
+        let workspace: String = row.try_get("workspace_id").map_err(backpressure)?;
+        let used: i64 =
+            sqlx::query_scalar("select used_bytes from relay_log_budget where workspace_id = $1")
+                .bind(&workspace)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(backpressure)?
+                // The trigger inserted the row as part of this transaction, so it is
+                // there. Zero is the honest answer if it somehow is not, and it makes
+                // this arm a refusal-free path rather than a failed `SEND`: an accounting
+                // row that vanished must not cost a customer their write.
+                .unwrap_or(0);
+        // `used` already includes this envelope, so the comparison is against the
+        // total after the write, and `charge` is zero here for that reason.
+        if crate::log_budget::over_budget(used, 0, Some(limit)) {
+            transaction.rollback().await.map_err(backpressure)?;
+            return Err(AcceptError::LogBudgetExhausted { limit });
+        }
     }
 
     transaction.commit().await.map_err(backpressure)?;

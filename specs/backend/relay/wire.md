@@ -899,7 +899,8 @@ off is not the default.
 | --- | --- | --- |
 | Envelope `ct` | 1 MiB | Larger content goes to media. |
 | Media blob | 2 GiB | Object store practicalities. |
-| Envelopes per connection per minute | 600 | Abuse control without impeding agents. Per connecting device key, which is the only identity the relay has. Per-agent budgets are enforced in the app, since the relay cannot see an author (`specs/backend/relay/agents.md`). |
+| `SEND` frames per device per minute | 6000, or `WEALD_RELAY_SEND_FRAMES_PER_MINUTE` | Abuse control without impeding agents. Per authenticated device key, which is the only identity the relay has, and not per connection, so reconnecting does not clear the allowance. Per-agent budgets are enforced in the app, since the relay cannot see an author (`specs/backend/relay/agents.md`). This row read 600 while nothing enforced it; the number rose when it became real, because 600 was written against a steady interactive stream and the traffic that actually arrives is a backlog flush. See "Sizing the `SEND` budget" below. Refused with `quota/rate_limited` on a socket that stays up. |
+| `SEND` bytes per device per minute | 64 MiB, or `WEALD_RELAY_SEND_BYTES_PER_MINUTE` | The workspace ingress figure below, applied per device, because the attack is one device rather than one workspace. At the 1 MiB `ct` ceiling it admits sixty-four maximum-size frames a minute and refuses a device writing 1 MiB frames at line rate. Far above the frame budget at realistic record sizes, so the frame count is what a legitimate client meets first. |
 | Groups per connection | 256 | Bounded server-side subscription state. |
 | Key packages per device | 100 outstanding | Prevents exhaustion. Published and fetched over `KEYS`, one-time delivery (`specs/backend/relay/private-messaging.md`). |
 | `LIVE` `ct` | 4 KiB | A beat is tens of bytes. The cap stops the ephemeral path becoming an unlogged bulk channel. |
@@ -914,6 +915,46 @@ off is not the default.
 | Participants per call | 5 | Relayed egress grows as n(n-1), and five is where the quadratic term stops being free. |
 | Concurrent calls per instance | `WEALD_RELAY_MAX_CONCURRENT_CALLS` | No default, ever: call capacity is a sizing decision about one instance's bandwidth. Required when `WEALD_RELAY_CALLS=on`. |
 | Concurrent connections per instance | 256, or `WEALD_RELAY_MAX_CONNECTIONS` | Closes the gap `specs/backend/relay/operations.md` recorded in words. At the 8 MiB per-connection queue ceiling that is two gibibytes at the absolute worst case. Refused before the WebSocket upgrade, with HTTP 503 and `Retry-After`. |
+
+### Sizing the `SEND` budget
+
+A budget that a legitimate cold start trips is a bug, and it is a bug that
+presents as a network fault, so the defaults above are chosen against what a real
+client actually does rather than against what a steady stream looks like.
+
+The behaviour, written down because the numbers only make sense beside it.
+`RelayConnection.drain` on macOS walks the outbox and hands every unacknowledged
+envelope to the socket in a single pass, with no pacing of any kind: it awaits
+the write, not the acknowledgement, so the whole queue goes out as fast as the
+socket will take it. `offerUnnumbered` fills that outbox once per group per
+session with every local record the relay has never numbered. The `SEND` traffic
+at the start of a session is therefore a burst whose size is exactly the local
+unnumbered set, not a rate.
+
+That set is empty for a joining device, which has authored nothing yet, and its
+cold start is entirely `SUB` and `RECON`. It is small for a device returning from
+an extended offline period, bounded by what its own member wrote while away. The
+one case that is genuinely large is a first publication of an existing history:
+the 40,000-envelope workspace `specs/backend/relay/search.md` sizes its largest
+fixture at, offered in one pass.
+
+So the frame budget is set an order of magnitude above the old interactive
+figure, at a hundred frames a second, which admits every ordinary cold start
+inside a single window with headroom. The history migration is the one case that
+crosses a window, and it is paced rather than failed: about seven windows of
+backoff, against the twenty-minute full-backfill gate `search.md` already
+publishes, with the socket up and reads flowing the whole time.
+
+The byte budget is set so that the frame budget is the one a legitimate client
+meets first. A `.weald` record is a few kilobytes, so six thousand of them is
+single-digit mebibytes and nowhere near 64 MiB; a device sending maximum-size
+frames reaches 64 MiB in sixty-four of them. The limits bind in opposite orders
+for the two populations on purpose, and that is what lets the refusal a real
+client can see carry a short interval.
+
+Both are raisable per instance and neither is settable per group, for the reason
+the admission-blind budget above gives: a per-group lever is a lever for singling
+a hidden group out.
 
 ## Versioning
 

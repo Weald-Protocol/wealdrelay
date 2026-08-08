@@ -40,6 +40,17 @@ use crate::session::{Reaction, Session, Work, SEND_QUEUE_BOUND};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outbound {
     Frame(Frame),
+    /// A WebSocket ping, for the liveness exchange the idle deadline is built on
+    /// (`crate::deadline`).
+    ///
+    /// Not a `Frame`, because it is not one: it carries no protocol meaning, a
+    /// conforming client's transport answers it without its application ever
+    /// seeing it, and putting it in the frame table would have meant a wire tag
+    /// and a version bump for something the WebSocket layer already defines. It
+    /// spends nothing against the byte budget for the reason `Close` does not:
+    /// the queue is most likely to be full exactly when the relay most needs to
+    /// find out whether anybody is still reading it.
+    Ping,
     /// Flush and close.
     Close,
 }
@@ -136,6 +147,19 @@ impl OutboundSender {
     /// spends no budget: it is the frame that must always be able to get through.
     pub async fn close(&self) -> Result<(), mpsc::error::SendError<Outbound>> {
         self.inner.send(Outbound::Close).await
+    }
+
+    /// Queue a liveness ping, without waiting.
+    ///
+    /// `try_send` rather than `send`, and the failure is not an error. A full
+    /// queue means this connection already has 256 frames the peer has not taken,
+    /// which answers the question the ping was going to ask more directly than the
+    /// ping would: there is no need to probe a peer that is visibly behind, and
+    /// waiting for room here would park the reader on the one connection where
+    /// nobody is draining. False means "not queued"; the deadline logic treats the
+    /// probe as sent either way, so a wedged peer is still closed on schedule.
+    pub fn try_ping(&self) -> bool {
+        self.inner.try_send(Outbound::Ping).is_ok()
     }
 }
 
@@ -235,6 +259,14 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
                         break;
                     }
                 }
+                // The liveness probe. A write that fails is the same answer a
+                // missing pong would have been, one round trip earlier, so the
+                // writer ends here exactly as it does for a frame.
+                Some(Outbound::Ping) => {
+                    if sink.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
                 // A close the session asked for, or the reader loop ending and
                 // dropping the last sender. The same thing from the writer's side, and
                 // in both cases whatever was already queued has been written first,
@@ -250,14 +282,73 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
 
     let mut session = Session::new(&state.config);
     session.set_source(source);
-    while let Some(message) = stream.next().await {
-        let Ok(message) = message else { break };
+
+    // The deadlines, and the monotonic origin they are measured from.
+    //
+    // `tokio::time::Instant` rather than `state.now_ms()`. The relay clock is wall
+    // time, it is what an accepted envelope's receipt is recorded against, and the
+    // suites pin it to a fixed instant so their vectors are stable; measuring a
+    // deadline against it would mean every connection in those suites lived
+    // forever, and would mean a real relay's deadlines moving when NTP stepped its
+    // clock. This one only ever goes forwards, and `tokio::time::pause` advances it
+    // without anybody sleeping, which is what makes the deadlines testable at all.
+    let opened = tokio::time::Instant::now();
+    let elapsed_ms = move || u64::try_from(opened.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut deadlines = crate::deadline::Deadlines::new(&state.config, 0);
+
+    loop {
+        // Decide before waiting, so the wait is bounded by whichever deadline is
+        // nearest rather than by the peer's willingness to speak.
+        let wait = match deadlines.next(elapsed_ms()) {
+            crate::deadline::Next::Expired(expiry) => {
+                close_on_deadline(&sender, &state, expiry);
+                break;
+            }
+            crate::deadline::Next::Probe(window) => {
+                // Recorded as probed whether or not it was queued: `try_ping`
+                // fails on a queue the peer is not draining, which is not a
+                // reason to give that peer another idle interval.
+                let _ = sender.try_ping();
+                deadlines.probed(elapsed_ms());
+                window
+            }
+            crate::deadline::Next::Wait(remaining) => remaining,
+        };
+
+        let message = match tokio::time::timeout(wait, stream.next()).await {
+            // The wait ran out. Nothing is decided here: the loop goes back to
+            // `next`, which is the one place a deadline is evaluated, so a probe
+            // and an expiry cannot come to disagree about the same instant.
+            Err(_) => continue,
+            // The stream ended, or the transport failed. Either way the peer is
+            // gone and there is nothing to tell it.
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(message))) => message,
+        };
+
+        // Anything at all counts as evidence the peer is there, including the pong
+        // that answers a probe and including a ping of its own. What the message
+        // *means* is the session's business; whether somebody sent it is this
+        // deadline's, and they are different questions.
+        deadlines.saw_message(elapsed_ms());
+
         // Receipt time belongs to this message, not to the HTTP upgrade that
         // opened the socket. In particular, a long-lived client must not make a
         // newly accepted envelope look as old as its connection.
         let now_ms = state.now_ms();
         if !handle_message(&sender, &state, &mut session, connection, message, now_ms).await {
             break;
+        }
+        // Checked after every message rather than at the one call site that sends
+        // `AUTH_ACK`, because there are two of them (the ordinary path and the
+        // bootstrap path) and they are reached through deferred work rather than
+        // returned from here. `Deadlines::authenticated` is idempotent, so asking
+        // repeatedly costs a branch and cannot extend anything.
+        if matches!(
+            session.state(),
+            crate::session::State::Ready | crate::session::State::Bootstrapping
+        ) {
+            deadlines.authenticated(elapsed_ms());
         }
     }
 
@@ -371,6 +462,50 @@ pub async fn handle_message(
 fn refuse(sender: &OutboundSender, frames: Vec<Frame>) -> bool {
     let _ = queue_all(sender, frames);
     false
+}
+
+/// Seconds a client is told to wait before reconnecting after a deadline closed
+/// its connection.
+///
+/// Five, matching the `Retry-After` on the 503 a connection past
+/// `WEALD_RELAY_MAX_CONNECTIONS` gets, because they are the same message: this
+/// relay has a bound and you met it. A client that reconnects immediately after
+/// being closed for holding a slot is the behaviour the deadline exists to stop.
+const DEADLINE_RETRY_AFTER_SECONDS: u32 = 5;
+
+/// Close a connection whose deadline elapsed, and count it.
+///
+/// The same close path a refusal takes, deliberately: a frame first and then the
+/// socket, because `specs/backend/relay/operations.md` requires that a client
+/// never gets a dropped connection without a frame, since it cannot otherwise tell
+/// a protocol decision from a network failure. `queue_all` rather than
+/// `OutboundSender::close`, which is also what `refuse` does and for the sharper
+/// reason here: `close` waits for room, and the idle deadline fires precisely when
+/// the peer may have stopped draining, so awaiting a slot on its queue would hang
+/// the one connection this function exists to let go of. Returning ends the reader
+/// loop, which drops the sender, which is what closes the socket.
+///
+/// `quota/rate_limited` rather than a new code. It is the code this taxonomy
+/// already has for a per-connection limit carrying a retry interval, and the
+/// client behaviour the registry prescribes for `quota` (wait the named interval,
+/// then come back) is exactly right for both deadlines. Inventing
+/// `retry/handshake_timeout` would have added two rows to a published protocol
+/// registry, and therefore two negative vectors and a client release, to say
+/// something a client already knows how to act on. The distinction an operator
+/// needs is between a deadline and a crash, and that is what the counters are
+/// for; the distinction a client needs is what to do next, and that is the class.
+fn close_on_deadline(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    expiry: crate::deadline::Expiry,
+) {
+    let _ = queue_all(
+        sender,
+        vec![Frame::Error(
+            FrameError::new(ErrorCode::RateLimited).retry_after(DEADLINE_RETRY_AFTER_SECONDS),
+        )],
+    );
+    state.record_deadline(expiry);
 }
 
 /// What the access set said about a connecting device.
@@ -1265,6 +1400,29 @@ pub async fn perform(
             }
         }
         Work::Accept { envelope } => {
+            // The budget first, ahead of the decode, ahead of `authorize_group`'s
+            // read and therefore ahead of the transaction `accept::accept` opens.
+            // A budget charged after the database has done the work measures the
+            // damage rather than preventing it, which is the whole objection this
+            // answers (`crate::send_budget`).
+            //
+            // `device_key` is bound at `AUTH` and `State::Ready` is reachable only
+            // through it, so the fallback is unreachable; it is an empty key
+            // rather than an unbudgeted pass so that a future path into `Ready`
+            // without a bound device is metered rather than exempt.
+            let device = session.device_key().unwrap_or(&[]).to_vec();
+            if let Err(refusal) = state
+                .send_budget
+                .charge(&device, envelope.len() as u64, now_ms)
+                .await
+            {
+                // A frame on a socket that stays up. The connection's reads are
+                // untouched: this is a statement about its writes.
+                return queue_all(
+                    sender,
+                    vec![Frame::Error(refusal.to_frame_error(&state.send_budget))],
+                );
+            }
             let decoded = match Envelope::decode(&envelope) {
                 Ok(decoded) => decoded,
                 Err(error) => {

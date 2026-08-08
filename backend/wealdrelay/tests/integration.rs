@@ -209,7 +209,10 @@ async fn an_applied_migration_that_has_since_been_edited_is_refused() {
             "0004_recovery_wrap".to_string(),
             "0005_handshake".to_string(),
             "0006_media".to_string(),
-            "0007_lifecycle".to_string()
+            "0007_lifecycle".to_string(),
+            "0008_envelope_read_path".to_string(),
+            "0009_push".to_string(),
+            "0010_envelope_budget".to_string()
         ]
     );
 
@@ -1103,7 +1106,10 @@ async fn a_pool_the_caller_already_holds_can_be_wrapped_and_used() {
             "0004_recovery_wrap".to_string(),
             "0005_handshake".to_string(),
             "0006_media".to_string(),
-            "0007_lifecycle".to_string()
+            "0007_lifecycle".to_string(),
+            "0008_envelope_read_path".to_string(),
+            "0009_push".to_string(),
+            "0010_envelope_budget".to_string()
         ]
     );
     // The same pool, and not a copy of the configuration that opened another one.
@@ -1293,7 +1299,10 @@ async fn a_transaction_that_cannot_be_committed_is_reported_and_not_assumed() {
             "0004_recovery_wrap".to_string(),
             "0005_handshake".to_string(),
             "0006_media".to_string(),
-            "0007_lifecycle".to_string()
+            "0007_lifecycle".to_string(),
+            "0008_envelope_read_path".to_string(),
+            "0009_push".to_string(),
+            "0010_envelope_budget".to_string()
         ]
     );
 

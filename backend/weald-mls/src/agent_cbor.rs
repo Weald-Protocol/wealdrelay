@@ -425,7 +425,7 @@ impl<'a> Reader<'a> {
 /// .. }` left an arm nothing could reach: `slot` returns no other error. An
 /// unreachable arm is not a safety net, it is a line no test can cover and a reader
 /// has to work out is dead.
-pub fn optional_slot<'s>(slots: &'s [(u64, Vec<u8>)], key: u64) -> Option<&'s [u8]> {
+pub fn optional_slot(slots: &[(u64, Vec<u8>)], key: u64) -> Option<&[u8]> {
     slots
         .iter()
         .find(|(k, _)| *k == key)
@@ -433,7 +433,7 @@ pub fn optional_slot<'s>(slots: &'s [(u64, Vec<u8>)], key: u64) -> Option<&'s [u
 }
 
 /// One slot out of a decoded schema map, or `MissingKey`.
-pub fn slot<'s>(slots: &'s [(u64, Vec<u8>)], key: u64) -> Result<&'s [u8]> {
+pub fn slot(slots: &[(u64, Vec<u8>)], key: u64) -> Result<&[u8]> {
     optional_slot(slots, key).ok_or(CborError::MissingKey(key))
 }
 

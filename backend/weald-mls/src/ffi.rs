@@ -121,6 +121,14 @@ unsafe fn put(out: *mut Buffer, bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a missing required result before touching MLS state.
+fn required_out(out: *mut Buffer, name: &str) -> Result<()> {
+    if out.is_null() {
+        return Err(Error::InvalidArgument(format!("{name} is null")));
+    }
+    Ok(())
+}
+
 // MARK: The device
 
 /// Open a device: its database, its identity, its signing key.
@@ -179,6 +187,7 @@ pub unsafe extern "C" fn weald_mls_key_package(handle: DeviceHandle, out: *mut B
     guard(
         |_| {},
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let device = unsafe { Handle::borrow(handle)? };
             let bytes = device.key_package()?;
@@ -303,6 +312,7 @@ pub unsafe extern "C" fn weald_mls_join_external(
             if out.is_null() {
                 return Err(Error::InvalidArgument("out handle is null".into()));
             }
+            required_out(commit_out, "commit_out")?;
             // Safety: the caller's contract.
             let device = unsafe { Handle::borrow(handle)? };
             // Safety: forwarded.
@@ -336,6 +346,8 @@ pub unsafe extern "C" fn weald_mls_add(
     guard(
         |_| {},
         || {
+            required_out(commit_out, "commit_out")?;
+            required_out(welcome_out, "welcome_out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             // Safety: forwarded.
@@ -363,6 +375,7 @@ pub unsafe extern "C" fn weald_mls_propose_add(
     guard(
         |_| {},
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             // Safety: forwarded.
@@ -388,6 +401,7 @@ pub unsafe extern "C" fn weald_mls_remove(
     guard(
         |_| {},
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             if leaves.is_null() {
@@ -411,6 +425,7 @@ pub unsafe extern "C" fn weald_mls_commit_pending(handle: GroupHandle, out: *mut
     guard(
         |_| {},
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             let commit = session.commit_pending()?;
@@ -488,6 +503,7 @@ pub unsafe extern "C" fn weald_mls_encrypt(
     guard(
         |_| {},
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             // Safety: forwarded.
@@ -520,6 +536,7 @@ pub unsafe extern "C" fn weald_mls_decrypt(
             }
         },
         || {
+            required_out(out, "out")?;
             // Safety: the caller's contract.
             let session = unsafe { Handle::borrow(handle)? };
             // Safety: forwarded.

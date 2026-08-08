@@ -81,6 +81,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/0008_envelope_read_path.sql"),
     ),
     ("0009_push", include_str!("../migrations/0009_push.sql")),
+    (
+        "0010_envelope_budget",
+        include_str!("../migrations/0010_envelope_budget.sql"),
+    ),
 ];
 
 /// The ledger of what has been applied. Created before anything else, and by the

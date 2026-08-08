@@ -3,7 +3,7 @@
 //! The frame set, and the one error taxonomy every frame uses.
 //!
 //! `specs/backend/relay/wire.md` names the frames and
-//! `specs/backend/relay/operations.md` names the five error classes. Both are
+//! `specs/backend/relay/operations.md` names the six error classes. Both are
 //! reproduced here as types rather than as strings, because the point of the
 //! taxonomy is that a client branches on a code: a client matching on a message
 //! is a client that breaks when somebody improves the wording.
@@ -55,8 +55,9 @@ pub const PROTOCOL_VERSION: u16 = 4;
 /// (`specs/backend/relay/wire.md`, versioning).
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
-/// The five classes from `operations.md`. Not extensible without a protocol
-/// version bump, which is why this is an enum and not a string.
+/// The six classes from `operations.md`. Not extensible without a protocol
+/// version bump, which is why this is an enum and not a string, and why `Limit`
+/// arrives here in the same version as ``FrameTag::Wake`` rather than on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     /// Transient. Backoff with jitter, resend verbatim, never renumber an author
@@ -71,6 +72,16 @@ pub enum ErrorClass {
     Quota,
     /// Unsupported or below the client's floor. Abort the connection.
     Version,
+    /// Over a per-principal ceiling on a write the client can simply stop making.
+    /// Retry after the named interval, on the frame only: the connection stays up
+    /// and durable traffic is unaffected.
+    ///
+    /// Distinct from `Quota` in who is over the line and in what clears it. A
+    /// `quota` is the workspace's and clears by a lever an operator or an admin
+    /// pulls; a `limit` is one principal's own rate and clears by that principal
+    /// waiting. Folding the two together would tell a device to go and find an
+    /// administrator when all it had to do was stop.
+    Limit,
 }
 
 impl ErrorClass {
@@ -81,17 +92,20 @@ impl ErrorClass {
             Self::Denied => "denied",
             Self::Quota => "quota",
             Self::Version => "version",
+            Self::Limit => "limit",
         }
     }
 
     /// Whether a client should send the same bytes again after a wait.
     ///
-    /// Only `retry` and `quota`, and they are different waits: `retry` is
-    /// backoff with jitter, `quota` is the interval the error names. `denied` is
-    /// deliberately not retryable, because retrying blind against a state that
-    /// changed is how a client hammers a relay that has already told it no.
+    /// Only `retry`, `quota` and `limit`, and they are different waits: `retry`
+    /// is backoff with jitter, `quota` and `limit` are the interval the error
+    /// names. `denied` is deliberately not retryable, because retrying blind
+    /// against a state that changed is how a client hammers a relay that has
+    /// already told it no. Kept in step with `RETRYABLE` in
+    /// `scripts/error-class-matrix.py`.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::Retry | Self::Quota)
+        matches!(self, Self::Retry | Self::Quota | Self::Limit)
     }
 }
 
@@ -144,16 +158,34 @@ pub enum ErrorCode {
     WrapNotNewer,
     // quota
     StorageExhausted,
+    /// The workspace's envelope log is at `WEALD_RELAY_MAX_LOG_GB`.
+    ///
+    /// Distinct from `storage_exhausted`, which is the media bucket, because the
+    /// two have different levers and a client that could not tell them apart
+    /// would offer the wrong one. Media clears by deleting a file; the envelope
+    /// log clears only by a signed `drop_before` behind an accepted checkpoint,
+    /// or by a larger plan. The relay never compacts to make room on its own:
+    /// `specs/backend/relay/lifecycle.md` says it "never drops an envelope on its
+    /// own initiative", and a budget that deleted history to accept a write would
+    /// be exactly that, done under load and without a signature.
+    ///
+    /// Carries the limit rather than an interval, because waiting does not clear
+    /// it. `operations.md` allows a `quota` error to name either.
+    LogBudgetExhausted,
     RateLimited,
     SeatsExhausted,
     GroupIngressLimited,
     /// More than ``crate::push::REGISTRATIONS_PER_HOUR`` registrations from one
     /// principal in an hour.
     ///
-    /// `quota` because that is the class this taxonomy has for "over a limit, retry
-    /// after the interval named". `push.md` writes the code as `limit/...` in prose;
-    /// the five classes in `operations.md` are closed and `quota` is the one that
-    /// means what the prose means, so the wire carries `quota`.
+    /// `limit`, the class protocol version 4 added alongside this frame. It was
+    /// briefly `quota` here on the reasoning that the class set was closed at five
+    /// and `quota` was the nearest fit, and that was wrong in the direction that
+    /// costs the most: the registry, `push.md`, the wire vectors and
+    /// `scripts/error-class-matrix.py` all say `limit`, so the wire carried a class
+    /// no published document named for this code. A client branches on the class
+    /// before the code, which is exactly why adding one is a breaking change and
+    /// why it rides this version bump.
     PushRegistrationRate,
     // version
     ProtocolUnsupported,
@@ -183,10 +215,11 @@ impl ErrorCode {
             | Self::WrapNotNewer
             | Self::PushNotConfigured => ErrorClass::Denied,
             Self::StorageExhausted
+            | Self::LogBudgetExhausted
             | Self::RateLimited
             | Self::SeatsExhausted
-            | Self::GroupIngressLimited
-            | Self::PushRegistrationRate => ErrorClass::Quota,
+            | Self::GroupIngressLimited => ErrorClass::Quota,
+            Self::PushRegistrationRate => ErrorClass::Limit,
             Self::ProtocolUnsupported | Self::BelowClientFloor => ErrorClass::Version,
         }
     }
@@ -212,6 +245,7 @@ impl ErrorCode {
             Self::PushNotConfigured => "push_not_configured",
             Self::WrapNotNewer => "wrap_not_newer",
             Self::StorageExhausted => "storage_exhausted",
+            Self::LogBudgetExhausted => "log_budget_exhausted",
             Self::RateLimited => "rate_limited",
             Self::SeatsExhausted => "seats_exhausted",
             Self::GroupIngressLimited => "group_ingress_limited",
@@ -246,6 +280,7 @@ impl ErrorCode {
         Self::PushNotConfigured,
         Self::WrapNotNewer,
         Self::StorageExhausted,
+        Self::LogBudgetExhausted,
         Self::RateLimited,
         Self::SeatsExhausted,
         Self::GroupIngressLimited,
@@ -1360,7 +1395,7 @@ impl Frame {
                             expires_at: reader.uint().map_err(|e| wake_shape(e, "expires_at"))?,
                         }
                     }
-                    3 | 4 | 5 => {
+                    3..=5 => {
                         reader.array(0).map_err(|e| wake_shape(e, "fields"))?;
                         match form {
                             3 => WakeBody::Clear,

@@ -139,6 +139,53 @@ async fn two_groups_are_independent() {
 }
 
 #[tokio::test]
+async fn two_members_receive_each_ordered_push_once_while_the_writer_and_other_group_do_not() {
+    // Multiplayer fanout invariant: every subscribed connection in the written
+    // group sees the same durable sequence, once. A writer has its SEND_ACK
+    // instead, and a subscription in another group is not a wildcard. This is the
+    // in-process companion to the real-WebSocket proof in `live_socket.rs`.
+    let hub = Hub::new();
+    let (first_sender, mut first) = outbound_channel();
+    let (second_sender, mut second) = outbound_channel();
+    let (writer_sender, mut writer) = outbound_channel();
+    let (other_sender, mut other) = outbound_channel();
+    let first_id = hub.connect();
+    let second_id = hub.connect();
+    let writer_id = hub.connect();
+    let other_id = hub.connect();
+
+    for (id, sender) in [
+        (first_id, first_sender),
+        (second_id, second_sender),
+        (writer_id, writer_sender),
+    ] {
+        hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
+            .await;
+    }
+    hub.subscribe(
+        &group(2),
+        other_id,
+        other_sender,
+        wealdrelay::frame::PROTOCOL_VERSION,
+    )
+    .await;
+
+    for body in [envelope(7), envelope(8)] {
+        assert_eq!(
+            hub.fanout(&group(1), &body, writer_id).await,
+            vec![(first_id, Delivery::Sent), (second_id, Delivery::Sent)]
+        );
+    }
+
+    assert_eq!(pushed(&mut first), envelope(7));
+    assert_eq!(pushed(&mut first), envelope(8));
+    assert_eq!(pushed(&mut second), envelope(7));
+    assert_eq!(pushed(&mut second), envelope(8));
+    assert!(writer.try_recv().is_err());
+    assert!(other.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn a_full_queue_downgrades_the_subscriber_and_keeps_every_envelope_it_took() {
     // The bound is real and the answer to hitting it is a downgrade, not a drop.
     let hub = Hub::new();

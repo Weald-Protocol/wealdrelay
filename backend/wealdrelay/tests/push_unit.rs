@@ -478,7 +478,10 @@ fn the_four_codes_are_in_the_registry_with_the_classes_the_spec_names() {
         ),
         (
             ErrorCode::PushRegistrationRate,
-            ErrorClass::Quota,
+            // `limit`, the sixth class, which arrived with this frame in protocol
+            // version 4 and which the registry, the wire vectors and push.md have
+            // named all along.
+            ErrorClass::Limit,
             "push_registration_rate",
         ),
         (

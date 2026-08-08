@@ -45,6 +45,19 @@ pub mod keys {
     pub const OBSERVABILITY_LISTEN: &str = "WEALD_RELAY_OBSERVABILITY_LISTEN";
     pub const TLS: &str = "WEALD_RELAY_TLS";
     pub const MAX_STORAGE_GB: &str = "WEALD_RELAY_MAX_STORAGE_GB";
+    /// The per-workspace ceiling on the envelope log, in decimal GB.
+    ///
+    /// `MAX_STORAGE_GB` bounds media alone and `RETENTION_DAYS` is a warning
+    /// threshold rather than a deletion, so before this variable existed one
+    /// workspace could fill a relay's Postgres while inside every limit the relay
+    /// enforced (`specs/backend/cloud/instance-sizing.md`). Unlimited by default,
+    /// which is the self-hoster's posture: an operator who owns the disk decides
+    /// what to do with it. The hosted provisioner always sets it.
+    ///
+    /// A gigabyte is 10^9 bytes here, the same as `MAX_STORAGE_GB` and the same
+    /// as `pricing.ts BYTES_PER_GB`, because the number a customer is sold and
+    /// the number the relay enforces have to be one number.
+    pub const MAX_LOG_GB: &str = "WEALD_RELAY_MAX_LOG_GB";
     pub const RETENTION_DAYS: &str = "WEALD_RELAY_RETENTION_DAYS";
     pub const ACCESS_SET: &str = "WEALD_RELAY_ACCESS_SET";
     pub const MIN_ENC: &str = "WEALD_RELAY_MIN_ENC";
@@ -93,6 +106,38 @@ pub mod keys {
     /// because a connection carrying a call holds its queue full rather than
     /// nearly empty, so the cap ships with them.
     pub const MAX_CONNECTIONS: &str = "WEALD_RELAY_MAX_CONNECTIONS";
+    /// How long a connection may sit between the WebSocket upgrade and
+    /// `AUTH_ACK`, in milliseconds.
+    ///
+    /// The cap above bounds how many sockets may be open and bounded nothing
+    /// about how long an unauthenticated one may hold its slot, which made the
+    /// cap itself the attack: `WEALD_RELAY_MAX_CONNECTIONS` sockets that send no
+    /// bytes at all lock every real device out of a customer's relay for the cost
+    /// of one file descriptor each. `crate::deadline` carries the argument and
+    /// the default.
+    pub const HANDSHAKE_TIMEOUT_MS: &str = "WEALD_RELAY_HANDSHAKE_TIMEOUT_MS";
+    /// How long an authenticated connection may be silent before the relay asks
+    /// whether its peer is still there, in milliseconds.
+    ///
+    /// Long by design, and not an abuse control: see `crate::deadline`. The
+    /// answer is an application-level liveness exchange rather than a TCP
+    /// keepalive, so a quiet peer and a wedged one are distinguishable.
+    pub const IDLE_TIMEOUT_MS: &str = "WEALD_RELAY_IDLE_TIMEOUT_MS";
+    /// How many `SEND` frames one device may write per minute.
+    ///
+    /// The envelope path had no budget at all until `crate::send_budget`: an admitted
+    /// device could drive the database at line rate, and every other workspace on
+    /// the instance would feel it. Raisable per instance, as
+    /// `specs/backend/relay/wire.md` says the ingress limits are, and never per
+    /// group, so it cannot be used to single a workspace out.
+    pub const SEND_FRAMES_PER_MINUTE: &str = "WEALD_RELAY_SEND_FRAMES_PER_MINUTE";
+    /// How many `SEND` bytes one device may write per minute.
+    ///
+    /// The other half of the same budget. Two variables rather than one, because
+    /// they answer different questions about an instance: the frame count is
+    /// about database write capacity and the byte count is about bandwidth and
+    /// storage, and an operator who raises one usually does not mean the other.
+    pub const SEND_BYTES_PER_MINUTE: &str = "WEALD_RELAY_SEND_BYTES_PER_MINUTE";
     /// The bearer a control plane presents on the operator routes.
     ///
     /// `specs/backend/cloud/api.md` requires the relay to report how many
@@ -161,6 +206,7 @@ pub mod keys {
         OBSERVABILITY_LISTEN,
         TLS,
         MAX_STORAGE_GB,
+        MAX_LOG_GB,
         RETENTION_DAYS,
         ACCESS_SET,
         MIN_ENC,
@@ -169,6 +215,10 @@ pub mod keys {
         CALLS,
         MAX_CONCURRENT_CALLS,
         MAX_CONNECTIONS,
+        HANDSHAKE_TIMEOUT_MS,
+        IDLE_TIMEOUT_MS,
+        SEND_FRAMES_PER_MINUTE,
+        SEND_BYTES_PER_MINUTE,
         SMTP_URL,
         WRITE_MODE,
         RELEASE_CHECK,
@@ -314,6 +364,8 @@ pub struct Config {
     /// The Postgres pool ceiling. See `keys::DB_POOL_SIZE`.
     pub db_pool_size: u32,
     pub max_storage_gb: Limit,
+    /// The envelope log's per-workspace ceiling. See `keys::MAX_LOG_GB`.
+    pub max_log_gb: Limit,
     pub retention_days: Limit,
     pub access_set: AccessSetMode,
     pub min_encryption: MinEncryption,
@@ -325,6 +377,19 @@ pub struct Config {
     /// the feature is on, so nothing downstream has a default to fall back to.
     pub max_concurrent_calls: Option<u64>,
     pub max_connections: Limit,
+    /// Upgrade to `AUTH_ACK`, in milliseconds. Never zero: `positive` refuses it,
+    /// because a zero handshake deadline is a relay that refuses every client and
+    /// is not a posture anybody can mean.
+    pub handshake_timeout_ms: u64,
+    /// Silence on an authenticated connection before the liveness ping, in
+    /// milliseconds. Never zero, for the same reason.
+    pub idle_timeout_ms: u64,
+    /// The per-device inbound budget on `SEND`, in frames and in bytes per
+    /// minute (`crate::send_budget`). Never zero, for the reason the deadlines are
+    /// never zero: zero is not a smaller limit, it is a relay that refuses every
+    /// write.
+    pub send_frames_per_minute: u64,
+    pub send_bytes_per_minute: u64,
     pub smtp_url: Option<String>,
     pub write_mode: WriteMode,
     pub release_check: bool,
@@ -866,6 +931,7 @@ impl Config {
                 ],
             )?,
             max_storage_gb: limit(values, keys::MAX_STORAGE_GB)?,
+            max_log_gb: limit(values, keys::MAX_LOG_GB)?,
             retention_days: limit(values, keys::RETENTION_DAYS)?,
             // `enforce` in every environment including local, so nobody ever
             // develops against the permissive path and discovers the difference
@@ -919,6 +985,23 @@ impl Config {
             // gigabytes at the absolute ceiling, which is a bound a modest
             // instance survives; an operator with more memory says so.
             max_connections: connection_limit(values, keys::MAX_CONNECTIONS)?,
+            // `positive` rather than `count`, so `0` is refused at startup rather
+            // than resolved into a relay that closes every connection the instant
+            // it is opened. It is the same refusal `WEALD_RELAY_MAX_CONNECTIONS=0`
+            // gets and for the same reason: zero is not a smaller limit, it is a
+            // service that does not run.
+            handshake_timeout_ms: positive(values, keys::HANDSHAKE_TIMEOUT_MS)?
+                .unwrap_or(crate::deadline::DEFAULT_HANDSHAKE_TIMEOUT_MS),
+            idle_timeout_ms: positive(values, keys::IDLE_TIMEOUT_MS)?
+                .unwrap_or(crate::deadline::DEFAULT_IDLE_TIMEOUT_MS),
+            // `positive` for the deadlines' reason: a zero here is a relay that
+            // answers `quota` to every `SEND` any device ever makes, which is not
+            // a posture anybody means, so it is refused at startup rather than
+            // discovered when a workspace goes silent.
+            send_frames_per_minute: positive(values, keys::SEND_FRAMES_PER_MINUTE)?
+                .unwrap_or(crate::send_budget::DEFAULT_SEND_FRAMES_PER_MINUTE),
+            send_bytes_per_minute: positive(values, keys::SEND_BYTES_PER_MINUTE)?
+                .unwrap_or(crate::send_budget::DEFAULT_SEND_BYTES_PER_MINUTE),
             db_pool_size: pool_size(values, keys::DB_POOL_SIZE)?,
             smtp_url: optional(values, keys::SMTP_URL)?.map(str::to_string),
             write_mode: one_of(

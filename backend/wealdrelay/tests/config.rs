@@ -638,7 +638,14 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     // wake destination that has no default because it is a trust boundary, the
     // optional bearer, the registration url a device is told rather than left to
     // guess, the coalescing window and the queue bound.
-    assert_eq!(keys::ALL.len(), 30);
+    // 35 with WEALD_RELAY_SEND_FRAMES_PER_MINUTE and
+    // WEALD_RELAY_SEND_BYTES_PER_MINUTE, the two halves of the per-device inbound
+    // budget on the envelope path. That path had no budget at all: media
+    // rate-limits per device and push rate-limits registration, but a `SEND` ran
+    // straight into a decode, an authorization read and a Postgres transaction,
+    // so any admitted device could drive the database at line rate with 1 MiB
+    // frames (`crate::send_budget`, `specs/backend/relay/wire.md`).
+    assert_eq!(keys::ALL.len(), 35);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
 }
 

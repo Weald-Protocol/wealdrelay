@@ -193,6 +193,104 @@ an attacker able to terminate TLS for a relay's name can relay a live handshake.
 The envelope layer holds under that (bodies stay sealed), but metadata does not.
 Binding the challenge to the exporter is the fix and it belongs to the same bump.
 
+## Connection deadlines
+
+An open socket is not a peer that is there, and until protocol version 4 the
+relay treated the two as the same thing. A connection slot is taken at the
+WebSocket upgrade and given back when the reader loop ends
+(`operations.md`, "Backpressure"), and nothing bounded the time between those
+two events. The consequence is worth stating plainly, because it turned a
+capacity control into the attack: an unauthenticated stranger could open
+`WEALD_RELAY_MAX_CONNECTIONS` sockets, send no bytes at all, and lock every real
+device out of a customer's relay for the cost of one file descriptor each. The
+cap bounded memory and bounded nothing about availability. The abuse table in
+`operations.md` already claimed "a hard cap on unauthenticated connection
+lifetime" against `CONNECT` and `AUTH`; these two deadlines are what makes that
+sentence true.
+
+| Deadline | Variable | Default | Runs from | Runs until |
+| --- | --- | --- | --- | --- |
+| Handshake | `WEALD_RELAY_HANDSHAKE_TIMEOUT_MS` | 10000 | The WebSocket upgrade | `AUTH_ACK` |
+| Idle | `WEALD_RELAY_IDLE_TIMEOUT_MS` | 300000 | The last message from the peer | The liveness exchange below |
+
+They are two deadlines rather than one because they answer different questions
+about different peers. Before `AUTH_ACK` the peer is a stranger holding a slot,
+and the honest path is one `CONNECT`, one challenge, one Ed25519 signature and
+one `AUTH`: no real client needs ten seconds for that, and every second granted
+beyond it is a second an attacker holds the connection table for free. After
+`AUTH_ACK` the peer is in the access set, holding a seat, and bounded by the
+abuse budgets in `wire.md`; a quiet workspace is then the ordinary case rather
+than a suspicious one, so five minutes is a reaper for peers that have already
+gone rather than a control on peers that are merely silent. Getting it wrong in
+that direction costs a reconnect and a handshake replay for somebody who was
+working fine, which is why the number is generous.
+
+Both are configuration with a stated default, both are refused at `0` by the same
+rule that refuses `WEALD_RELAY_MAX_CONNECTIONS=0`, and neither has an
+`unlimited`. Zero is not a smaller deadline, it is a relay that closes every
+connection it accepts. `unlimited` is absent because unlimited is the behaviour
+being replaced, and offering it under a new name would let the gap above be
+re-opened by one variable.
+
+### Why liveness is not TCP's job
+
+The idle deadline is enforced by an application-level exchange: when the interval
+elapses the relay sends a WebSocket ping and waits ten seconds for **anything**
+to come back, and only silence past that closes the connection. Any inbound
+message resets the interval and cancels an outstanding probe, because the
+question is whether the peer is present and a frame, a ping, a pong and a close
+are each an answer to it.
+
+TCP is not used for this, for two reasons and the second is the one that matters.
+First, a TCP keepalive is a property of the host's network stack rather than of
+this relay: it is off by default, its interval is measured in hours where it is
+on, and a deadline built on it would mean something different on every
+deployment a self-hoster chooses. Second, and structurally, TCP answers the wrong
+question. The kernel's peer is the kernel on the other side, and it will go on
+acknowledging segments for a process that has stopped reading, so a relay that
+trusted the socket's liveness could not distinguish a client that is quiet from a
+client that is wedged. That distinction is exactly what the deadline exists to
+make, and it is the same one the replay drain makes from the other direction in
+`operations.md`: a peer that is slow keeps its connection, a peer that is gone
+does not.
+
+A ping is used rather than a new frame because the WebSocket layer already
+defines one, a conforming client's transport answers it without its application
+being involved, and adding a protocol frame for it would mean a wire tag, a
+registry row and a client release to say something the transport says already.
+It costs a quiet connection one small frame every five minutes.
+
+### What a closed connection is told, and what an operator sees
+
+A connection closed on either deadline is sent `quota/rate_limited` with
+`retry-after`, then closed. That is the same close path a refusal takes, and it
+is deliberate: `operations.md` requires that a client never gets a dropped
+connection without a frame, because it cannot otherwise tell a decision the relay
+made from a network that failed. The class carries the client behaviour that is
+actually correct here, which is to wait the named interval and reconnect.
+
+The client is told one thing and the operator is told another, because they need
+different facts. `/readyz` reports
+`call_stats.connections_closed_handshake_deadline` and
+`call_stats.connections_closed_idle_deadline` beside
+`call_stats.connections_refused`. Three counters rather than one, because from
+outside they are otherwise indistinguishable from each other and from a relay
+that is crashing:
+
+- `connections_refused` rising is a relay at its ceiling. The answer is a bigger
+  ceiling or another instance.
+- `connections_closed_handshake_deadline` rising while `connections` sits well
+  below the ceiling is somebody parked on the connection table. The answer is at
+  the edge, and it is never to raise anything.
+- `connections_closed_idle_deadline` rising is ordinary attrition: laptops
+  closing, mobile networks dropping connections without a FIN. It is non-zero on
+  every real deployment and is a fleet-health signal rather than an alarm.
+
+They are counts and nothing else. There is no per-source breakdown, for the
+reason the invite path hashes a source address before it reaches a table: a map
+from address to connection behaviour, held in memory and served on an operator
+surface, is the metadata this design spends its effort not accumulating.
+
 ## What this does not protect
 
 - **Metadata against the relay itself.** The relay sees connection times, group

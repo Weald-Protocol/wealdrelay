@@ -265,7 +265,7 @@ async fn dropping_an_access_entry_drops_its_registration_in_the_same_transaction
         "ws-drop",
         0x64,
         &[ada.clone(), bo.clone()],
-        &[ada.clone()],
+        std::slice::from_ref(&ada),
     )
     .await;
     let pool = relay.state.database.as_ref().unwrap().pool();
@@ -293,7 +293,7 @@ async fn dropping_an_access_entry_drops_its_registration_in_the_same_transaction
     );
 
     // Version 1 of the set, naming Ada and the recovery principal and not Bo.
-    support::publish_set_without(&relay.state, "ws-drop", &ada, &[bo.clone()]).await;
+    support::publish_set_without(&relay.state, "ws-drop", &ada, std::slice::from_ref(&bo)).await;
 
     assert!(
         store::find(pool, "ws-drop", &bo_entry)
@@ -333,7 +333,7 @@ async fn the_group_lookup_is_the_access_set_and_the_mask_and_nothing_else() {
         "ws-l",
         0x65,
         &[ada.clone(), bo.clone()],
-        &[ada.clone()],
+        std::slice::from_ref(&ada),
     )
     .await;
     // A second workspace with its own group and its own device, which must never
@@ -343,8 +343,8 @@ async fn the_group_lookup_is_the_access_set_and_the_mask_and_nothing_else() {
         &relay.state,
         "ws-m",
         0x66,
-        &[stranger.clone()],
-        &[stranger.clone()],
+        std::slice::from_ref(&stranger),
+        std::slice::from_ref(&stranger),
     )
     .await;
     let pool = relay.state.database.as_ref().unwrap().pool();

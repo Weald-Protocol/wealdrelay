@@ -631,12 +631,12 @@ fn every_frame_in_every_state_follows_the_documented_rule() {
     // the same enrolment and neither reads anything. A third would move this number
     // and fail here, which is the point.
     //
-    // Twenty-four, and the arithmetic is written out because the number is the
-    // assertion: `CONNECT` in `Fresh` (1), `AUTH` in `Challenged` (1), the thirteen
+    // Twenty-five, and the arithmetic is written out because the number is the
+    // assertion: `CONNECT` in `Fresh` (1), `AUTH` in `Challenged` (1), the fourteen
     // content frames in `Ready` (`SEND`, `SUB`, `RECON`, `ACCESS`, `WRAP`,
-    // `INVITE`, `HANDSHAKE`, `LIVE`, `KEYS`, `CALL`, `MEDIA`, `BLOB`, `DROP`),
-    // `ACCESS` again in `Bootstrapping` (1), `JOIN` in each of the four live states
-    // (4), and `BYE` in each of the four live states (4).
+    // `INVITE`, `HANDSHAKE`, `LIVE`, `KEYS`, `CALL`, `MEDIA`, `WAKE`, `BLOB`,
+    // `DROP`), `ACCESS` again in `Bootstrapping` (1), `JOIN` in each of the four
+    // live states (4), and `BYE` in each of the four live states (4).
     //
     // Protocol version 3 contributed two of them. `CALL` and `MEDIA` are the twelfth
     // and thirteenth content frames and both are `Ready` only, like every other
@@ -644,14 +644,20 @@ fn every_frame_in_every_state_follows_the_documented_rule() {
     // because the call it names was only ever reachable through a `CALL` that was
     // access-set checked, and a session that never authenticated has none.
     //
+    // Protocol version 4 contributed the fourteenth, `WAKE`, and it is `Ready` only
+    // for the reason that matters most here: a registration is written against a
+    // principal, so a session with no authenticated principal has nothing to write
+    // it against. It widens this total by exactly one and leaves the bootstrap hole
+    // alone, which is the shape every added frame should have.
+    //
     // The bootstrap hole is unmoved at two frames wide, `ACCESS` and `JOIN`, which
     // is the number this assertion is really guarding. A third would move it and
     // fail here, which is the point.
     assert_eq!(
-        permitted, 24,
-        "CONNECT, AUTH, the thirteen content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
+        permitted, 25,
+        "CONNECT, AUTH, the fourteen content frames, BYE and JOIN in four live states, ACCESS while bootstrapping"
     );
-    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 24);
+    assert_eq!(refused, FrameTag::ALL.len() * STATES.len() - 25);
 }
 
 #[test]

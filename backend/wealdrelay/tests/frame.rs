@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wealdrelay::cbor;
 use wealdrelay::frame::{
-    ErrorClass, ErrorCode, Frame, FrameDecodeError, FrameError, FrameTag, KeysBody,
+    ErrorClass, ErrorCode, Frame, FrameDecodeError, FrameError, FrameTag, KeysBody, WakeBody,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
@@ -152,6 +152,38 @@ fn every_variant() -> Vec<Frame> {
             seq: u64::MAX,
             ct: Vec::new(),
         },
+        // Every `WAKE` form, because the leading discriminant is on the wire and
+        // the tag-set assertion below is what noticed this frame had no case here
+        // at all: tag 25 shipped in protocol version 4 and round-tripped nowhere.
+        Frame::Wake(WakeBody::Register {
+            handle: vec![0xA7; 16],
+            categories: 0b0000_0001,
+            expires_at: 1_700_000_000_000,
+        }),
+        Frame::Wake(WakeBody::Register {
+            // Every defined bit at once (message, call, handshake), and the
+            // furthest expiry a u64 can name.
+            // Both are legal and neither is special-cased.
+            handle: vec![0; 16],
+            categories: 0b0000_0111,
+            expires_at: u64::MAX,
+        }),
+        Frame::Wake(WakeBody::Registered {
+            expires_at: 1_700_000_086_400,
+        }),
+        Frame::Wake(WakeBody::Clear),
+        Frame::Wake(WakeBody::Cleared),
+        Frame::Wake(WakeBody::Query),
+        Frame::Wake(WakeBody::Capability {
+            enabled: true,
+            register_url: "https://ringer.weald.team/register".to_string(),
+        }),
+        Frame::Wake(WakeBody::Capability {
+            // Off, and with no url to go to, which is the shape a self-hoster who
+            // has not chosen a ringer answers with.
+            enabled: false,
+            register_url: String::new(),
+        }),
         Frame::Invite { body: vec![6; 64] },
         Frame::Handshake {
             group: wide(9),
@@ -394,20 +426,27 @@ fn every_code_string_is_unique_and_qualifies_as_class_slash_code() {
 }
 
 #[test]
-fn only_retry_and_quota_are_retryable() {
-    // Two classes and no others. `denied` is deliberately excluded: it means well
-    // formed but not permitted now, and retrying blind against a state that
-    // changed is how a client hammers a relay that has already told it no. The
-    // remedy for `denied` is to re-read the state the error names. `reject` is
-    // permanently wrong as sent and `version` aborts the connection.
+fn only_retry_quota_and_limit_are_retryable() {
+    // Three classes and no others. `limit` joined `retry` and `quota` with
+    // protocol version 4: it is one principal's own rate on a write it can stop
+    // making, so the same bytes after the named interval are exactly the right
+    // move. `denied` is deliberately excluded: it means well formed but not
+    // permitted now, and retrying blind against a state that changed is how a
+    // client hammers a relay that has already told it no. The remedy for `denied`
+    // is to re-read the state the error names. `reject` is permanently wrong as
+    // sent and `version` aborts the connection.
     assert!(ErrorClass::Retry.is_retryable());
     assert!(ErrorClass::Quota.is_retryable());
+    assert!(ErrorClass::Limit.is_retryable());
     assert!(!ErrorClass::Denied.is_retryable());
     assert!(!ErrorClass::Reject.is_retryable());
     assert!(!ErrorClass::Version.is_retryable());
 
     for code in ErrorCode::ALL {
-        let expected = matches!(code.class(), ErrorClass::Retry | ErrorClass::Quota);
+        let expected = matches!(
+            code.class(),
+            ErrorClass::Retry | ErrorClass::Quota | ErrorClass::Limit
+        );
         assert_eq!(
             code.class().is_retryable(),
             expected,
