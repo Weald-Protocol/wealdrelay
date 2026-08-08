@@ -44,6 +44,17 @@ const SHORT: Duration = Duration::from_millis(600);
 /// A deadline nothing in a test should ever reach.
 const NEVER: Duration = Duration::from_secs(600);
 
+/// How long a test waits for a close it is certain is coming.
+///
+/// Deliberately far above any deadline this suite sets, because it is not
+/// measuring one: it is the point at which "the relay never closed the
+/// connection" stops being a slow machine and starts being a defect. It was
+/// `SHORT * 20`, twelve seconds, and the 0.1.10 release runner blew through it on
+/// a stalled scheduler while the relay behaved correctly. Two minutes is still an
+/// order of magnitude below `NEVER`, so the idle deadline cannot be what fires
+/// inside it.
+const PATIENCE: Duration = Duration::from_secs(120);
+
 /// What arrived on the wire, at the WebSocket framing layer rather than the
 /// protocol one.
 ///
@@ -194,20 +205,23 @@ async fn a_connection_that_never_authenticates_is_closed_at_the_handshake_deadli
         "the slot is taken at the upgrade, which is what makes the deadline necessary"
     );
 
-    let frames = drain_to_close(&mut client, SHORT * 20, false).await;
+    let frames = drain_to_close(&mut client, PATIENCE, false).await;
     let took = opened.elapsed();
 
     assert_deadline_refusal(&frames);
-    // Closed *at* the deadline: not before it, which would refuse honest clients,
-    // and not merely eventually, which is what the socket did before this existed.
+    // Not before the deadline, which would refuse honest clients. This half is a
+    // real bound and stays: a relay that closed early would fail it on any machine.
     assert!(
         took >= SHORT,
         "closed after {took:?}, before the {SHORT:?} deadline it was given"
     );
-    assert!(
-        took < SHORT * 20,
-        "closed after {took:?}, which is not the deadline doing it"
-    );
+    // The other half of the old assertion, that it was *this* deadline and not
+    // something else eventually, was a wall-clock ceiling of twelve seconds. It is
+    // gone, because the counters below answer the same question exactly rather than
+    // by inference: `deadline_closes(Handshake)` is 1 and `Idle` is 0, so the close
+    // is attributed to the deadline under test by the relay itself. A ceiling on
+    // elapsed time was measuring the runner, and on the 0.1.10 release run it
+    // failed while the relay did precisely the right thing.
 
     // The slot comes back. This is the whole point: a deadline that closed the
     // socket and leaked its slot would leave the relay just as unreachable.
@@ -296,7 +310,7 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     // The deadlines fire, and the relay comes back on its own with nobody
     // restarting anything.
     for client in silent.iter_mut() {
-        let _ = drain_to_close(client, handshake * 20, false).await;
+        let _ = drain_to_close(client, PATIENCE, false).await;
     }
     let mut settled = false;
     for _ in 0..200 {
@@ -451,7 +465,7 @@ async fn an_authenticated_peer_that_stops_answering_is_closed_on_the_idle_deadli
     // and its application is never going to speak again. TCP cannot tell this
     // from the test above; the liveness exchange can, and that difference is the
     // reason the exchange exists.
-    let frames = drain_to_close(&mut ada, SHORT * 20, false).await;
+    let frames = drain_to_close(&mut ada, PATIENCE, false).await;
     assert_deadline_refusal(&frames);
 
     assert_eq!(relay.state.deadline_closes(Expiry::Idle), 1);
