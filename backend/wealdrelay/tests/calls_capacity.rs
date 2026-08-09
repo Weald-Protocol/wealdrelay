@@ -114,6 +114,14 @@ async fn the_relay_refuses_a_connection_past_its_cap_and_takes_it_back_when_one_
     // sockets. The value is a configuration rather than a constant precisely so an
     // operator can size it, and so a test can.
     config.max_connections = wealdrelay::config::Limit::Of(2);
+    // Both connection-cap tests hold sockets that never handshake, which is the one
+    // thing the shared harness deadline cannot accommodate: `support::deadline_pairs`
+    // gives every suite two minutes, and these tests wait up to two minutes for a
+    // count to settle, so the reaper and the wait were racing over the same window.
+    // 0.1.13 read back zero of eight. An hour here, because holding un-handshaken
+    // sockets *is* the premise, and the handshake deadline is proven by
+    // `tests/deadline_socket.rs`, which is where it belongs.
+    config.handshake_timeout_ms = 3_600_000;
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
     let group = make_group(&relay.state, 0x50).await;
 
@@ -187,6 +195,14 @@ async fn an_operator_may_remove_the_cap_deliberately() {
     let blobs = tempfile::tempdir().unwrap();
     let mut config = config_for_calls(&scratch, blobs.path(), 4);
     config.max_connections = wealdrelay::config::Limit::Unlimited;
+    // Both connection-cap tests hold sockets that never handshake, which is the one
+    // thing the shared harness deadline cannot accommodate: `support::deadline_pairs`
+    // gives every suite two minutes, and these tests wait up to two minutes for a
+    // count to settle, so the reaper and the wait were racing over the same window.
+    // 0.1.13 read back zero of eight. An hour here, because holding un-handshaken
+    // sockets *is* the premise, and the handshake deadline is proven by
+    // `tests/deadline_socket.rs`, which is where it belongs.
+    config.handshake_timeout_ms = 3_600_000;
     // This test deliberately holds eight sockets that never handshake, so it is the
     // one that first ran into the handshake deadline reaping them: eight connects
     // read back six, and waiting made it worse rather than better, because the
