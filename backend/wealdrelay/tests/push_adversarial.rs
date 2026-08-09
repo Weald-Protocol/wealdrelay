@@ -201,7 +201,21 @@ async fn a_principal_holding_a_socket_is_not_woken() {
         "the socket was never let go, so the suppression under test never lifted"
     );
     wealdrelay::push::dispatch::wake_group(&relay.state, &group, Category::Message).await;
-    assert_eq!(relay.state.push.queued().await, 1);
+    // Waited for on the same principle as the reap above. `wake_group` returning is
+    // not the queue having been written: the enqueue is observable a moment later,
+    // and on a loaded runner that moment is longer than the read that followed it.
+    // 0.1.15 bounded the wait for the precondition and left this line an immediate
+    // read, so the same run that used to fail on a socket still held now fails on a
+    // queue not yet written, one line further on and just as silent about why.
+    let give_up = Instant::now() + Duration::from_secs(120);
+    while relay.state.push.queued().await != 1 && Instant::now() < give_up {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.state.push.queued().await,
+        1,
+        "the disconnected principal was never woken, so the suppression never lifted"
+    );
 
     ringer.stop();
     relay.shutdown().await;

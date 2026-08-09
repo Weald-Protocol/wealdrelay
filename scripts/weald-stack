@@ -38,9 +38,17 @@ EX_UNAVAILABLE=69
 : "${WEALD_STACK_SMTP_PORT:=54025}"
 : "${WEALD_STACK_MAILPIT_UI_PORT:=54080}"
 : "${WEALD_STACK_RELAY_PORT:=54040}"
+# Which interface the harness relay binds. Loopback by default, because the
+# default posture is one machine and a plaintext socket that nothing off this
+# host can open. Set to 0.0.0.0 to test a second device (an iPhone, a second
+# Mac) against this relay over the LAN; the URL those devices use is then
+# ws://<this machine's LAN address>:$WEALD_STACK_RELAY_PORT/relay. Health and
+# readiness are still probed on 127.0.0.1, which a 0.0.0.0 bind also serves.
+: "${WEALD_STACK_RELAY_BIND:=127.0.0.1}"
 : "${WEALD_STACK_CLOUD_PORT:=54030}"
 export WEALD_STACK_PG_PORT WEALD_STACK_MINIO_PORT WEALD_STACK_MINIO_CONSOLE_PORT \
-  WEALD_STACK_REDIS_PORT WEALD_STACK_SMTP_PORT WEALD_STACK_MAILPIT_UI_PORT
+  WEALD_STACK_REDIS_PORT WEALD_STACK_SMTP_PORT WEALD_STACK_MAILPIT_UI_PORT \
+  WEALD_STACK_RELAY_BIND
 
 INFRA_SERVICES=(postgres minio redis mailpit)
 
@@ -55,6 +63,46 @@ require_daemon() {
     echo "weald-stack: no docker daemon. Start OrbStack and try again." >&2
     exit 1
   fi
+}
+
+# The loopback addresses above 127.0.0.1 that the suite binds as distinct sources.
+# Linux answers on every 127/8 address without being asked; macOS binds 127.0.0.1
+# and nothing else, so those tests fail there with EADDRNOTAVAIL and the failure
+# names a bind rather than the cap it is really about. Adding an alias needs root,
+# so this reports rather than sudoing: an unattended `up` must not sit on a
+# password prompt.
+#
+# Three and not one. `tests/calls_capacity.rs` binds 127.0.0.2 as a second source,
+# and `tests/deadline_socket.rs` fills a four-slot table from 127.0.0.1 through
+# 127.0.0.4 because BR-032 gives one source only a quarter of it. Checking .2
+# alone let a machine pass this gate and still fail the suite, one test further
+# on, with the same opaque EADDRNOTAVAIL.
+LOOPBACK_ALIASES=("127.0.0.2" "127.0.0.3" "127.0.0.4")
+
+require_loopback_alias() {
+  case "$(uname -s)" in
+    Darwin) ;;
+    *) return 0 ;;
+  esac
+  local present=() missing=() alias_
+  for alias_ in "${LOOPBACK_ALIASES[@]}"; do
+    if /sbin/ifconfig lo0 2>/dev/null | grep -q "inet $alias_"; then
+      present+=("$alias_")
+    else
+      missing+=("$alias_")
+    fi
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    note "loopback" "${present[*]} present"
+    return 0
+  fi
+  note "loopback" "${missing[*]} absent"
+  echo "weald-stack: the relay suite binds these as distinct sources and will fail" >&2
+  echo "weald-stack: with EADDRNOTAVAIL until the aliases exist. Add them with:" >&2
+  for alias_ in "${missing[@]}"; do
+    echo "weald-stack:   sudo ifconfig lo0 alias $alias_ up" >&2
+  done
+  echo "weald-stack: They do not survive a reboot; re-run those lines after one." >&2
 }
 
 # A step that has not been built yet. Named so every message reads the same and
@@ -232,8 +280,8 @@ relay_start() {
   WEALD_RELAY_HOSTNAME=localhost \
   WEALD_RELAY_DATABASE_URL="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack" \
   WEALD_RELAY_STORAGE_URL="file://$STACK_STATE/blobs" \
-  WEALD_RELAY_LISTEN="127.0.0.1:$WEALD_STACK_RELAY_PORT" \
-  WEALD_RELAY_OBSERVABILITY_LISTEN="127.0.0.1:$RELAY_OBSERVABILITY_PORT" \
+  WEALD_RELAY_LISTEN="$WEALD_STACK_RELAY_BIND:$WEALD_STACK_RELAY_PORT" \
+  WEALD_RELAY_OBSERVABILITY_LISTEN="$WEALD_STACK_RELAY_BIND:$RELAY_OBSERVABILITY_PORT" \
   WEALD_RELAY_TLS=off \
   WEALD_RELAY_RELEASE_CHECK=off \
   WEALD_RELAY_MIN_ENC="${WEALD_STACK_MIN_ENC:-mls}" \
@@ -1832,6 +1880,8 @@ cmd_up() {
   dc up -d --wait --wait-timeout 120 "${INFRA_SERVICES[@]}" >/dev/null
   wait_healthy
   for svc in "${INFRA_SERVICES[@]}"; do note "$svc" "healthy"; done
+
+  require_loopback_alias
 
   # The relay. Built from source, TLS off, loopback only.
   relay_start || true

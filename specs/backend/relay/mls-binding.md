@@ -85,6 +85,20 @@ than they look:
   why. It is the same ordering rule `wire.md` uses for the author chain: reserve,
   send, then advance.
 
+  The Swift side keeps that ordering as of 2026-08-09 (register BR-025).
+  `GroupSession.commitPending` returns the commit unmerged and reports
+  `awaitingAcceptance`; the caller publishes it, waits for the relay to number it,
+  and only then calls `GroupSession.accepted()`, which merges and returns the
+  standing `GroupInfo` and the history record for the epoch the merge created.
+  Those two publications cannot be produced any earlier because both describe an
+  epoch that does not exist until the merge, which is why the publish call is two
+  phases and not one. A write the relay refused leaves the device at the epoch the
+  rest of the group is at, and it publishes nothing describing an epoch nobody
+  else reached. The agent-admission and steward paths still merge inline, for the
+  reason the register records: both read the added or evicted leaf out of merged
+  state, so deferring there needs a way to clear a pending commit at this
+  boundary.
+
 **A third correction, made in step 7: the recovery wrap is sealed below the boundary,
 not above it.** `specs/backend/relay/groups.md` describes `recovery.wrap` as a record
 the committer emits, and everything about it reads like a product concern: who is

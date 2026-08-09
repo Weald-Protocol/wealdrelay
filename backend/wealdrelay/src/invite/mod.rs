@@ -40,6 +40,7 @@ pub mod admin;
 pub mod code;
 pub mod delivery;
 pub mod genesis;
+pub mod handoff;
 pub mod redeem;
 pub mod reserve;
 pub mod store;

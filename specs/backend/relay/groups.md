@@ -180,6 +180,19 @@ epoch secrets is sealed and published as `history.publish`
 only thing that has to be re-wrapped when the enrolment key rotates, and the
 sealed history blob is rewritten only when the group gains an epoch.
 
+**What a reader accepts as a history publication, added 2026-08-09 (register
+BR-026).** The relay stores this record without understanding it, so nothing on
+that side can tell an accumulating list from a replacement: an authorized member
+holding the history key can seal a syntactically valid list carrying only the
+newest epoch, or one under a key nobody else holds, and publish it last. A reader
+therefore adopts a publication only when every entry opens under the key that
+travelled in the standing publication, the epochs run from zero with no gap, and
+the candidate still carries every epoch this device already held. Anything else
+is refused whole rather than adopted in part, because a partly adopted list is
+the truncation being refused; the refusal is surfaced as an integrity failure and
+the group stays usable forward. Without this an `open` group could be quietly
+turned into a forward-only one by a single record.
+
 **What is in that list, corrected in step 8.** An earlier version of this
 paragraph said the list holds historical epoch secrets, meaning the MLS key
 schedule's own. It cannot, and the correction is not cosmetic. No RFC 9420

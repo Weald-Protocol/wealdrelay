@@ -301,8 +301,77 @@ pub async fn bootstrap(database: &Database, config: &Config) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or_default();
+    // Decoded before the mint rather than after it. A relay configured with an
+    // unusable handoff key is a hosted relay that will mint an invite it can then
+    // never seal, and the code exists in memory for exactly the length of the arm
+    // below: there is no second chance to seal it. Refusing to mint at all leaves
+    // an empty database an operator can restart against, which is the documented
+    // remedy; minting first would burn the one bootstrap this relay is allowed.
+    let handoff = match config.bootstrap_handoff_pubkey.as_deref() {
+        Some(configured) => match crate::invite::handoff::parse_public_key(configured) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace,
+                    error = %error,
+                    "refusing to mint a genesis key that could never be handed off"
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     match crate::invite::genesis::ensure(database.pool(), &workspace, now).await {
         Ok(crate::invite::genesis::Ensured::Minted(run)) => {
+            if let Some(key) = handoff.as_ref() {
+                // The hosted path. Both halves are sealed to the control plane's
+                // key and neither is printed: on this tier the link is claimed once
+                // by the buyer's browser and the code is mailed to their verified
+                // address, and a line on this relay's stdout would be a third copy
+                // of a secret in a place neither of them chose
+                // (`specs/backend/contracts/threat-model/bootstrap-handoff.md`).
+                let expires = now.max(0) + crate::invite::BOOTSTRAP_EXPIRY_MS as i64;
+                match crate::invite::handoff::store(
+                    database.pool(),
+                    &workspace,
+                    &config.hostname,
+                    &run,
+                    key,
+                    expires,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        // Fingerprints only. This is the whole of what an operator
+                        // with log access learns, and it is the value a customer is
+                        // asked to compare rather than one they are asked to keep.
+                        println!(
+                            "{}",
+                            crate::invite::genesis::sealed_banner(
+                                &config.hostname,
+                                &run.fingerprint
+                            )
+                        );
+                    }
+                    Err(error) => {
+                        let reason = crate::logging::scrub(&error.to_string());
+                        tracing::warn!(
+                            workspace = %workspace,
+                            error = %reason,
+                            "minted a genesis key but could not seal the handoff; \
+                             this relay cannot be enrolled and must be started again \
+                             against an empty database"
+                        );
+                    }
+                }
+                let fingerprint = crate::invite::genesis::hex(&run.fingerprint);
+                tracing::info!(
+                    workspace = %workspace,
+                    fingerprint = %fingerprint,
+                    "minted the genesis key"
+                );
+                return;
+            }
             // To stdout, once, and never again for this relay. The code is in it
             // because for a self-hoster the genesis key never left their machine;
             // `genesis::banner` says why at more length.
@@ -330,7 +399,13 @@ pub async fn bootstrap(database: &Database, config: &Config) {
             // along and nothing showed it to them. The code is not reprinted and
             // cannot be, which `genesis::reminder` says out loud so nobody goes
             // looking for a reissue flag that must never exist.
-            if !redeemed {
+            //
+            // Suppressed entirely on the hosted path. There the link half is the one
+            // the dashboard guards and claims once, and reprinting it on every
+            // restart would put it in front of everyone with log access, which is
+            // precisely the audience the two-channel split exists to exclude. The
+            // sealed blob is already served at the derived path, so nothing is lost.
+            if !redeemed && handoff.is_none() {
                 println!(
                     "{}",
                     crate::invite::genesis::reminder(&config.hostname, &token, &fingerprint)

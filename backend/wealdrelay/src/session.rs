@@ -397,6 +397,25 @@ impl Session {
         &self.subscribed
     }
 
+    /// Forget a group this connection never actually subscribed to.
+    ///
+    /// The `SUB` arm records the group before the work is deferred, because the group
+    /// limit is a property of the frames a connection has sent and has to be decided
+    /// without a database round trip. Authorization happens afterwards, in
+    /// `ws::perform`, and a refused `SUB` creates no subscription: no hub entry, no
+    /// acknowledgement, nothing. Left recorded, those refusals still counted against
+    /// `MAX_GROUPS_PER_CONNECTION`, so 256 `SUB`s for group ids that do not exist put a
+    /// connection holding zero subscriptions permanently at its ceiling, and the next
+    /// `SUB` for a real group was answered `quota/rate_limited`. An honest client that
+    /// subscribed to a group a moment before its row existed reached the same wall by
+    /// accident.
+    ///
+    /// Called only from the refusal path, so a successful subscription is still counted
+    /// exactly once and the limit still holds.
+    pub fn forget_subscription(&mut self, group: &[u8]) {
+        self.subscribed.retain(|held| held.as_slice() != group);
+    }
+
     pub fn requested(&self) -> &[Vec<u8>] {
         &self.requested
     }

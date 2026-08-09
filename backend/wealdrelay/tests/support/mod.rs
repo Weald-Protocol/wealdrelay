@@ -256,6 +256,32 @@ impl Client {
         Self::upgrade(TcpStream::connect(address).await.expect("connect")).await
     }
 
+    /// Connect from a chosen loopback source.
+    ///
+    /// BR-032 caps how much of a finite connection table one *source* may hold
+    /// before it authenticates, so a test that needs several unauthenticated
+    /// sockets open at once needs several sources: four connections from one
+    /// address is the attack that control exists to refuse, not a full table.
+    /// Anything above `127.0.0.1` needs an alias on macOS and none on Linux
+    /// (`scripts/weald-stack up` reports the line).
+    pub async fn connect_from(address: std::net::SocketAddr, source: std::net::IpAddr) -> Self {
+        let socket = match source {
+            std::net::IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().expect("an IPv4 socket"),
+            std::net::IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().expect("an IPv6 socket"),
+        };
+        socket
+            .bind(std::net::SocketAddr::new(source, 0))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "bind the chosen source {source}: {error}\n\
+                     On macOS every loopback address above 127.0.0.1 needs an alias:\n\
+                     \x20   sudo ifconfig lo0 alias {source} up\n\
+                     It does not survive a reboot. `scripts/weald-stack up` reports the set."
+                )
+            });
+        Self::upgrade(socket.connect(address).await.expect("connect")).await
+    }
+
     /// A client whose kernel receive buffer is tiny and which resets rather than
     /// closes.
     ///

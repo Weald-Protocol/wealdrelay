@@ -165,12 +165,33 @@ wrong. `info` binds the ciphertext to the key it was sealed to, so a blob lifted
 from one instance and served for another fails to open rather than decrypting.
 The path is derived from the key rather than from the workspace, because a path
 containing a hostname would be a guessable url for a ciphertext. And the blob is
-served on the **private observability listener** beside `/readyz`, never on the
-public one, with the genesis fingerprint alongside it:
+served on the **public listener behind the operator bearer**, mounted only where
+both `WEALD_RELAY_BOOTSTRAP_HANDOFF_PUBKEY` and `WEALD_RELAY_OPERATOR_TOKEN` are
+set, with the genesis fingerprint alongside it:
 
     GET /handoff/<derived>  ->  200 {"blob": "...", "sealed_code": "...",
                                      "genesis_fingerprint": "..."}
                                 404 before anything has been sealed
+
+An earlier draft of this section pinned the route to the private observability
+listener, "never on the public one". That was right about the port and wrong about
+the topology, and it is corrected here rather than quietly softened. The private
+listener is per-region provider-private networking, and the control plane does not
+run in every region it provisions into, so `renderHandoffBlob` could not reach it
+and read unreachable as absent. The consequence reached a paying customer: `POST
+/instances/:id/bootstrap` answered `instance_not_operable` however many times the
+Reveal button was pressed, and the provisioning saga, which waited on the same
+blob, destroyed and refunded relays that were up, certificated and answering on the
+customer's own hostname. A blob nobody can fetch is not a safer blob.
+
+Moving it costs nothing the design was relying on. What is served is a ciphertext
+openable only by a private key held in another system and destroyed on first claim,
+the path is derived from that key rather than from anything guessable, and the
+request must still carry the operator bearer, compared in constant time by the same
+function `/admitted` uses. The private listener was never the security boundary;
+the bearer was, and it still is. `/admitted` is mounted on the public listener too,
+for the same reason and under the same bearer, and both remain absent entirely on a
+relay with no operator token, which is every self-hosted one.
 
 The fingerprint travels with the blob because `cloud/api.md` returns the two
 together and the client checks which genesis key signed the invite it is about to

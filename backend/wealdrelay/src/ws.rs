@@ -143,6 +143,16 @@ impl OutboundSender {
         SEND_QUEUE_BYTE_BUDGET - self.budget.available_permits()
     }
 
+    /// Frames that can still be queued before the channel's own bound is reached.
+    ///
+    /// Exposed for the same reason [`OutboundSender::queued_bytes`] is: a batch built
+    /// to a constant derived from the empty queue is a batch that gets refused when
+    /// something is already in it, and a refused control run ends the connection. See
+    /// `sync::subscribe`.
+    pub fn free_slots(&self) -> usize {
+        self.inner.capacity()
+    }
+
     /// Ask the channel to close, waiting for room. `Close` carries no payload and so
     /// spends no budget: it is the frame that must always be able to get through.
     pub async fn close(&self) -> Result<(), mpsc::error::SendError<Outbound>> {
@@ -281,7 +291,8 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
     });
 
     let mut session = Session::new(&state.config);
-    session.set_source(source);
+    session.set_source(source.clone());
+    let mut holds_unauthenticated_source_share = true;
 
     // The deadlines, and the monotonic origin they are measured from.
     //
@@ -349,6 +360,10 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
             crate::session::State::Ready | crate::session::State::Bootstrapping
         ) {
             deadlines.authenticated(elapsed_ms());
+            if holds_unauthenticated_source_share {
+                state.release_unauthenticated_connection(source.as_deref());
+                holds_unauthenticated_source_share = false;
+            }
         }
     }
 
@@ -372,6 +387,9 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
     // slot before the upgrade; releasing it there would have released it while the
     // socket was still open, and releasing it only on the clean path would leak
     // one per client that vanished.
+    if holds_unauthenticated_source_share {
+        state.release_unauthenticated_connection(source.as_deref());
+    }
     state.release_connection();
 }
 
@@ -1475,6 +1493,9 @@ pub async fn perform(
         }
         Work::Subscribe { group, from_seq } => {
             if let Err(code) = authorize_group(state, session, &group).await {
+                // Refused means no subscription was created, so the slot the `SUB` arm
+                // took for it is given back. See `Session::forget_subscription`.
+                session.forget_subscription(&group);
                 return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
             }
             crate::sync::subscribe(

@@ -418,6 +418,37 @@ impl JoinRefusal {
         }
     }
 
+    /// Seconds before the refused frame could succeed, for the two answers that
+    /// are a quota.
+    ///
+    /// `quota` is defined by `specs/backend/contracts/registries/error-codes.md`
+    /// as "retry after the named interval", and every other quota answer this
+    /// relay gives names one: the send budget, the media budgets, the log budget.
+    /// These two named none, and the omission was not cosmetic. A client is
+    /// entitled to distinguish an answer it should act on from one it should wait
+    /// out, and the Android client does exactly that: a non-terminal error with no
+    /// interval is dropped in silence, so a call refused by a full instance or a
+    /// full call rang for its full forty-five seconds and then reported "no
+    /// answer", which names the wrong cause to the one person who could have acted
+    /// on the right one.
+    ///
+    /// Five seconds, and it is honestly a suggestion rather than a window that
+    /// provably clears: both of these free up when somebody hangs up rather than
+    /// when a timer expires. That is the correct shape anyway. The interval on a
+    /// fixed window is when the window resets; the interval here is how long to
+    /// wait before asking again, which is what the class asks for and what a client
+    /// can act on.
+    ///
+    /// `GroupMismatch` has none, because it is not a quota. It is `denied`, it is a
+    /// frame that names a call id belonging to another room, and it will be refused
+    /// identically forever.
+    pub fn retry_after(self) -> Option<u32> {
+        match self {
+            Self::GroupMismatch => None,
+            Self::TooManyCalls | Self::CallFull => Some(5),
+        }
+    }
+
     /// The limit the answer names, so a client surfaces the lever rather than
     /// guessing at one. Never content-derived.
     pub fn detail(self, max_calls: usize) -> u64 {

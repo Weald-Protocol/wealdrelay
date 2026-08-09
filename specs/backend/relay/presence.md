@@ -66,12 +66,24 @@ checkpoint, and never in a `drop_before` manifest. A `LIVE` frame that arrives
 while its group has no other connected subscriber is discarded, and that is the
 normal case rather than an error.
 
-Backpressure sheds `LIVE` first, before it touches any durable frame, and sheds
-it silently. This is the whole reason it must be a frame: the shed decision is
-made on a bounded queue by a relay that has to know it is allowed to drop this
-one, and it cannot learn that from `ct`. A shed `LIVE` produces no error to
-either side, because the next beat is twenty seconds away and a lost beat is
-indistinguishable from a slow one.
+Backpressure sheds `LIVE` rather than queueing it, and sheds it silently. This is
+the whole reason it must be a frame: the shed decision is made on a bounded queue
+by a relay that has to know it is allowed to drop this one, and it cannot learn
+that from `ct`. A shed `LIVE` produces no error to either side, because the next
+beat is twenty seconds away and a lost beat is indistinguishable from a slow one.
+
+One thing precedes the shed, and only one: a downgrade already owed to that
+subscriber from an earlier round. The debt is discharged at the first opportunity
+of any kind, ephemeral included, rather than waiting for the next durable frame.
+A subscriber whose queue fills and then drains would otherwise never be told if
+no further durable write ever came: the notice stays pending, the subscriber goes
+on receiving beats and calls as though it were live, and `disconnect` destroys it
+undelivered. An undeclared hole in an author chain is a security alarm on
+somebody else's screen (`specs/backend/relay/operations.md`), which outranks the
+queue slot the notice costs. A beat every twenty seconds is that opportunity.
+Shedding still never spends a slot on the beat itself, which is the invariant
+this ordering protects: what goes out ahead of it is durable state the subscriber
+is already owed, never the ephemeral frame.
 
 ### Version negotiation
 

@@ -660,6 +660,23 @@ async fn a_group_mismatch_names_the_denial_class_rather_than_a_quota() {
     assert_eq!(JoinRefusal::TooManyCalls.code(), ErrorCode::RateLimited);
     assert_eq!(JoinRefusal::CallFull.code(), ErrorCode::RateLimited);
 
+    // And the class is kept by the interval as well as by the code. A `quota` answer
+    // is defined as "retry after the named interval", and one that named none was an
+    // answer a client could not act on: the Android client drops a non-terminal error
+    // with no interval, so a call refused by a full instance or a full call rang out
+    // its whole ringing timeout and then reported no answer. A `denied` still names
+    // none, because it will be refused identically forever.
+    assert_eq!(JoinRefusal::GroupMismatch.retry_after(), None);
+    assert_eq!(JoinRefusal::TooManyCalls.retry_after(), Some(5));
+    assert_eq!(JoinRefusal::CallFull.retry_after(), Some(5));
+    for refusal in [JoinRefusal::TooManyCalls, JoinRefusal::CallFull] {
+        assert_eq!(refusal.code(), ErrorCode::RateLimited);
+        assert!(
+            refusal.retry_after().is_some(),
+            "every quota refusal names an interval"
+        );
+    }
+
     // And the detail names the lever the operator or the user can act on.
     assert_eq!(JoinRefusal::GroupMismatch.detail(16), 0);
     assert_eq!(JoinRefusal::TooManyCalls.detail(16), 16);

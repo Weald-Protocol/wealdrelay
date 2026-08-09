@@ -430,7 +430,7 @@ async fn a_full_queue_sheds_a_beat_silently_and_never_downgrades() {
         "step-30",
         "saturation.txt",
         &format!(
-            "# Shedding under saturation\n\nspecs/backend/relay/presence.md. A subscriber's queue is filled to its bound\n({SEND_QUEUE_BOUND} durable frames), then one LIVE frame is fanned out to it.\n\nshed              {}\ndowngrades        {}\ndurable delivered {SEND_QUEUE_BOUND}\n\nA shed beat does not set downgrade_owed and does not move the downgrade counter.\nA downgrade is a claim about durable state: it tells a client it has a hole in an\nauthor chain and must reconcile. A beat is not durable and the next one is 20\nseconds away, so shedding is silent to the client and visible only to the\noperator, here.\n",
+            "# Shedding under saturation\n\nspecs/backend/relay/presence.md. A subscriber's queue is filled to its bound\n({SEND_QUEUE_BOUND} durable frames), then one LIVE frame is fanned out to it.\n\nshed              {}\ndowngrades        {}\ndurable delivered {SEND_QUEUE_BOUND}\n\nA shed beat does not set downgrade_owed and does not move the downgrade counter.\nA downgrade is a claim about durable state: it tells a client it has a hole in an\nauthor chain and must reconcile. A beat is not durable and the next one is 20\nseconds away, so shedding is silent to the client and visible only to the\noperator, here.\n\nOrdering: a downgrade already owed from an earlier round is discharged ahead of\nthe shed, at the first opportunity of any kind. That is durable state the\nsubscriber is already entitled to, and a notice that waited for the next durable\nframe was never delivered at all when none followed. The beat itself is still\nnever queued, which is the invariant the ordering protects.\n",
             hub.shed(),
             hub.downgrades()
         ),
@@ -438,9 +438,12 @@ async fn a_full_queue_sheds_a_beat_silently_and_never_downgrades() {
 }
 
 #[tokio::test]
-async fn a_beat_is_shed_ahead_of_an_owed_downgrade_rather_than_taking_its_slot() {
-    // Shedding is first, before anything owed. A beat that queued the downgrade
-    // frame on its way past would have spent a durable slot on an ephemeral frame.
+async fn a_beat_discharges_an_owed_downgrade_before_it_is_shed() {
+    // The debt goes out ahead of the beat, and the beat is still shed rather than
+    // queued. Both halves matter: an owed downgrade is durable state the subscriber
+    // is already entitled to, so it takes the first slot of any kind that appears
+    // (`specs/backend/relay/presence.md`), while the ephemeral frame that created
+    // the opportunity never spends a slot of its own.
     let hub = Hub::new();
     let (sender, mut receiver) = outbound_channel();
     let id = hub.connect();
@@ -457,18 +460,88 @@ async fn a_beat_is_shed_ahead_of_an_owed_downgrade_rather_than_taking_its_slot()
         vec![(id, Delivery::Downgraded)]
     );
 
+    // With no room at all, the beat round reports the debt rather than the shed:
+    // there was no slot for the notice either, so nothing was discharged and the
+    // subscriber is still owed one.
+    assert_eq!(
+        hub.fanout_frame(&group(1), &beat(&group(1)), writer_id, 2)
+            .await,
+        vec![(id, Delivery::Downgraded)]
+    );
+
+    // Drain one slot and beat again. Now the notice fits, so it goes out, and the
+    // beat that carried the opportunity is shed rather than taking the slot it
+    // just freed for itself.
+    assert_eq!(pushed(&mut receiver), envelope(0));
     assert_eq!(
         hub.fanout_frame(&group(1), &beat(&group(1)), writer_id, 2)
             .await,
         vec![(id, Delivery::Shed)]
     );
-
-    // Drain one slot and fan out a durable envelope: the owed downgrade goes out
-    // first, exactly as it would have without the beat in between.
-    assert_eq!(pushed(&mut receiver), envelope(0));
-    hub.fanout(&group(1), &envelope(201), writer_id).await;
     for seed in 1..SEND_QUEUE_BOUND {
         assert_eq!(pushed(&mut receiver), envelope(seed as u8));
     }
     downgrade(&mut receiver, &group(1));
+
+    // And the debt is settled: a further beat is an ordinary shed with nothing
+    // owed behind it.
+    hub.fanout(&group(1), &envelope(201), writer_id).await;
+    assert_eq!(pushed(&mut receiver), envelope(201));
+}
+
+#[tokio::test]
+async fn an_owed_downgrade_is_discharged_by_a_beat_when_no_envelope_follows() {
+    // The regression: the owed downgrade used to be attempted only ahead of the next
+    // *durable* frame, and the ephemeral arm took an early exit before it. So a
+    // subscriber whose queue filled and then drained was never told it had a hole for
+    // as long as its group had no further write, went on receiving beats as though it
+    // were live, and lost the notice entirely when `disconnect` dropped its entry. An
+    // undeclared hole in an author chain is a security alarm on somebody else's
+    // screen, so the debt is discharged at the first opportunity of any kind.
+    let hub = Hub::new();
+    let (sender, mut receiver) = outbound_channel();
+    let id = hub.connect();
+    let writer_id = hub.connect();
+    hub.subscribe(&group(1), id, sender, 2).await;
+
+    for _ in 0..SEND_QUEUE_BOUND {
+        hub.fanout(&group(1), &envelope(1), writer_id).await;
+    }
+    assert_eq!(
+        hub.fanout(&group(1), &envelope(2), writer_id).await,
+        vec![(id, Delivery::Downgraded)]
+    );
+    assert_eq!(hub.downgrades(), 1);
+
+    // The client catches up on everything it was sent. Its queue is now empty, it is
+    // missing one envelope, and it has been told nothing.
+    let mut drained = 0;
+    while receiver.try_recv().is_ok() {
+        drained += 1;
+    }
+    assert_eq!(drained, SEND_QUEUE_BOUND);
+
+    // No further envelope is ever published to this group. The only traffic is a beat.
+    let outcomes = hub
+        .fanout_frame(&group(1), &beat(&group(1)), writer_id, 2)
+        .await;
+    assert_eq!(outcomes, vec![(id, Delivery::Sent)]);
+
+    // The downgrade goes first, then the beat: the client learns it must reconcile
+    // before it reads anything that would look like a live stream.
+    downgrade(&mut receiver, &group(1));
+    match receiver.try_recv().expect("the beat is queued") {
+        Outbound::Frame(Frame::Live { group: at, .. }) => assert_eq!(at, group(1)),
+        other => panic!("expected the beat, got {other:?}"),
+    }
+    assert!(receiver.try_recv().is_err());
+
+    // And the debt is settled: a second beat is not preceded by a second downgrade.
+    hub.fanout_frame(&group(1), &beat(&group(1)), writer_id, 2)
+        .await;
+    match receiver.try_recv().expect("the second beat is queued") {
+        Outbound::Frame(Frame::Live { .. }) => {}
+        other => panic!("the downgrade was sent twice: {other:?}"),
+    }
+    assert_eq!(hub.downgrades(), 1);
 }

@@ -82,9 +82,32 @@ fn media(id: &[u8], seq: u64) -> Frame {
 /// an HTTP response rather than a socket: `Client::upgrade` asserts a 101 and
 /// this test is about the case where there is not one.
 async fn upgrade_status(address: std::net::SocketAddr) -> String {
-    let mut stream = tokio::net::TcpStream::connect(address)
-        .await
-        .expect("connect");
+    let (_, response) = upgrade_from(address, "127.0.0.1".parse().expect("source")).await;
+    response
+}
+
+/// Upgrade from a chosen loopback source and keep the socket open. The source is
+/// part of this adversarial proof: BR-032 is an attack by one source continuously
+/// replacing unauthenticated sockets, not merely a small global-cap configuration.
+async fn upgrade_from(
+    address: std::net::SocketAddr,
+    source: std::net::IpAddr,
+) -> (tokio::net::TcpStream, String) {
+    let socket = match source {
+        std::net::IpAddr::V4(_) => tokio::net::TcpSocket::new_v4().expect("IPv4 socket"),
+        std::net::IpAddr::V6(_) => tokio::net::TcpSocket::new_v6().expect("IPv6 socket"),
+    };
+    socket
+        .bind(std::net::SocketAddr::new(source, 0))
+        .unwrap_or_else(|error| {
+            panic!(
+                "bind source {source}: {error}\n\
+                 On macOS every loopback address above 127.0.0.1 needs an alias:\n\
+                 \x20   sudo ifconfig lo0 alias {source} up\n\
+                 It does not survive a reboot. `scripts/weald-stack up` reports the set."
+            )
+        });
+    let mut stream = socket.connect(address).await.expect("connect");
     let host = stream.peer_addr().expect("a peer address");
     let request = format!(
         "GET /relay HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
@@ -102,7 +125,7 @@ async fn upgrade_status(address: std::net::SocketAddr) -> String {
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buffer).into_owned()
+    (stream, String::from_utf8_lossy(&buffer).into_owned())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -181,6 +204,42 @@ async fn the_relay_refuses_a_connection_past_its_cap_and_takes_it_back_when_one_
     third
         .handshake_as(&other_device(), vec![group.clone()], CLOCK)
         .await;
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_unauthenticated_source_cannot_reserve_the_connection_table() {
+    // BR-032: the source share applies before AUTH, and is released only once the
+    // socket becomes a legitimate session. With a cap of four, one source gets one
+    // pre-authentication slot, leaving capacity for an unrelated address.
+    let scratch = Scratch::new("br032_source_share").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let mut config = config_for_calls(&scratch, blobs.path(), 4);
+    config.max_connections = wealdrelay::config::Limit::Of(4);
+    config.handshake_timeout_ms = 600_000;
+    let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
+
+    let attacker: std::net::IpAddr = "127.0.0.1".parse().expect("attacker source");
+    let member: std::net::IpAddr = "127.0.0.2".parse().expect("member source");
+    let (_first, first_response) = upgrade_from(relay.address, attacker).await;
+    assert!(
+        first_response.starts_with("HTTP/1.1 101"),
+        "{first_response}"
+    );
+
+    let (_replacement, replacement_response) = upgrade_from(relay.address, attacker).await;
+    assert!(
+        replacement_response.starts_with("HTTP/1.1 503"),
+        "one source was allowed to take another pre-authentication slot: {replacement_response}"
+    );
+
+    let (_member, member_response) = upgrade_from(relay.address, member).await;
+    assert!(
+        member_response.starts_with("HTTP/1.1 101"),
+        "an unrelated source was denied the reserved capacity: {member_response}"
+    );
 
     relay.shutdown().await;
     scratch.drop_database().await;

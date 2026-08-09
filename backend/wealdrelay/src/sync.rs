@@ -63,18 +63,50 @@ const SYNC_PUSH_BYTES: usize = crate::ws::SEND_QUEUE_BYTE_BUDGET - crate::frame:
 /// At least one, always: a single envelope larger than the allowance still has to be
 /// sendable, and `ws::try_queue` takes one frame of any size against an empty queue
 /// for the same reason.
-fn fits_in_budget<T>(items: &[T], cost: impl Fn(&T) -> usize) -> usize {
+fn fits_in_budget<T>(items: &[T], allowance: usize, cost: impl Fn(&T) -> usize) -> usize {
+    if allowance == 0 {
+        // No room at all, which is a queue that already holds a replay or a backlog
+        // rather than a client this batch can serve. Nothing is taken, and the
+        // acknowledgement the client already has names a head beyond what arrived.
+        return 0;
+    }
     let mut spent = 0usize;
     let mut taken = 0usize;
     for item in items {
         let next = spent.saturating_add(cost(item));
-        if taken > 0 && next > SYNC_PUSH_BYTES {
+        if taken > 0 && next > allowance {
             break;
         }
         spent = next;
         taken += 1;
     }
     taken
+}
+
+/// How many push frames may be queued now, against what the queue already holds.
+///
+/// The two constants above describe an empty queue, and by the time a batch is built
+/// the queue is not empty: `subscribe` has queued the `SUB_ACK` and then the group's
+/// entire MLS replay through `queue_all_awaiting`, which by design leaves up to the
+/// whole bound outstanding. A batch built to the constants was then handed to
+/// `queue_all`, which treats a full queue as a client that has stopped reading and
+/// ends the connection, so a group with a large handshake log was unsubscribable for
+/// any client even slightly behind, identically on every reconnect. Truncating is
+/// what `specs/backend/relay/operations.md` asks for ("cut to fit that budget rather
+/// than built to the frame count and then refused"), and it is safe here because the
+/// acknowledgement already carries a head beyond what arrives.
+///
+/// One slot and one frame's bytes are held back for the `SUB_ACK` or `RECON` that
+/// closes the round, for the reason `SYNC_PUSH_BYTES` gives.
+fn push_frame_allowance(sender: &crate::ws::OutboundSender) -> usize {
+    sender.free_slots().saturating_sub(1).min(SYNC_PUSH_LIMIT)
+}
+
+fn push_byte_allowance(sender: &crate::ws::OutboundSender) -> usize {
+    crate::ws::SEND_QUEUE_BYTE_BUDGET
+        .saturating_sub(sender.queued_bytes())
+        .saturating_sub(crate::frame::MAX_FRAME_BYTES)
+        .min(SYNC_PUSH_BYTES)
 }
 
 /// Reopen every span holding an omitted id as a fingerprint.
@@ -168,8 +200,9 @@ pub async fn reconcile(
     //
     // The frame count is the first cut and it also bounds the read below. The second
     // cut is by size and cannot be made until the envelopes are in hand.
-    let mut omitted: Vec<negentropy::Id> = if response.push.len() > SYNC_PUSH_LIMIT {
-        response.push.split_off(SYNC_PUSH_LIMIT)
+    let frame_allowance = push_frame_allowance(sender);
+    let mut omitted: Vec<negentropy::Id> = if response.push.len() > frame_allowance {
+        response.push.split_off(frame_allowance)
     } else {
         Vec::new()
     };
@@ -192,7 +225,7 @@ pub async fn reconcile(
     // The frame's own cost, measured as the empty frame plus its payload rather than
     // by building the frame: the allowance is spent on the envelope bytes and the rest
     // is the header allowance `Frame::queued_bytes` already accounts for.
-    let sendable = fits_in_budget(&envelopes, |(_, bytes)| {
+    let sendable = fits_in_budget(&envelopes, push_byte_allowance(sender), |(_, bytes)| {
         Frame::Push {
             envelope: Vec::new(),
         }
@@ -312,8 +345,11 @@ pub async fn subscribe(
     // what arrives, and the client reconciles for the rest.
     match log::since(database.pool(), &group, from_seq).await {
         Ok(envelopes) => {
-            let mut envelopes: Vec<Vec<u8>> = envelopes.into_iter().take(SYNC_PUSH_LIMIT).collect();
-            let sendable = fits_in_budget(&envelopes, |bytes| {
+            let mut envelopes: Vec<Vec<u8>> = envelopes
+                .into_iter()
+                .take(push_frame_allowance(sender))
+                .collect();
+            let sendable = fits_in_budget(&envelopes, push_byte_allowance(sender), |bytes| {
                 Frame::Push {
                     envelope: Vec::new(),
                 }

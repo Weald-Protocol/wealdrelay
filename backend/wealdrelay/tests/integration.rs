@@ -212,7 +212,8 @@ async fn an_applied_migration_that_has_since_been_edited_is_refused() {
             "0007_lifecycle".to_string(),
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
-            "0010_envelope_budget".to_string()
+            "0010_envelope_budget".to_string(),
+            "0011_bootstrap_handoff".to_string()
         ]
     );
 
@@ -1109,7 +1110,8 @@ async fn a_pool_the_caller_already_holds_can_be_wrapped_and_used() {
             "0007_lifecycle".to_string(),
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
-            "0010_envelope_budget".to_string()
+            "0010_envelope_budget".to_string(),
+            "0011_bootstrap_handoff".to_string()
         ]
     );
     // The same pool, and not a copy of the configuration that opened another one.
@@ -1302,7 +1304,8 @@ async fn a_transaction_that_cannot_be_committed_is_reported_and_not_assumed() {
             "0007_lifecycle".to_string(),
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
-            "0010_envelope_budget".to_string()
+            "0010_envelope_budget".to_string(),
+            "0011_bootstrap_handoff".to_string()
         ]
     );
 
@@ -1507,9 +1510,9 @@ async fn the_bootstrap_workspace_is_derived_from_the_relays_own_hostname() {
 /// read a 404 against a real relay.
 ///
 /// Four things are asserted together because they are one contract: the route is
-/// on the private listener and not the public one, it refuses a request with no
-/// bearer and one with the wrong bearer, it answers the right shape with the right
-/// one, and the number it reports is the number the store reports.
+/// served on both listeners, it refuses a request with no bearer and one with the
+/// wrong bearer on each of them, it answers the right shape with the right one,
+/// and the number it reports is the number the store reports.
 #[tokio::test]
 async fn the_operator_route_answers_the_admitted_count_and_refuses_everyone_else() {
     let scratch = Scratch::new("admitted_route").await;
@@ -1526,10 +1529,32 @@ async fn the_operator_route_answers_the_admitted_count_and_refuses_everyone_else
         let _ = wait.await;
     }));
 
-    // Not on the public listener. The roster size is not a fact for the internet:
-    // `server.md` keeps the public listener to liveness and nothing else.
+    // On the public listener too, and behind the same bearer there. `server.md`
+    // corrects an earlier draft that pinned this to the private listener: the
+    // control plane does not run in every region it provisions into, so it cannot
+    // resolve the private name and read unreachable as absent. The bearer was
+    // always the security boundary and still is, so what the internet gets without
+    // one is a refusal rather than a count.
     let (status, _) = get(&format!("http://{public_address}/admitted")).await;
-    assert_eq!(status, 404, "the public listener served the admitted count");
+    assert_eq!(
+        status, 401,
+        "the public listener served the admitted count unauthenticated"
+    );
+    let (status, _) = get_with_bearer(
+        &format!("http://{public_address}/admitted"),
+        "operator-token-value-0123456780",
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "a wrong token of the right length was accepted on the public listener"
+    );
+    let (status, body) = get_with_bearer(
+        &format!("http://{public_address}/admitted"),
+        "operator-token-value-0123456789",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
 
     // Provider-private is a network boundary, not an authentication boundary.
     let (status, _) = get(&format!("http://{private_address}/admitted")).await;

@@ -22,7 +22,22 @@ use crate::health::RelayState;
 use crate::session::Session;
 use crate::ws::{authorize_group, queue_all};
 
-use super::{CallKind, CALL_ID_BYTES, CALL_PROTOCOL_VERSION, STREAM_BYTES};
+use super::{CallKind, JoinRefusal, CALL_ID_BYTES, CALL_PROTOCOL_VERSION, STREAM_BYTES};
+
+/// One refusal, as the frame a client is answered with.
+///
+/// One function rather than the same three lines at each site, because the two
+/// sites answer with the same shape and drifted once already: the quota arms
+/// carried a limit and no interval, which is a `quota` answer a client cannot act
+/// on. See ``JoinRefusal::retry_after``.
+fn refusal_error(state: &Arc<RelayState>, refusal: JoinRefusal) -> FrameError {
+    let error = FrameError::new(refusal.code())
+        .detail(refusal.detail(state.calls.max_concurrent()).to_be_bytes());
+    match refusal.retry_after() {
+        Some(seconds) => error.retry_after(seconds),
+        None => error,
+    }
+}
 
 /// One call signalling frame.
 ///
@@ -59,12 +74,7 @@ pub async fn publish_call(
             .join(&call_id, &group, connection, sender.clone())
             .await
         {
-            return queue_all(
-                sender,
-                vec![Frame::Error(FrameError::new(refusal.code()).detail(
-                    refusal.detail(state.calls.max_concurrent()).to_be_bytes(),
-                ))],
-            );
+            return queue_all(sender, vec![Frame::Error(refusal_error(state, refusal))]);
         }
     } else {
         // The same call id check the joining kinds get, and for a sharper reason.
@@ -77,12 +87,7 @@ pub async fn publish_call(
         if let Some(open) = state.calls.group_of(&call_id).await {
             if open != group {
                 let refusal = super::JoinRefusal::GroupMismatch;
-                return queue_all(
-                    sender,
-                    vec![Frame::Error(FrameError::new(refusal.code()).detail(
-                        refusal.detail(state.calls.max_concurrent()).to_be_bytes(),
-                    ))],
-                );
+                return queue_all(sender, vec![Frame::Error(refusal_error(state, refusal))]);
             }
         }
         // Leaving a call you were not in is still not an error: a client that

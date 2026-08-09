@@ -276,10 +276,17 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     // upgrade is not fast enough on every machine for four serial connections to
     // land inside any deadline short enough to be worth waiting for, and an
     // attacker opening sockets does not take turns either.
+    // Each from its own source. BR-032 gives one source a quarter of a finite
+    // table before it authenticates, so four sockets from `127.0.0.1` is the
+    // attack that control refuses rather than the full table this test needs.
+    // The claim here is about deadlines returning slots, not about the share.
     let mut opening = Vec::new();
-    for _ in 0..4 {
+    for index in 0..4u8 {
         let address = relay.address;
-        opening.push(tokio::spawn(async move { Client::connect(address).await }));
+        let source = std::net::IpAddr::from([127, 0, 0, index + 1]);
+        opening.push(tokio::spawn(async move {
+            Client::connect_from(address, source).await
+        }));
     }
     let mut silent = Vec::new();
     for handle in opening {

@@ -305,27 +305,18 @@ impl Hub {
                     outcomes.push((subscriber.id, Delivery::NotSpoken));
                     continue;
                 }
-                if ephemeral {
-                    // Shed first, before anything owed and before any durable
-                    // frame. A beat is worth less than the queue slot it would take
-                    // from an envelope, and the next one is 20 seconds away.
-                    let delivery = match try_queue(&subscriber.sender, frame.clone()) {
-                        Queued::Sent => Delivery::Sent,
-                        Queued::Full => {
-                            self.shed.fetch_add(1, Ordering::Relaxed);
-                            Delivery::Shed
-                        }
-                        Queued::Closed => {
-                            gone.push(subscriber.id);
-                            Delivery::Gone
-                        }
-                    };
-                    outcomes.push((subscriber.id, delivery));
-                    continue;
-                }
-                // A downgrade owed from an earlier round goes out first, ahead of
-                // anything this subscriber might otherwise read as a complete live
-                // stream. Only once it has been queued is the subscriber live again.
+                // A downgrade owed from an earlier round goes out before anything
+                // else this subscriber might read as a complete live stream, and that
+                // includes an ephemeral frame. It used to be attempted only ahead of
+                // the next durable frame, which meant a subscriber whose queue filled
+                // and then drained was never told: a group with no further write kept
+                // the notice pending forever, the subscriber went on receiving beats
+                // and calls as though it were live, and `disconnect` destroyed the
+                // notice undelivered. An undeclared hole in an author chain is a
+                // security alarm on somebody else's screen
+                // (`specs/backend/relay/operations.md`), so the debt is discharged at
+                // the first opportunity of any kind. A beat every twenty seconds is
+                // that opportunity.
                 if subscriber.downgrade_owed {
                     match try_queue(&subscriber.sender, downgrade_frame(group)) {
                         Queued::Sent => subscriber.downgrade_owed = false,
@@ -339,6 +330,24 @@ impl Hub {
                             continue;
                         }
                     }
+                }
+                if ephemeral {
+                    // Shed rather than queued when there is no room. A beat is worth
+                    // less than the queue slot it would take from an envelope, and the
+                    // next one is 20 seconds away.
+                    let delivery = match try_queue(&subscriber.sender, frame.clone()) {
+                        Queued::Sent => Delivery::Sent,
+                        Queued::Full => {
+                            self.shed.fetch_add(1, Ordering::Relaxed);
+                            Delivery::Shed
+                        }
+                        Queued::Closed => {
+                            gone.push(subscriber.id);
+                            Delivery::Gone
+                        }
+                    };
+                    outcomes.push((subscriber.id, delivery));
+                    continue;
                 }
                 let delivery = match try_queue(&subscriber.sender, frame.clone()) {
                     Queued::Sent => Delivery::Sent,

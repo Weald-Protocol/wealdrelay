@@ -193,6 +193,29 @@ pub fn reminder(hostname: &str, token: &[u8], fingerprint: &[u8]) -> String {
     )
 }
 
+/// What an operator reads on a hosted relay's first run.
+///
+/// The fingerprint and nothing else, which is the whole of `server.md`'s "prints
+/// only those non-secret fingerprints". A fingerprint is a public key's fingerprint:
+/// publishing it grants nobody anything and its entire purpose is to be compared out
+/// of band, so it is the one value that belongs in a log an operator can read.
+///
+/// The link and the code are both absent, and absent for different reasons. The link
+/// half is claimed once by the buyer's browser and the code half is mailed to their
+/// verified address; a copy on this relay's stdout would be a third copy, in a place
+/// neither of them chose, held by the party the two-channel split exists to exclude.
+pub fn sealed_banner(hostname: &str, fingerprint: &[u8]) -> String {
+    format!(
+        "weald: this workspace has no members yet.\n\
+         weald:   relay        {hostname}\n\
+         weald:   genesis key  {fingerprint}\n\
+         weald: the enrollment link and the one-time code were sealed to the\n\
+         weald: handoff key and are not printed here. They reach the buyer through\n\
+         weald: the dashboard and their verified email, on purpose.",
+        fingerprint = hex(fingerprint),
+    )
+}
+
 /// Mint the bootstrap invite if this relay has never had one, otherwise say so.
 ///
 /// Idempotent, and idempotent in the direction that matters: a relay that has been

@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::{collections::HashMap, sync::Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -259,6 +260,14 @@ pub struct RelayState {
     /// caller that should ever wait for a slot. A relay at its ceiling refuses now
     /// rather than holding a request open until somebody else leaves.
     pub connections: std::sync::atomic::AtomicUsize,
+    /// Pre-authentication connection counts by a process-local, keyed hash of the
+    /// transport source. The address never leaves this map as plaintext and every
+    /// entry is removed as soon as its socket authenticates or closes.
+    unauthenticated_connections_by_source: Mutex<HashMap<[u8; 32], usize>>,
+    /// Key for `unauthenticated_connections_by_source`, generated at startup and
+    /// deliberately not shared with the invite source-hash salt or any persisted
+    /// data.
+    unauthenticated_connection_source_key: [u8; 32],
     /// How many connections were refused because the cap was reached. An operator
     /// counter with no label: capacity, never identity.
     pub connections_refused: std::sync::atomic::AtomicU64,
@@ -313,6 +322,8 @@ impl RelayState {
             send_budget,
             calls: crate::calls::CallRegistry::new(max_concurrent_calls),
             connections: std::sync::atomic::AtomicUsize::new(0),
+            unauthenticated_connections_by_source: Mutex::new(HashMap::new()),
+            unauthenticated_connection_source_key: random_secret(),
             connections_refused: std::sync::atomic::AtomicU64::new(0),
             handshake_deadline_closes: std::sync::atomic::AtomicU64::new(0),
             idle_deadline_closes: std::sync::atomic::AtomicU64::new(0),
@@ -326,18 +337,28 @@ impl RelayState {
     /// The check and the increment are one `fetch_update`, so two sockets arriving
     /// in the same instant cannot both be told there was room for the last slot.
     /// That is the whole reason this is not a read followed by an add.
-    pub fn admit_connection(&self) -> bool {
+    pub fn admit_connection(&self, source: Option<&str>) -> bool {
         use std::sync::atomic::Ordering;
 
-        let ceiling = match self.config.max_connections {
-            crate::config::Limit::Unlimited => {
-                return {
-                    self.connections.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-            }
-            crate::config::Limit::Of(value) => usize::try_from(value).unwrap_or(usize::MAX),
+        let Some(ceiling) = self.connection_ceiling() else {
+            self.connections.fetch_add(1, Ordering::Relaxed);
+            return true;
         };
+        // A source may occupy at most one quarter of a finite connection table
+        // before it authenticates. This leaves at least three quarters for other
+        // sources while an attacker continuously replaces handshake-expired
+        // sockets. The share is a pre-authentication control only: it is released
+        // on `AUTH_ACK`, so a NAT cannot cap its own authenticated users.
+        let source_ceiling = (ceiling / 4).max(1);
+        let source = self.connection_source(source);
+        let mut sources = self
+            .unauthenticated_connections_by_source
+            .lock()
+            .expect("unauthenticated source counter lock");
+        if sources.get(&source).copied().unwrap_or(0) >= source_ceiling {
+            self.connections_refused.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         let taken = self
             .connections
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
@@ -345,8 +366,43 @@ impl RelayState {
             });
         if taken.is_err() {
             self.connections_refused.fetch_add(1, Ordering::Relaxed);
+        } else {
+            *sources.entry(source).or_insert(0) += 1;
         }
         taken.is_ok()
+    }
+
+    /// Release the temporary pre-authentication source share after `AUTH_ACK` or
+    /// when a socket ends before it can authenticate.
+    pub fn release_unauthenticated_connection(&self, source: Option<&str>) {
+        let Some(_) = self.connection_ceiling() else {
+            return;
+        };
+        let source = self.connection_source(source);
+        let mut sources = self
+            .unauthenticated_connections_by_source
+            .lock()
+            .expect("unauthenticated source counter lock");
+        let Some(count) = sources.get_mut(&source) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            sources.remove(&source);
+        }
+    }
+
+    fn connection_ceiling(&self) -> Option<usize> {
+        match self.config.max_connections {
+            crate::config::Limit::Unlimited => None,
+            crate::config::Limit::Of(value) => Some(usize::try_from(value).unwrap_or(usize::MAX)),
+        }
+    }
+
+    fn connection_source(&self, source: Option<&str>) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_keyed(&self.unauthenticated_connection_source_key);
+        hasher.update(source.unwrap_or("unknown").as_bytes());
+        *hasher.finalize().as_bytes()
     }
 
     /// Give one connection slot back. Called exactly once per successful
@@ -570,12 +626,112 @@ fn random_secret() -> [u8; 32] {
 /// `/healthz` that failed then would make an orchestrator restart a process that
 /// has nothing wrong with it while the actual fault is elsewhere.
 pub fn public_router(state: Arc<RelayState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/relay", get(relay_socket))
         .route("/join/:token", get(join_page))
-        .merge(crate::media::http::routes())
-        .with_state(state)
+        .merge(crate::media::http::routes());
+    let router = mount_handoff(router, &state);
+    // `/admitted` on the public listener as well, for exactly the reason the
+    // handoff route moved: it is asked cross-region by a control plane that cannot
+    // resolve the private name, and `renderAdmittedPrincipals` answers 1 rather
+    // than a count when it cannot ask. Still mounted only where the operator token
+    // exists, still checked by the same constant-time comparison, and still
+    // reporting a number and nothing else.
+    let router = match state.config.operator_token.clone() {
+        Some(token) => router.route(
+            "/admitted",
+            get(admitted).layer(axum::Extension(OperatorToken(token))),
+        ),
+        None => router,
+    };
+    router.with_state(state)
+}
+
+/// Mount `GET /handoff/<derived>`, or do not.
+///
+/// Mounted only where both a handoff public key and an operator token are set,
+/// which is the hosted shape and only the hosted shape. A self-hoster has no
+/// control plane, nothing that would ever call this, and no token to authenticate
+/// it with, so the honest answer to a request for it there is 404 rather than a
+/// route that exists and refuses everything. This is the same conditional-mount
+/// rule `/admitted` follows and for the same reason: a misread variable name means
+/// the route is absent and the provisioner fails loudly, rather than present and
+/// open.
+///
+/// ## Why the public listener
+///
+/// `server.md` originally pinned this to the private observability listener, on the
+/// argument that a ciphertext is safer on a port the internet cannot reach. That was
+/// right about the port and wrong about the topology. The private listener is
+/// per-region provider-private networking, and the control plane does not run in
+/// every region it provisions into, so `renderHandoffBlob` cannot reach it and reads
+/// unreachable as absent: `POST /instances/:id/bootstrap` then answers
+/// `instance_not_operable` for ever and the customer's relay, up and certificated,
+/// is destroyed and refunded at the deadline. A blob nobody can fetch is not a
+/// safer blob, it is a broken product.
+///
+/// Moving it to the public listener costs nothing the design was relying on. What is
+/// served is a ciphertext openable only by a key held in another system, the path is
+/// derived from that key rather than from anything guessable, and the request must
+/// still carry the operator bearer. The private listener was never the security
+/// boundary; `operator_authorized` was, and it still is.
+fn mount_handoff(
+    router: Router<Arc<RelayState>>,
+    state: &Arc<RelayState>,
+) -> Router<Arc<RelayState>> {
+    let (Some(configured), Some(token)) = (
+        state.config.bootstrap_handoff_pubkey.as_deref(),
+        state.config.operator_token.clone(),
+    ) else {
+        return router;
+    };
+    let Ok(key) = crate::invite::handoff::parse_public_key(configured) else {
+        // An unusable key is already fatal to the mint (`serve::bootstrap`), so this
+        // relay has no genesis and nothing to serve. Refusing to derive a path from
+        // a value that is not a key keeps the two decisions consistent rather than
+        // mounting a route that could only ever 404.
+        return router;
+    };
+    router.route(
+        &crate::invite::handoff::handoff_path(&key),
+        get(handoff).layer(axum::Extension(OperatorToken(token))),
+    )
+}
+
+/// `GET /handoff/<derived>`: the sealed bootstrap handoff, or 404.
+///
+/// Reading does not consume. The control plane polls this while it waits for a relay
+/// to finish coming up, and a read that spent the invite would destroy it before the
+/// buyer ever saw it; redemption remains the one-time operation and it happens over
+/// the socket, not here.
+///
+/// 404 before anything has been sealed, which is the state between a relay accepting
+/// connections and its first boot completing the mint, and also the permanent state
+/// of a relay whose mint failed. The control plane treats both as "not operable yet"
+/// and retries, which is correct for the first and is resolved by a restart against
+/// an empty database for the second.
+async fn handoff(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    };
+    let workspace = crate::serve::bootstrap_workspace(&state.config.hostname);
+    match crate::invite::handoff::read(database.pool(), &workspace).await {
+        Ok(Some(sealed)) => (StatusCode::OK, axum::Json(sealed)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no sealed handoff\n").into_response(),
+        // 503 rather than 404 when the database could not answer. The caller reads
+        // 404 as "nothing was ever sealed", which for an instance that did seal one
+        // is a wrong answer rather than an unavailable one, and the difference is
+        // whether it retries or gives up on a relay that is fine.
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response(),
+    }
 }
 
 /// The invite landing page, at the path the first-run banner prints.
@@ -629,7 +785,7 @@ async fn relay_socket(
     // 503 with `Retry-After`, which is the transport's own way of saying what
     // `quota` says in a frame. There is no frame to say it in: the socket does not
     // exist yet.
-    if !state.admit_connection() {
+    if !state.admit_connection(source.as_deref()) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "5")],

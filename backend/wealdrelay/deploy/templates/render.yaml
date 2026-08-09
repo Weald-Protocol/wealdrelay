@@ -28,6 +28,12 @@ services:
       mountPath: /var/lib/wealdrelay/blobs
       sizeGB: 10
     envVars:
+      # The public hosted template must not inherit the self-host migration
+      # defaults, which permit plaintext envelopes.
+      - key: WEALD_RELAY_PROFILE
+        value: hosted
+      - key: WEALD_RELAY_MIN_ENC
+        value: mls
       - key: WEALD_RELAY_HOSTNAME
         # Render substitutes the service's own hostname, so the one-click path
         # has nothing at all to fill in.

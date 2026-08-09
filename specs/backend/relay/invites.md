@@ -149,13 +149,22 @@ reservation is what makes it admissible. Everything that would otherwise be a
 session check is a property of the record instead, and the endpoint's single generic
 answer is what keeps it from being an oracle.
 
-Step 5's signature verification is **not yet implemented**, and it is named here
-rather than left to be discovered: the client fetches the sealed bundles and opens
-them, but does not yet fetch the signed record and verify that its issuer chains to
-the workspace trust root. Until it does, a client trusts the relay for which scopes
-an invite covers. A relay can shrink that list, which costs a joiner a channel it
-would have entered, and cannot widen it: a scope it invented has no bundle anybody
-can open, and the commit for it is refused against the record's own scope list.
+Step 5's signature verification is **implemented on every client**, and the two
+implementations answer identically: `InviteRedemption.fetchRecord` on macOS
+(`Sources/Sync/InviteRedemption.swift`) and `InviteRedemption.fetchRecord` on
+Android (`Android/app/src/main/java/team/weald/android/mls/InviteRedemption.kt`)
+both refuse a record whose stored bytes do not decode, whose `token` is not the
+token that was asked for, or whose issuer signature does not verify, and both
+answer that refusal the same way they answer a token the relay does not hold:
+with nothing. That sameness is deliberate. A client that told the two apart would
+be an oracle for which tokens exist, reachable by anybody who can open a socket,
+which is the property this whole endpoint is shaped around.
+
+The scope list therefore comes from the record and never from the relay's own
+answer. A relay can still shrink what it serves, which costs a joiner a channel it
+would have entered, and it cannot widen it: a scope it invented has no bundle
+anybody can open, and the commit for it is refused against the record's own scope
+list.
 
 4. **Local setup, then reserve.** Before spending an invite seat, the client
    generates its device key, collects a display name, and generates and confirms
@@ -201,6 +210,14 @@ can open, and the commit for it is refused against the record's own scope list.
    group's current epoch secret to the joiner's freshly generated recovery key,
    so recovery works from the first minute rather than from whenever an admin
    next happens to commit.
+
+   The client half of that rule, made explicit 2026-08-09 (register BR-027): a
+   scope entered by external commit is not a joined scope until the relay has
+   numbered the commit that carries it. Until then the joining device folds
+   nothing into its seal, writes no epoch secret to its group store, emits no
+   recovery wrap and reports the scope as still waiting, because a device that
+   recorded the join on its own word would be sealing to a group no other member
+   has it in and would look healthy while being invisible.
 
    The relay accepts an external commit only when its invite reservation is live,
    the committing device hash matches the reservation, and the group is one of

@@ -183,8 +183,29 @@ async fn a_durable_write_reaches_two_other_connections_once_and_in_order() {
         ));
     }
 
+    // Read past a repeat rather than forbidding one, because the relay does not
+    // promise there will not be one and this test used to assume it did.
+    //
+    // `sync::subscribe` acknowledges, then registers the connection in the hub,
+    // then reads the backfill. An envelope accepted between the registration and
+    // the query is deliberately delivered by both paths, and the comment there
+    // says so: the hash is a content address, so a client deduplicates without
+    // coordination, and `../../specs/backend/relay/migration.md` makes that a
+    // stated rule rather than an accident. Delivery is at least once.
+    //
+    // The old loop read exactly one push per reader per envelope and asserted it
+    // was the expected one. That passes only when the timing misses that window.
+    // It reproduced four times in twelve local runs and killed the 0.1.15 release,
+    // reading seq 1 a second time where seq 2 was expected, which looked like a
+    // fanout defect and was the relay behaving as specified.
+    //
+    // What is still asserted, and is the whole point of the test: both readers see
+    // both envelopes, with the relay's sequence numbers, and the writer is never
+    // echoed its own write. A relay that dropped one, reordered them, or echoed to
+    // the author still fails.
+    let mut expected = Vec::new();
     for (expected_seq, body) in [
-        (1, b"first multiplayer line".as_slice()),
+        (1u64, b"first multiplayer line".as_slice()),
         (2, b"second multiplayer line"),
     ] {
         let envelope = support::envelope_for(&group, body);
@@ -196,18 +217,38 @@ async fn a_durable_write_reaches_two_other_connections_once_and_in_order() {
         assert!(
             matches!(writer.recv_frame().await, Frame::SendAck { seq, .. } if seq == expected_seq)
         );
+        expected.push((expected_seq, envelope.hash.clone()));
+    }
 
-        for reader in [&mut first_reader, &mut second_reader] {
+    for reader in [&mut first_reader, &mut second_reader] {
+        let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Bounded by the work, not by a clock: two envelopes plus whatever repeats
+        // the subscription window produced, and a relay that sends neither runs out
+        // of attempts rather than hanging.
+        for _ in 0..(expected.len() * 4) {
+            if seen.len() == expected.len() {
+                break;
+            }
             match reader.recv_frame().await {
                 Frame::Push { envelope: bytes } => {
                     let pushed =
                         wealdrelay::envelope::Envelope::decode(&bytes).expect("a pushed envelope");
-                    assert_eq!(pushed.hash, envelope.hash);
-                    assert_eq!(pushed.seq, expected_seq);
+                    let arrived = (pushed.seq, pushed.hash.clone());
+                    // A repeat is allowed. Anything not written by this test is not.
+                    assert!(
+                        expected.contains(&arrived),
+                        "the relay pushed an envelope this test never wrote: {arrived:?}"
+                    );
+                    if !seen.contains(&arrived) {
+                        seen.push(arrived);
+                    }
                 }
-                other => panic!("expected ordered multiplayer push, got {other:?}"),
+                other => panic!("expected a multiplayer push, got {other:?}"),
             }
         }
+        // In the relay's order, first delivery of each, which is the claim that
+        // survives deduplication.
+        assert_eq!(seen, expected, "a reader did not see both writes in order");
     }
 
     relay.shutdown().await;

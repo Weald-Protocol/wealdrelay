@@ -231,8 +231,8 @@ is refused either way, and what is economised is the complaint.
 | max `MEDIA.ct` bytes | 1500 | `reject/envelope_too_large` | | 1500 |
 | `CALL` frames per connection per minute | 120 | `quota/rate_limited` | 60 | 120 |
 | max `CALL.body` bytes | 4096 | `reject/envelope_too_large` | | 4096 |
-| participants per call | 5 | `quota/rate_limited` | | 5 |
-| concurrent calls per instance | `WEALD_RELAY_MAX_CONCURRENT_CALLS` | `quota/rate_limited` | | the ceiling |
+| participants per call | 5 | `quota/rate_limited` | 5 | 5 |
+| concurrent calls per instance | `WEALD_RELAY_MAX_CONCURRENT_CALLS` | `quota/rate_limited` | 5 | the ceiling |
 | concurrent connections per instance | `WEALD_RELAY_MAX_CONNECTIONS` | HTTP 503 with `Retry-After` | | |
 
 One code for the three media limits and three different intervals, which is not
@@ -245,6 +245,21 @@ refused fifty-nine more times, which is the flood the once-a-second answer exist
 to prevent, arriving by the front door. `detail` names the limit that was hit for
 the same reason, and neither leaks anything the sender did not already know,
 because both go only to the connection that sent the frame.
+
+The two join refusals name an interval even though neither clears on a timer.
+They used to name none, and that reads as tidier than it is. `quota` is defined
+by `../contracts/registries/error-codes.md` as "retry after the named interval",
+and a client is entitled to sort an answer it should act on from one it should
+wait out: the Android client drops a non-terminal error carrying no interval, so
+a call refused by a full instance or a full call rang out its whole forty-five
+seconds and then said "no answer", which names the wrong cause to the one person
+who could have acted on the right one. Five seconds, and it is a suggestion
+rather than a window that provably clears, because both of these free up when
+somebody hangs up. That is the right shape for this class anyway: the interval on
+a fixed window is when the window resets, and the interval here is how long to
+wait before asking again. `denied/writer_not_in_access_set` from a call id open
+against another group names none, because it is not a quota and will be refused
+identically forever.
 
 `quota/group_ingress_limited` is the code `src/frame.rs` has carried since step 2
 with nothing referring to it. A limit the spec claims and the code does not
