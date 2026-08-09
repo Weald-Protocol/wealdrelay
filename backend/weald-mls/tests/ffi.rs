@@ -131,6 +131,24 @@ fn the_whole_invite_path_works_through_the_c_abi_and_every_buffer_is_freed() {
     );
     assert_eq!(epoch, 1, "the epoch moves when the commit is merged");
 
+    // The other half of the ordering rule, over the same seam: a commit the relay refuses
+    // is dropped rather than merged, and the epoch stays where the group's is. Built and
+    // cleared here so the C caller has the same escape the Rust one does.
+    let mut refused = Buffer::empty();
+    // Safety: `group` is live, `refused` is writable.
+    assert_eq!(
+        status(unsafe { weald_mls_commit_pending(group, &mut refused) }),
+        Status::Ok
+    );
+    let _ = take(&mut refused);
+    let mut cleared = 0u64;
+    // Safety: `group` is live, `cleared` is writable.
+    assert_eq!(
+        status(unsafe { weald_mls_clear_pending_commit(group, &mut cleared) }),
+        Status::Ok
+    );
+    assert_eq!(cleared, 1, "a dropped commit leaves the epoch where it was");
+
     let mut joined: GroupHandle = core::ptr::null_mut();
     // Safety: `bo` is live, the welcome is readable, `joined` is writable.
     assert_eq!(
@@ -662,6 +680,11 @@ fn the_remaining_seam_functions_answer_through_pointers_too() {
         Status::Ok
     );
     let _ = take(&mut join_commit);
+
+    // The escape for a join the relay refuses, over the same seam: the group goes out of
+    // the store while the handle stays valid to be freed the ordinary way.
+    // Safety: `joined` is live.
+    assert_eq!(status(unsafe { weald_mls_abandon(joined) }), Status::Ok);
 
     // `decrypt` refuses a message that is not an application message, rather than quietly
     // advancing an epoch inside a function called decrypt.

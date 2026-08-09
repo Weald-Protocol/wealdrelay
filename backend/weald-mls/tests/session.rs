@@ -354,3 +354,88 @@ fn a_group_this_device_is_not_in_is_an_ordinary_none_rather_than_an_error() {
         .expect("the store answered")
         .is_none());
 }
+
+/// A refused commit is dropped, and the membership change can be built again.
+///
+/// The obligation `clear_pending_commit` exists for, and the reason a caller can honestly
+/// wait for the relay before merging. Without it a device whose write was refused holds a
+/// commit it can neither merge, because the group never saw it, nor replace, because a
+/// second commit is refused while one is pending: the group is stuck one write short of
+/// the epoch everybody else is at, forever.
+#[test]
+fn a_pending_commit_can_be_dropped_and_the_change_rebuilt() {
+    let ada_device = device("ada");
+    let mut ada = ada_device.create_group(GROUP).expect("a group");
+    let bo_device = device("bo");
+    let key_package = bo_device.key_package().expect("a key package");
+
+    // The write is refused, so nothing merges. The epoch is the group's, and Bo is not a
+    // member here any more than he is anywhere else.
+    let (refused, _) = ada.add(&key_package).expect("an add");
+    assert_eq!(ada.clear_pending_commit().expect("cleared"), 0);
+    assert_eq!(ada.epoch(), 0);
+    assert_eq!(ada.members(), vec![0]);
+
+    // Idempotent: a failure path that had to know how far it got would be a failure path
+    // with a second bug in it.
+    assert_eq!(ada.clear_pending_commit().expect("cleared again"), 0);
+
+    // And the change is retryable, which is the whole point. The second commit is a real
+    // one and not the refused bytes replayed.
+    let (commit, welcome) = ada.add(&key_package).expect("a second add");
+    assert_ne!(commit, refused);
+    assert_eq!(ada.merge_pending().expect("merged"), 1);
+    assert_eq!(ada.members(), vec![0, 1]);
+    let bo = bo_device.join_welcome(&welcome).expect("joined");
+    assert_eq!(bo.epoch_authenticator(), ada.epoch_authenticator());
+}
+
+/// An external join nobody accepted can be abandoned, and the device rejoins cleanly.
+///
+/// `join_external` writes the group through the store before its commit has been anywhere.
+/// Without a way to delete it, a device whose commit the relay refused finds that group on
+/// its next launch, takes the resume path rather than the join path, and can never
+/// republish the only thing that would have made it a member (BR-027). This is that way
+/// out, over a real database, because the whole failure is about what survives a restart.
+#[test]
+fn an_unaccepted_external_join_can_be_abandoned_and_tried_again() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cy_config = file_config(dir.path(), "cy");
+    let ada_device = device("ada");
+    let mut ada = ada_device.create_group(GROUP).expect("a group");
+
+    // The refused join. Cy holds a group at epoch 1 that Ada has never heard of.
+    {
+        let cy_device = Device::open(&cy_config).expect("a device");
+        let (cy, _refused) = cy_device
+            .join_external(&ada.group_info().expect("a group info"))
+            .expect("joined");
+        assert_eq!(cy.epoch(), 1);
+        let mut cy = cy;
+        cy.abandon().expect("abandoned");
+    }
+
+    // A restart. The group is not in the store, so the client takes the join path again
+    // rather than resuming a membership no other member has.
+    let cy_device = Device::open(&cy_config).expect("the device, reopened");
+    assert!(cy_device
+        .open_group(GROUP)
+        .expect("the store answered")
+        .is_none());
+
+    // And the second attempt is a real join: Ada accepts the commit and they converge.
+    let (mut cy, commit) = cy_device
+        .join_external(&ada.group_info().expect("a group info"))
+        .expect("joined");
+    assert!(matches!(
+        ada.process(&commit).expect("processed"),
+        Processed::Commit { epoch: 1 }
+    ));
+    assert_eq!(ada.members(), vec![0, 1]);
+    assert_eq!(ada.epoch_authenticator(), cy.epoch_authenticator());
+    let line = ada.encrypt(b"after cy rejoined").expect("ciphertext");
+    assert_eq!(
+        cy.decrypt(&line).expect("decrypted").0,
+        b"after cy rejoined".to_vec()
+    );
+}

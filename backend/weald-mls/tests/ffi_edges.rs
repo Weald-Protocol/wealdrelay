@@ -653,6 +653,15 @@ fn an_optional_out_parameter_left_null_is_an_ordinary_success() {
         Status::Ok
     );
 
+    // And the clear, with nowhere to report the epoch. Nothing is pending by now, which
+    // is deliberately not an error: a failure path that had to know how far it got would
+    // be a failure path with a second bug in it.
+    // Safety: live handle, null out is explicitly permitted.
+    assert_eq!(
+        status(unsafe { weald_mls_clear_pending_commit(group, core::ptr::null_mut::<u64>()) }),
+        Status::Ok
+    );
+
     // `epoch` with both halves null: nothing to write, still a success, and the group is
     // unharmed by being asked for something it was not allowed to answer.
     // Safety: live handle, both outs deliberately null.
@@ -839,6 +848,17 @@ fn every_function_that_takes_a_handle_refuses_a_null_one_before_it_reads_anythin
         Status::InvalidHandle
     );
     assert_eq!(epoch, 77, "a refused merge must not report an epoch");
+    // Safety: as above.
+    assert_eq!(
+        status(unsafe { weald_mls_clear_pending_commit(null_group, &mut epoch) }),
+        Status::InvalidHandle
+    );
+    assert_eq!(epoch, 77, "a refused clear must not report an epoch either");
+    // Safety: as above.
+    assert_eq!(
+        status(unsafe { weald_mls_abandon(null_group) }),
+        Status::InvalidHandle
+    );
 
     // The message half.
     let mut processed = ProcessedOut::zeroed();

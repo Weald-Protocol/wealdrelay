@@ -456,6 +456,51 @@ pub unsafe extern "C" fn weald_mls_merge_pending(handle: GroupHandle, epoch_out:
     ) as i32
 }
 
+/// Drop this device's own pending commit, once the relay has refused it.
+///
+/// # Safety
+/// `epoch_out` is null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn weald_mls_clear_pending_commit(
+    handle: GroupHandle,
+    epoch_out: *mut u64,
+) -> i32 {
+    guard(
+        |epoch| {
+            if !epoch_out.is_null() {
+                // Safety: checked non-null.
+                unsafe { *epoch_out = epoch }
+            }
+        },
+        || {
+            // Safety: the caller's contract.
+            let session = unsafe { Handle::borrow(handle)? };
+            session.clear_pending_commit()
+        },
+    ) as i32
+}
+
+/// Delete this group from the device's store.
+///
+/// The escape for an external join the relay refused. The handle stays valid and is still
+/// freed with ``weald_mls_free``, but the group behind it is no longer in the store, so a
+/// caller that went on using it would be operating on a group that survives only until the
+/// handle does. Every caller frees it immediately.
+///
+/// # Safety
+/// A live group handle this library issued, from its owning thread.
+#[no_mangle]
+pub unsafe extern "C" fn weald_mls_abandon(handle: GroupHandle) -> i32 {
+    guard(
+        |_| {},
+        || {
+            // Safety: the caller's contract.
+            let session = unsafe { Handle::borrow(handle)? };
+            session.abandon()
+        },
+    ) as i32
+}
+
 // MARK: Messages
 
 /// Process one message from the group.

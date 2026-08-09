@@ -395,6 +395,43 @@ impl Session {
         Ok(self.epoch())
     }
 
+    /// Drop this device's own pending commit, after the relay refused it.
+    ///
+    /// The other half of ``merge_pending``, and the reason a caller can honestly wait for
+    /// acceptance before advancing. Without it a refused commit is stuck: it cannot be
+    /// merged, because the group never saw it, and it cannot be rebuilt, because OpenMLS
+    /// refuses a second commit while one is pending. Clearing it returns the group to the
+    /// epoch the rest of the group is still at, with the original proposals gone, so the
+    /// caller rebuilds the membership change from scratch and publishes again.
+    ///
+    /// Idempotent on purpose: clearing when nothing is pending is not an error, because a
+    /// failure path that has to know whether it got as far as producing a commit is a
+    /// failure path with a second bug in it.
+    pub fn clear_pending_commit(&mut self) -> Result<u64> {
+        self.group
+            .clear_pending_commit(self.provider.storage())
+            .map_err(|error| Error::Storage(error.to_string()))?;
+        Ok(self.epoch())
+    }
+
+    /// Delete this group from the device's store, leaving no trace of it.
+    ///
+    /// The escape for a join nobody accepted. ``Device::join_external`` writes the group
+    /// through the provider before its commit has been anywhere, so a device whose
+    /// external commit the relay refused finds that group again on its next launch, takes
+    /// the resume path rather than the join path, and can never republish the commit that
+    /// would have made it a member. Abandoning the group puts the device back where it
+    /// was: not in the group, free to external-join again from a fresh group info.
+    ///
+    /// The session stays alive and is freed the ordinary way. What is deleted is the
+    /// persisted state: a caller that went on using this handle would be operating on a
+    /// group held only in memory, which is why every caller drops it immediately.
+    pub fn abandon(&mut self) -> Result<()> {
+        self.group
+            .delete(self.provider.storage())
+            .map_err(|error| Error::Storage(error.to_string()))
+    }
+
     // MARK: Messages
 
     /// Process one message from the group: a commit, a proposal, or an application

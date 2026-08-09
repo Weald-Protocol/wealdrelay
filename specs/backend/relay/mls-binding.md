@@ -49,7 +49,8 @@ Everything above them, including envelope construction, author chains,
 certificates, retention and every product decision in this spec family, lives in
 Swift. Everything below is OpenMLS unmodified.
 
-**Corrected in step 7, from twelve functions to fourteen.** The list above could
+**Corrected in step 7, from twelve functions to fourteen**, and to sixteen on
+2026-08-09 by the two acceptance-ordering functions described below. The list above could
 consume a key package in `add` and could never produce one, and could accept a
 `Welcome` from nobody: `add` returns a welcome for the joiner and no function took
 one. So the ordinary invite path in `specs/backend/relay/invites.md` was
@@ -94,10 +95,35 @@ than they look:
   epoch that does not exist until the merge, which is why the publish call is two
   phases and not one. A write the relay refused leaves the device at the epoch the
   rest of the group is at, and it publishes nothing describing an epoch nobody
-  else reached. The agent-admission and steward paths still merge inline, for the
-  reason the register records: both read the added or evicted leaf out of merged
-  state, so deferring there needs a way to clear a pending commit at this
-  boundary.
+  else reached.
+
+  **Two more functions, added 2026-08-09, and they are what let every other path
+  keep that ordering** (register BR-025 and BR-027):
+
+```
+weald_mls_clear_pending_commit(handle)         -> epoch
+weald_mls_abandon(handle)
+```
+
+  `clear_pending_commit` drops a commit the relay refused. Without it a refused
+  commit is stuck: it cannot be merged, because the group never saw it, and it
+  cannot be replaced, because a second commit is refused while one is pending. So
+  the agent-admission and steward paths could not defer their merge at all, since
+  both read the added or evicted leaf out of merged state and had no way back if
+  the write failed. They now build the commit, publish it, and record the leaf and
+  the eviction window only on acceptance (`AgentAdmission.prepare` then `accepted`
+  or `refused`; `EpochSteward.prepare` then `accepted` or `refused`), which is the
+  same two-phase shape `commitPending` and `accepted()` already had.
+
+  `abandon` deletes a group from this device's store. It exists for the one case
+  where refusing to advance is not enough: `join_external` writes the group through
+  the storage provider before its commit has been anywhere, so a device whose
+  external commit was refused would find that group again on its next launch,
+  resume it rather than rejoin, and never republish the only thing that would have
+  made it a member. Abandoning returns the device to not being in the group, which
+  is what every other member already believes, and the next pass joins again from
+  the standing publication. Neither function widens what crosses the boundary: both
+  take a handle and return a number or nothing, and no key material moves.
 
 **A third correction, made in step 7: the recovery wrap is sealed below the boundary,
 not above it.** `specs/backend/relay/groups.md` describes `recovery.wrap` as a record

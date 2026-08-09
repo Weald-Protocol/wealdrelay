@@ -180,6 +180,15 @@ async fn a_principal_holding_a_socket_is_not_woken() {
         0,
         "a connected principal is dropped before the queue, not after"
     );
+    // And nothing went out, which the queue depth alone does not establish: this
+    // configuration drains, so a zero here is equally consistent with "suppressed"
+    // and with "enqueued and already delivered". The claim is that a connected
+    // principal is never rung, and only the ringer can witness that. It also makes
+    // the count below exact rather than cumulative.
+    assert!(
+        ringer.requests().await.is_empty(),
+        "a connected principal was rung"
+    );
 
     // The same device, disconnected, is woken: the suppression is about now rather
     // than about the registration.
@@ -201,18 +210,27 @@ async fn a_principal_holding_a_socket_is_not_woken() {
         "the socket was never let go, so the suppression under test never lifted"
     );
     wealdrelay::push::dispatch::wake_group(&relay.state, &group, Category::Message).await;
-    // Waited for on the same principle as the reap above. `wake_group` returning is
-    // not the queue having been written: the enqueue is observable a moment later,
-    // and on a loaded runner that moment is longer than the read that followed it.
-    // 0.1.15 bounded the wait for the precondition and left this line an immediate
-    // read, so the same run that used to fail on a socket still held now fails on a
-    // queue not yet written, one line further on and just as silent about why.
+    // Asserted against the ringer rather than against the queue, because the queue
+    // is the wrong witness for this claim. `queued()` is the live length of a queue
+    // this configuration drains: `coalesce_ms` is zero and the ringer accepts, so
+    // the worker takes the entry as soon as it is written and the depth returns to
+    // zero. Waiting for it to *equal* one is waiting for a moment to still be true,
+    // and the wait cannot be lengthened into correctness: a slower runner drains it
+    // sooner relative to the read, not later. 0.1.16's release runner sampled zero
+    // for the full two minutes and then reported that nothing was ever woken, on a
+    // relay that had woken the principal correctly before the loop began.
+    //
+    // The ringer's record is monotonic, which is what an assertion needs: a request
+    // that arrived stays arrived. It is also the stronger claim. What `push.md`
+    // requires here is that the suppression lifts and a wake goes *out*, and a wake
+    // that reached the queue and never left it would satisfy the old line and fail
+    // the requirement.
     let give_up = Instant::now() + Duration::from_secs(120);
-    while relay.state.push.queued().await != 1 && Instant::now() < give_up {
+    while ringer.requests().await.is_empty() && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        relay.state.push.queued().await,
+        ringer.requests().await.len(),
         1,
         "the disconnected principal was never woken, so the suppression never lifted"
     );
