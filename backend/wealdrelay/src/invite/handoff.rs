@@ -28,13 +28,15 @@
 //!
 //! ## The construction, and why each part of it
 //!
-//!     blob  = ephemeral_public_key (32) || AES-256-GCM(key, nonce, plaintext) || tag (16)
-//!     key   = HKDF-SHA256(ikm  = X25519(ephemeral_private, handoff_public),
-//!                         salt = "weald-bootstrap-handoff-v1",
-//!                         info = handoff_public_key,
-//!                         len  = 32)
-//!     nonce = 12 zero bytes
-//!     path  = /handoff/<base64url(SHA-256(handoff_public_key))>
+//! ```text
+//! blob  = ephemeral_public_key (32) || AES-256-GCM(key, nonce, plaintext) || tag (16)
+//! key   = HKDF-SHA256(ikm  = X25519(ephemeral_private, handoff_public),
+//!                     salt = "weald-bootstrap-handoff-v1",
+//!                     info = handoff_public_key,
+//!                     len  = 32)
+//! nonce = 12 zero bytes
+//! path  = /handoff/<base64url(SHA-256(handoff_public_key))>
+//! ```
 //!
 //! The nonce is fixed and safe here and only here: the key is derived from a fresh
 //! ephemeral pair per sealing, so it encrypts exactly one message. `info` binds the
