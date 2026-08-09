@@ -100,12 +100,26 @@ impl Scratch {
 /// A single test file took 223 seconds of wall clock in that run, so ten seconds
 /// of scheduling delay is not an outlandish thing to hit.
 ///
-/// Two minutes here, not ten. Ten was the first attempt and it turned a fast
-/// failure into a slow one: a socket that wedges now holds the whole suite for
-/// the length of the deadline, and the 0.1.11 run sat on `cargo test` for nearly
-/// two hours instead of failing in twenty minutes. Two minutes is still two
-/// orders of magnitude above what a handshake takes on an idle machine, which is
-/// all the headroom the runner needs, and it keeps a hang cheap to diagnose.
+/// The two deadlines want different numbers here, and treating them as one
+/// number is what broke 0.1.12.
+///
+/// The handshake deadline is two minutes. Ten was the first attempt and it turned
+/// a fast failure into a slow one: a socket that wedges before authenticating
+/// holds the suite for the length of the deadline, and the 0.1.11 run sat on
+/// `cargo test` for nearly two hours instead of failing in twenty minutes. Two
+/// minutes is still two orders of magnitude above what a handshake takes on an
+/// idle machine, and it keeps a hang cheap to diagnose.
+///
+/// The idle deadline is an hour, and briefly setting it to two minutes alongside
+/// the handshake one was a straight mistake: it is *shorter* than the production
+/// default of five minutes, so the harness reaped established sockets sooner than
+/// a real relay would. `calls_socket.rs` holds five participants open across a
+/// file that took 393 seconds on the 0.1.12 runner, and the sixth-participant
+/// refusal came back as a deadline close (`RateLimited` with no detail) instead
+/// of the call ceiling (`RateLimited` carrying 5). A test asserting a refusal
+/// reason got a different refusal, which is worse than a timeout: it looks like a
+/// logic failure. Nothing in these suites is testing what happens to a
+/// long-established idle socket, so the clock comes off it.
 ///
 /// Nothing is weakened by it: the deadlines are proven by
 /// `tests/deadline_socket.rs`, which sets its own short ones deliberately, and by
@@ -116,7 +130,7 @@ impl Scratch {
 fn deadline_pairs() -> [(&'static str, String); 2] {
     [
         (keys::HANDSHAKE_TIMEOUT_MS, "120000".to_string()),
-        (keys::IDLE_TIMEOUT_MS, "120000".to_string()),
+        (keys::IDLE_TIMEOUT_MS, "3600000".to_string()),
     ]
 }
 
