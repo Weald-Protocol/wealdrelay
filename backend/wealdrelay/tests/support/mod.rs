@@ -100,7 +100,14 @@ impl Scratch {
 /// A single test file took 223 seconds of wall clock in that run, so ten seconds
 /// of scheduling delay is not an outlandish thing to hit.
 ///
-/// Ten minutes here. Nothing is weakened by it: the deadlines are proven by
+/// Two minutes here, not ten. Ten was the first attempt and it turned a fast
+/// failure into a slow one: a socket that wedges now holds the whole suite for
+/// the length of the deadline, and the 0.1.11 run sat on `cargo test` for nearly
+/// two hours instead of failing in twenty minutes. Two minutes is still two
+/// orders of magnitude above what a handshake takes on an idle machine, which is
+/// all the headroom the runner needs, and it keeps a hang cheap to diagnose.
+///
+/// Nothing is weakened by it: the deadlines are proven by
 /// `tests/deadline_socket.rs`, which sets its own short ones deliberately, and by
 /// `tests/deadline_unit.rs`, which resolves configuration through its own helper
 /// and still asserts the production defaults are what an operator gets. What this
@@ -108,8 +115,8 @@ impl Scratch {
 /// else.
 fn deadline_pairs() -> [(&'static str, String); 2] {
     [
-        (keys::HANDSHAKE_TIMEOUT_MS, "600000".to_string()),
-        (keys::IDLE_TIMEOUT_MS, "600000".to_string()),
+        (keys::HANDSHAKE_TIMEOUT_MS, "120000".to_string()),
+        (keys::IDLE_TIMEOUT_MS, "120000".to_string()),
     ]
 }
 
