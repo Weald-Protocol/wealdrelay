@@ -225,15 +225,18 @@ async fn a_connection_that_never_authenticates_is_closed_at_the_handshake_deadli
 
     // The slot comes back. This is the whole point: a deadline that closed the
     // socket and leaked its slot would leave the relay just as unreachable.
-    let mut settled = false;
-    for _ in 0..100 {
-        if relay.state.open_connections() == 0 {
-            settled = true;
-            break;
-        }
+    // Bounded by `PATIENCE` rather than by a hundred twenty-millisecond ticks.
+    // Two seconds is a measurement of the runner, and a slot that is genuinely
+    // leaked never comes back however long this waits.
+    let give_up = Instant::now() + PATIENCE;
+    while relay.state.open_connections() != 0 && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(settled, "the connection slot was never given back");
+    assert_eq!(
+        relay.state.open_connections(),
+        0,
+        "the connection slot was never given back"
+    );
 
     // And the operator can tell this from a crash, which is the only reason the
     // counters exist.
@@ -312,15 +315,15 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     for client in silent.iter_mut() {
         let _ = drain_to_close(client, PATIENCE, false).await;
     }
-    let mut settled = false;
-    for _ in 0..200 {
-        if relay.state.open_connections() == 0 {
-            settled = true;
-            break;
-        }
+    let give_up = Instant::now() + PATIENCE;
+    while relay.state.open_connections() != 0 && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(settled, "the relay never recovered its connection table");
+    assert_eq!(
+        relay.state.open_connections(),
+        0,
+        "the relay never recovered its connection table"
+    );
     assert_eq!(relay.state.deadline_closes(Expiry::Handshake), 4);
 
     // And the device that was locked out gets in, over the same relay process.

@@ -184,12 +184,22 @@ async fn a_principal_holding_a_socket_is_not_woken() {
     // The same device, disconnected, is woken: the suppression is about now rather
     // than about the registration.
     drop(ada);
-    for _ in 0..100 {
-        if relay.state.hub.connections_for(&entry).await == 0 {
-            break;
-        }
+    // Waited for and then asserted, rather than polled for two seconds and hoped.
+    // The old loop fell through silently when the socket had not been reaped yet,
+    // so the wake that followed was suppressed for a principal the relay still
+    // believed was connected, and the failure landed on the queue depth two lines
+    // later saying nothing about why. On the 0.1.14 release runner, where
+    // thirty-five minutes passed between two lines of test output, two seconds was
+    // not enough. This is the same assertion with the cause named.
+    let give_up = Instant::now() + Duration::from_secs(120);
+    while relay.state.hub.connections_for(&entry).await != 0 && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        relay.state.hub.connections_for(&entry).await,
+        0,
+        "the socket was never let go, so the suppression under test never lifted"
+    );
     wealdrelay::push::dispatch::wake_group(&relay.state, &group, Category::Message).await;
     assert_eq!(relay.state.push.queued().await, 1);
 
