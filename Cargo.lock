@@ -4468,6 +4468,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "proptest",
+ "ring",
  "rustls 0.23.42",
  "serde",
  "serde_json",
@@ -4481,6 +4482,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

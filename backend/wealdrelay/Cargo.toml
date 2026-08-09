@@ -68,6 +68,21 @@ http-body-util = "0.1"
 # cannot pick one, which would be a panic on the wake path of a relay that started
 # fine. Already in the tree under sqlx's `tls-rustls-ring`.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Three of the four primitives the sealed bootstrap handoff needs: HKDF-SHA256,
+# AES-256-GCM and SHA-256 (`src/invite/handoff.rs`). Already linked into this
+# binary underneath rustls and sqlx, so naming it directly adds a line here and no
+# code to the dependency graph. The fourth, X25519, is below and says why.
+ring = "0.17"
+# X25519 with a *static* private key, which `ring` deliberately does not offer:
+# its agreement API consumes an ephemeral key it generated itself. Sealing only
+# ever needs the ephemeral direction, but the conformance vectors in
+# specs/backend/contracts/wire/vectors/bootstrap-handoff.json pin a specific
+# ephemeral private key precisely so both implementations can be checked against
+# the same bytes, and a construction no test can reproduce deterministically is a
+# construction checked against nothing. Same family as `ed25519-dalek`, already in
+# the tree: this adds `x25519-dalek` over a `curve25519-dalek` that is already
+# linked.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [dev-dependencies]
 proptest = "1"
