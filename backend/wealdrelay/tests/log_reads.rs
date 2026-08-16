@@ -213,8 +213,18 @@ async fn the_backfill_reads_only_what_the_caller_can_send() {
     let group = make_group(&relay.state, 0x66).await;
     let pool = relay.state.database.as_ref().unwrap().pool();
 
-    let body = vec![0x5au8; 4096];
+    // One distinct body per row, all the same length.
+    //
+    // This stored the same 4096 bytes forty times, and `relay_envelope`'s primary
+    // key is `(group_id, hash)` while `envelope_for` derives the hash from the
+    // group and the ciphertext alone. So every row after the first was the same
+    // key and the insert failed on a duplicate: the test could never have reached
+    // its own assertions. The length is what both assertions below rest on, and
+    // it is unchanged, so writing the sequence number into the first eight bytes
+    // makes each row its own envelope without moving the arithmetic.
     for seq in 1..=40i64 {
+        let mut body = vec![0x5au8; 4096];
+        body[..8].copy_from_slice(&seq.to_be_bytes());
         store(pool, &group, &body, seq).await;
     }
 
