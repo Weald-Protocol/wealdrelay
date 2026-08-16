@@ -421,7 +421,16 @@ async fn a_wedged_participant_has_its_audio_shed_and_keeps_its_call() {
     // 256-frame queue bound, so what fills Bo's queue is legitimate traffic
     // reaching a client that stopped reading rather than a flood being refused.
     const STREAMS: u32 = 8;
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Two minutes rather than twenty seconds, because the bound is wall clock and
+    // the thing being waited for is not. Two iterations of the loop below send
+    // 480 frames past a 256-frame queue, so on any machine that can push them the
+    // shed happens in about a second; twenty seconds was not a margin, it was the
+    // same assumption `release.yml` already records being wrong about this suite,
+    // where a two-core hosted runner opening real sockets against a real Postgres
+    // runs it at a multiple somewhere past 3x. This failed the v0.1.20 tag having
+    // passed the v0.1.19 one on the same code, which is the signature of a clock
+    // and not of a regression. The assertion is unchanged: the relay must shed.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut seq = 0u64;
     while relay.state.calls.shed() == 0 && Instant::now() < deadline {
         for stream in 0..STREAMS {
