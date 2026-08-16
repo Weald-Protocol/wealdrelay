@@ -286,6 +286,29 @@ relay_start() {
   # once the ephemeral path landed, and the alternative fix, WEALD_RELAY_LIVE=off,
   # would have turned presence off in the one place the suites exercise it. Redis
   # is still up in the compose file; the control plane's queue is what wants it.
+  # The optional values are passed only when the operator actually set one.
+  #
+  # These were `"${WEALD_STACK_IMAGE_DIGEST:-}"` and `"${WEALD_STACK_PUSH_URL:-}"`,
+  # which is not "leave it unset": it exports the key with an empty value, and
+  # the relay refuses that on purpose, with `is set to an empty value; unset it
+  # instead of setting it to nothing`. An empty string is a value somebody typed
+  # and a configuration surface that silently treats it as absence is one where a
+  # deployment cannot tell a missing secret from a blank one. So the relay is
+  # right and the harness was wrong, and it only ever showed on a machine with no
+  # relay already running: a warm `up` adopts the process it finds and never
+  # reaches this line, which is why it failed first on a clean CI runner and
+  # never on a laptop.
+  # `${optional[@]+...}` rather than a bare expansion, and `if` rather than
+  # `[ ... ] &&`: this runs under `set -eu`, where an unset array expands to an
+  # error and a trailing `&&` that is false is the script's exit status.
+  local optional=()
+  if [ -n "${WEALD_STACK_IMAGE_DIGEST:-}" ]; then
+    optional+=("WEALD_RELAY_IMAGE_DIGEST=$WEALD_STACK_IMAGE_DIGEST")
+  fi
+  if [ -n "${WEALD_STACK_PUSH_URL:-}" ]; then
+    optional+=("WEALD_RELAY_PUSH_URL=$WEALD_STACK_PUSH_URL")
+  fi
+
   WEALD_RELAY_HOSTNAME=localhost \
   WEALD_RELAY_DATABASE_URL="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack" \
   WEALD_RELAY_STORAGE_URL="file://$STACK_STATE/blobs" \
@@ -295,9 +318,8 @@ relay_start() {
   WEALD_RELAY_RELEASE_CHECK=off \
   WEALD_RELAY_MIN_ENC="${WEALD_STACK_MIN_ENC:-mls}" \
   WEALD_RELAY_WRITE_MODE="${WEALD_STACK_WRITE_MODE:-full}" \
-  WEALD_RELAY_IMAGE_DIGEST="${WEALD_STACK_IMAGE_DIGEST:-}" \
   WEALD_RELAY_PUSH="${WEALD_STACK_PUSH:-off}" \
-  WEALD_RELAY_PUSH_URL="${WEALD_STACK_PUSH_URL:-}" \
+  env ${optional[@]+"${optional[@]}"} \
     nohup "$bin" > "$RELAY_LOG_FILE" 2>&1 &
   echo $! > "$RELAY_PID_FILE"
 
