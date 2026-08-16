@@ -436,6 +436,19 @@ const GROUPS: u8 = 2;
 /// `TooManyCalls` is reachable too.
 const MAX_CONCURRENT: usize = 2;
 
+/// The most calls one connection may hold: a quarter of the table, never less
+/// than one. `CallRegistry::share`'s rule, written out longhand here like every
+/// other rule in this model rather than borrowed from the implementation, which
+/// would agree with it about a bug as well as about the behaviour.
+const fn share_of(ceiling: usize) -> usize {
+    let quarter = ceiling / 4;
+    if quarter > 1 {
+        quarter
+    } else {
+        1
+    }
+}
+
 fn ops() -> impl Strategy<Value = Vec<Op>> {
     prop::collection::vec(
         prop_oneof![
@@ -494,7 +507,13 @@ impl Model {
                 // every other rule in this model, rather than calling the
                 // registry's own `share`: a model that borrowed the
                 // implementation would agree with it about a bug too.
-                let share = (MAX_CONCURRENT / 4).max(1);
+                // Written as a `const fn` of the ceiling rather than inline,
+                // because inline it is `(2 / 4).max(1)`, which clippy correctly
+                // folds to `1` and refuses as an expression with no effect. The
+                // rule is the quarter and the floor together, and a model that
+                // hard-coded `1` would silently stop modelling the ceiling the
+                // day somebody raises `MAX_CONCURRENT`.
+                let share = share_of(MAX_CONCURRENT);
                 let held = self
                     .calls
                     .values()

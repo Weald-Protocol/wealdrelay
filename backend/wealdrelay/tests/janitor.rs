@@ -432,12 +432,17 @@ async fn a_pass_can_skip_the_storage_listing_without_skipping_anything_else() {
 
     // The cadence itself: one listing pass in ninety-six, and never on the first
     // pass of a fresh process.
-    assert!(wealdrelay::janitor::STORAGE_LISTING_EVERY > 1);
+    // `const` blocks, because both of these are assertions about a constant and
+    // clippy refuses a runtime `assert!` that can only ever hold or only ever
+    // fail. A const block is the stronger form anyway: it fails the build rather
+    // than one test run, which is what an assertion about a compile-time value
+    // deserves.
+    const { assert!(wealdrelay::janitor::STORAGE_LISTING_EVERY > 1) };
     let listing_passes = (1..=wealdrelay::janitor::STORAGE_LISTING_EVERY)
         .filter(|pass| pass % wealdrelay::janitor::STORAGE_LISTING_EVERY == 0)
         .count();
     assert_eq!(listing_passes, 1);
-    assert!(1 % wealdrelay::janitor::STORAGE_LISTING_EVERY != 0);
+    const { assert!(1 % wealdrelay::janitor::STORAGE_LISTING_EVERY != 0) };
 
     harness.finish().await;
 }

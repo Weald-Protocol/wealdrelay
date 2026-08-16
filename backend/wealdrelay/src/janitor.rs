@@ -287,7 +287,7 @@ pub async fn run(state: Arc<RelayState>) {
         let wait = interval_ms.saturating_add(jitter_ms(interval_ms));
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         passes = passes.wrapping_add(1);
-        let list_storage = passes % STORAGE_LISTING_EVERY == 0;
+        let list_storage = passes.is_multiple_of(STORAGE_LISTING_EVERY);
         let summary = pass_with(&state, list_storage).await;
         let storage_listings = summary.storage_listings;
         let scopes = summary.scopes;
