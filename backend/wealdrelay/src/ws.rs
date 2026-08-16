@@ -1019,18 +1019,26 @@ async fn redeem(
             }
         }
         Request::Record { .. } => match store::fetch(pool, &token).await {
-            // The issuer's own bytes, never re-encoded. A client verifies the
-            // signature over what the issuer signed, not over this relay's encoder.
-            Ok(Some(record)) => queue_all(
-                sender,
-                vec![Frame::Join {
-                    body: Response::Record { body: record.body }.encode(),
-                }],
-            ),
+            // Live and unexpired only. This arm is reachable before any
+            // authentication and burns no code-attempt budget, so serving a body
+            // for a revoked, spent or expired token would answer "this token is
+            // real" to anyone holding a leaked one, and the body carries the
+            // `code_hash` that offline brute force needs. A dead invite is
+            // answered exactly like one that never existed.
+            Ok(Some(record))
+                if record.state == store::State::Live && state.now_ms() < record.invite.expires =>
+            {
+                queue_all(
+                    sender,
+                    vec![Frame::Join {
+                        body: Response::Record { body: record.body }.encode(),
+                    }],
+                )
+            }
             // An empty body for a token that does not exist, and the same empty body
             // for one that does: this path stays uninformative about which tokens are
             // real, which is the whole reason the refusals here are flat.
-            Ok(None) => queue_all(
+            Ok(_) => queue_all(
                 sender,
                 vec![Frame::Join {
                     body: Response::Record { body: Vec::new() }.encode(),

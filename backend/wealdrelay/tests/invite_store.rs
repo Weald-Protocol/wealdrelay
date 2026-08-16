@@ -1534,12 +1534,39 @@ async fn a_synchronized_burst_of_wrong_codes_spends_the_budget_once() {
                 NOW,
             )
             .await
-            .unwrap()
         }));
     }
+    // A verdict or a retryable refusal, and never a wrong verdict.
+    //
+    // This used to `unwrap` inside each task, which made the test demand that
+    // all sixty-four get a definitive answer. They contend for a pool of
+    // `DEFAULT_POOL_SIZE` (eight) with a five second acquire timeout, so on a
+    // busy two-core runner some of them time out waiting for a connection and
+    // the whole run failed on `pool timed out while waiting for an open
+    // connection`.
+    //
+    // That is the relay behaving correctly rather than a defect: a burst that
+    // outruns the pool is told to come back, which is what the socket layer's
+    // own queue is for. It also cannot weaken what this test proves. An attempt
+    // that never got a connection never reached the verifier, so it cannot have
+    // spent budget, and the assertion below is a count of what did.
+    let mut answered = 0usize;
     for attempt in attempts {
-        assert_eq!(attempt.await.unwrap(), Verdict::Unavailable);
+        match attempt.await.expect("the task itself must not panic") {
+            Ok(verdict) => {
+                assert_eq!(verdict, Verdict::Unavailable);
+                answered += 1;
+            }
+            Err(error) => assert!(
+                error.to_string().contains("pool timed out"),
+                "the only tolerable failure here is pool contention, got {error:?}"
+            ),
+        }
     }
+    assert!(
+        answered >= usize::try_from(wealdrelay::invite::code::MAX_FAILURES).unwrap(),
+        "too few attempts reached the relay to say anything about the budget"
+    );
 
     let charged: i32 =
         sqlx::query_scalar("select failures from relay_invite_attempt where token = $1")
