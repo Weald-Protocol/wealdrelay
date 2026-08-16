@@ -137,6 +137,7 @@ event-kind =
   / k-agent-invoke        ; 0x0091
   / k-agent-lifecycle     ; 0x0092
   / k-agent-lease         ; 0x0093
+  / k-ask                 ; 0x00A0
   / k-ephemeral           ; 0x00F0
   / unknown-kind
 
@@ -170,6 +171,11 @@ k-agent-card         = 144
 k-agent-invoke       = 145
 k-agent-lifecycle    = 146
 k-agent-lease        = 147
+; One person asking one other person to look at one thing. A request and its
+; resolution are the same kind, told apart by `replyTo` and a terminal `state`,
+; so there is one codec and one authorization rule rather than two
+; (`specs/backend/relay/wire.md`, `specs/asks.md`).
+k-ask                = 160
 k-ephemeral          = 240
 
 unknown-kind = uint   ; stored and ignored. Forward compatibility is a
