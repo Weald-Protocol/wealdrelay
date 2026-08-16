@@ -789,6 +789,22 @@ async fn handle_multipart_abort(
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
     let Ok(Some(multipart)) = store::find_multipart(pool, session_uuid).await else {
+        // The lookup inner-joins the reservation and the first abort deleted
+        // that row (`store::release`), so an already-aborted session lands here
+        // and never reaches the repeated-abort branch below, which was
+        // unreachable for exactly this reason. `specs/backend/relay/media.md`
+        // requires the same `MultipartAborted` the first abort gave. The group
+        // went with the reservation, so there is nothing left to authorize
+        // against; the session id is the 128 random bits handed to whoever
+        // opened it, and this says nothing to anyone who cannot produce one.
+        if matches!(
+            store::multipart_is_aborted(pool, session_uuid).await,
+            Ok(true)
+        ) {
+            return Frame::Blob {
+                payload: wire::Response::MultipartAborted.encode(),
+            };
+        }
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
     let workspace = match authorize_group(pool, session, &multipart.group).await {

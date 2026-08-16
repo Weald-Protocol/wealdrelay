@@ -714,6 +714,29 @@ pub async fn abort_multipart(pool: &PgPool, session_id: Uuid) -> Result<(), Stor
     Ok(())
 }
 
+/// Whether a session was already aborted, read from the multipart row alone.
+///
+/// `find_multipart` inner-joins the reservation, and an abort deletes that row
+/// (`release`), so a second abort could not find the session it had just
+/// aborted and answered `MalformedHeader`. That made the repeated-abort branch
+/// in `media::mod` unreachable and broke the rule in
+/// `specs/backend/relay/media.md`: a session already aborted is answered with
+/// the same `MultipartAborted` the first abort gave.
+pub async fn multipart_is_aborted(pool: &PgPool, session_id: Uuid) -> Result<bool, StoreError> {
+    let row = sqlx::query(
+        "select aborted_at is not null as aborted from relay_blob_multipart \
+         where session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    match row {
+        Some(row) => row.try_get("aborted").map_err(db),
+        None => Ok(false),
+    }
+}
+
 /// Every multipart session past its expiry with no completion: aborted, its
 /// reservation released, alongside the plain unclaimed-upload sweep.
 pub async fn stale_multipart_sessions(pool: &PgPool) -> Result<Vec<(Uuid, Uuid)>, StoreError> {

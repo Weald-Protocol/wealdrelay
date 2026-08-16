@@ -82,7 +82,14 @@ pub const MAX_LIVE_BYTES: usize = 4096;
 /// Budgeted separately from the 600-envelope allowance, so presence can never
 /// starve a durable write, and refused on the frame only: the connection stays up
 /// and the next beat is 20 seconds away.
-pub const LIVE_FRAMES_PER_MINUTE: u32 = 60;
+///
+/// 900 rather than 60 because live cursors ride this path
+/// (`specs/multiplayer-cursors.md`): a moving pointer publishes 10 coalesced
+/// samples a second, which a 60 per minute budget refuses outright. The property
+/// that mattered is unchanged, because it was never the number: the allowance is
+/// still separate from the envelope allowance, so an ephemeral stream can only
+/// spend its own and can never starve a durable write.
+pub const LIVE_FRAMES_PER_MINUTE: u32 = 900;
 
 /// `KEYS` frames one connection may send per minute. A roster prefetch is a
 /// startup burst rather than a stream.

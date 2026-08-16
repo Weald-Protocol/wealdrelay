@@ -109,7 +109,7 @@ because a body defined in two codebases and no document is a body that diverges.
 
 ```
 LiveBody {
-  kind:     u8            // 1 presence, 2 typing, 5 agent status. 3 and 4 reserved for focus and read cursor
+  kind:     u8            // 1 presence, 2 typing, 5 agent status, 6 pointer (specs/multiplayer-cursors.md). 3 and 4 reserved for focus and read cursor
   member:   [32]byte      // the author's device key, as in EnvelopePayload.author
   state:    u8            // 1 active, 2 idle, 3 away, 4 busy (agent status only)
   channel:  bytes?        // channel slug, typing only, absent for presence
@@ -207,7 +207,7 @@ fanout is configured, rather than quietly showing half the room.
 | Limit | Value | Why |
 | --- | --- | --- |
 | `LIVE` `ct` | 4 KiB | A beat is tens of bytes. The cap exists so the ephemeral path cannot be used as an unlogged bulk channel. |
-| `LIVE` frames per connection per minute | 60 | One beat per group per twenty seconds across a handful of open channels, plus typing. Budgeted separately from the 600 envelope allowance so a chatty presence can never starve a durable write. |
+| `LIVE` frames per connection per minute | 900 | Was 60, which covered one beat per group per twenty seconds plus typing. Live cursors (`specs/multiplayer-cursors.md`) publish 10 coalesced samples a second while a pointer moves, so the allowance is sized for that. Still budgeted separately from the 600 envelope allowance, so an ephemeral stream can never starve a durable write. |
 | Beacon interval, client | 20 seconds | Below the 120 second ttl clamp with room for two lost beats. |
 | `ttl` clamp, receiver | 120 seconds | A sender cannot claim to be present indefinitely. |
 

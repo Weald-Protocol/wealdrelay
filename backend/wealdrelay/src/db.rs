@@ -105,6 +105,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0015_gc_restore_marker",
         include_str!("../migrations/0015_gc_restore_marker.sql"),
     ),
+    (
+        "0016_multipart_survives_release",
+        include_str!("../migrations/0016_multipart_survives_release.sql"),
+    ),
 ];
 
 /// The ledger of what has been applied. Created before anything else, and by the

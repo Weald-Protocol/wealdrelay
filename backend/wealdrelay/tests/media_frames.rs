@@ -2070,11 +2070,38 @@ async fn a_multipart_completion_against_broken_storage_never_reports_success() {
         &rate,
     )
     .await;
-    let session_id = match response(&opened) {
-        Response::Multipart { session_id, .. } => session_id,
+    let (session_id, part_size) = match response(&opened) {
+        Response::Multipart {
+            session_id,
+            part_size,
+            ..
+        } => (session_id, part_size),
         other => panic!("expected a multipart session, got {other:?}"),
     };
     let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
+    // Part 1 is asked for against the healthy store before the stores below are
+    // swapped out. `MultipartComplete` refuses a part number the relay never
+    // recorded (`media/mod.rs`: `recorded_parts`) before it reads a single
+    // object, so writing the bytes straight into the bucket answered
+    // `MalformedHeader` and none of the storage faults this test exists to prove
+    // were ever reached.
+    assert!(matches!(
+        response(
+            &media::handle(
+                &state,
+                &session,
+                Request::MultipartPart {
+                    session_id: session_id.clone(),
+                    part_number: 1,
+                    expected_len: part_size,
+                }
+                .encode(),
+                &rate,
+            )
+            .await
+        ),
+        Response::MultipartPartUpload { .. }
+    ));
     let part = BlobKey::new("_multipart", uuid.simple().to_string(), "part-1").unwrap();
     state
         .storage
