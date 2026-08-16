@@ -83,8 +83,23 @@ ring = "0.17"
 # the tree: this adds `x25519-dalek` over a `curve25519-dalek` that is already
 # linked.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+# The export artifact (`src/backup.rs`, `specs/backend/relay/operations.md`). Two
+# new third parties, and the smallest pair that produce the format the artifact
+# names, `<name>.tar.gz`: `tar` writes ustar headers and `flate2` on its
+# pure-Rust backend does the gzip, so neither adds a C toolchain to a build that
+# has none. Writing a tar by hand was the alternative and was rejected: a
+# hand-rolled archiver is a format nobody else's tooling can be held to, and the
+# one thing a disaster-recovery artifact must be is readable by tools the
+# operator already has.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
+# Reading back what `src/backup.rs` wrote. An integration test is its own crate,
+# so the two archive crates are named again here rather than inherited; no new
+# third party either way.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 proptest = "1"
 tempfile = "3"
 # Only for sending a real SIGTERM to a spawned relay in tests/process.rs.
