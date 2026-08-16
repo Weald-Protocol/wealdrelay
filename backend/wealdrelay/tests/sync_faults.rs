@@ -51,12 +51,11 @@ async fn a_backfill_that_cannot_be_read_is_a_retry_and_not_a_rejection() {
             from_seq: 0,
         })
         .await;
-    // The acknowledgement comes first: the subscription itself succeeded, and the
-    // client is registered for fanout whatever the backfill did.
-    match client.recv_frame().await {
-        Frame::SubAck { group: acked, .. } => assert_eq!(acked, group),
-        other => panic!("expected a SubAck, got {other:?}"),
-    }
+    // WEALD-299. No acknowledgement at all, because the head this one would name
+    // comes from the same unreadable table. A `SUB_ACK` whose `head_seq` fell back
+    // to zero would resolve to the client's own cursor and tell it there is
+    // nothing left to fetch, which is the one answer it acts on and never revisits.
+    // Refusing costs a retry; acknowledging costs the envelopes.
     match client.recv_frame().await {
         Frame::Error(error) => {
             assert_eq!(error.code, ErrorCode::Backpressure);
@@ -123,5 +122,60 @@ async fn a_reconciliation_that_cannot_read_the_log_is_a_retry_and_not_a_rejectio
     }
 
     relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_that_cannot_be_read_refuses_the_subscription_with_no_suback() {
+    // The negative proof WEALD-299 asks for. The two tests above park the table
+    // after the handshake, by which point the head statement is already prepared
+    // and Postgres keeps serving the cached plan by OID, so they exercise the
+    // failed backfill and never the failed head read. Here the pool itself is
+    // closed, so the very first statement `sync::subscribe` runs, the head read,
+    // fails, and the claim under test is that no `SUB_ACK` naming a head this
+    // relay did not read is ever emitted: the client is told `retry/backpressure`
+    // and nothing else. An ack at the client's own cursor would tell it it is
+    // caught up, permanently, over a transient fault.
+    use wealdrelay::db::Database;
+    use wealdrelay::health::RelayState;
+    use wealdrelay::ws::{outbound_channel, Outbound};
+
+    let scratch = Scratch::new("syncfault_head").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let config = config_for(&scratch, blobs.path());
+    let database = Database::connect(&scratch.url).await.expect("a database");
+    database.pool().close().await;
+    let state = std::sync::Arc::new(RelayState::new(config, Some(database), None));
+
+    let (sender, mut receiver) = outbound_channel();
+    let group = vec![0xC3; 32];
+    assert!(
+        wealdrelay::sync::subscribe(
+            &sender,
+            &state,
+            1,
+            group.clone(),
+            42,
+            wealdrelay::frame::PROTOCOL_VERSION,
+        )
+        .await,
+        "a refused subscription keeps the connection"
+    );
+    match receiver.try_recv() {
+        Ok(Outbound::Frame(Frame::Error(error))) => {
+            assert_eq!(error.code, ErrorCode::Backpressure);
+        }
+        other => panic!("expected backpressure and no SubAck, got {other:?}"),
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "nothing follows the refusal, and above all no SubAck"
+    );
+    assert_eq!(
+        state.hub.subscribers(&group).await,
+        0,
+        "a refused subscription is not registered for fanout"
+    );
+
     scratch.drop_database().await;
 }

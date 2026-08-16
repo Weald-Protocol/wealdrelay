@@ -34,6 +34,7 @@
 
 pub mod gc;
 pub mod http;
+pub mod restore;
 pub mod retention;
 pub mod store;
 pub mod wire;
@@ -87,6 +88,13 @@ fn own_part_key(session: uuid::Uuid, part_number: u32) -> BlobKey {
     .expect("a uuid and a part number are always well formed key components")
 }
 
+/// ``own_part_key`` for callers outside this module, notably the janitor, which
+/// deletes a stale session's part objects and has only the session id and the
+/// part numbers the database recorded.
+pub fn part_key_for(session: uuid::Uuid, part_number: i32) -> BlobKey {
+    own_part_key(session, part_number as u32)
+}
+
 fn object_key(workspace: &str, group: &[u8], hash: &[u8]) -> Result<BlobKey, StorageError> {
     BlobKey::new(workspace, hex(group), hex(hash))
 }
@@ -104,6 +112,7 @@ async fn presign(
     key: &BlobKey,
     method: &str,
     ttl: Duration,
+    content_length: Option<i64>,
 ) -> Result<String, StorageError> {
     let store = state
         .storage
@@ -113,7 +122,9 @@ async fn presign(
         })?;
     match store.as_ref() {
         Store::S3(s3) => match method {
-            "PUT" => s3.presign_put(key, ttl).await,
+            // The write is bound to the length the quota was charged for; the read
+            // is not bound to anything, because it stores nothing.
+            "PUT" => s3.presign_put(key, ttl, content_length).await,
             _ => s3.presign_get(key, ttl).await,
         },
         Store::Filesystem(_) => {
@@ -139,6 +150,7 @@ async fn presigned(
     state: &Arc<RelayState>,
     key: &BlobKey,
     method: &str,
+    content_length: Option<i64>,
     carry: impl FnOnce(String) -> wire::Response,
 ) -> Frame {
     match presign(
@@ -146,6 +158,7 @@ async fn presigned(
         key,
         method,
         Duration::from_secs(u64::from(PRESIGN_TTL_SECONDS)),
+        content_length,
     )
     .await
     {
@@ -284,8 +297,16 @@ pub async fn handle(
             part_number,
             expected_len,
         } => {
-            handle_multipart_part(state, session, pool, &session_id, part_number, expected_len)
-                .await
+            handle_multipart_part(
+                state,
+                session,
+                pool,
+                &session_id,
+                part_number,
+                expected_len,
+                rate,
+            )
+            .await
         }
         wire::Request::MultipartComplete { session_id, parts } => {
             handle_multipart_complete(state, session, pool, &session_id, &parts).await
@@ -295,7 +316,9 @@ pub async fn handle(
         }
         wire::Request::List { group, .. } => handle_list(state, session, pool, &group, rate).await,
         wire::Request::RetentionControl(record) => handle_control(session, pool, &record).await,
-        wire::Request::RetentionManifest(record) => handle_manifest(session, pool, &record).await,
+        wire::Request::RetentionManifest(record) => {
+            handle_manifest(state, session, pool, &record).await
+        }
         wire::Request::RetentionPolicy(record) => {
             handle_policy(state, session, pool, &record).await
         }
@@ -399,9 +422,14 @@ async fn handle_put(
                     }
                 }
             } else {
-                presigned(state, &key, "PUT", |url| wire::Response::Upload {
-                    url,
-                    expires_in: PRESIGN_TTL_SECONDS,
+                // Bound to exactly the length the reservation was charged for. The
+                // client declared it, the quota was moved for it, and now the
+                // object store will not take anything else.
+                presigned(state, &key, "PUT", Some(ciphertext_len as i64), |url| {
+                    wire::Response::Upload {
+                        url,
+                        expires_in: PRESIGN_TTL_SECONDS,
+                    }
                 })
                 .await
             }
@@ -466,7 +494,7 @@ async fn handle_get(
     if !rate.allow_bytes(device, length, state.now_ms()).await {
         return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
     }
-    presigned(state, &key, "GET", |url| wire::Response::Download {
+    presigned(state, &key, "GET", None, |url| wire::Response::Download {
         url,
         expires_in: PRESIGN_TTL_SECONDS,
     })
@@ -546,6 +574,18 @@ fn parse_session_id(bytes: &[u8]) -> Option<uuid::Uuid> {
     uuid::Uuid::from_slice(bytes).ok()
 }
 
+/// How many parts one session can have: `ceil(total_bytes / part_size)`.
+///
+/// `None` when the session's own numbers are unusable (a non-positive part size
+/// or total), which the caller refuses rather than treating as unbounded.
+fn session_part_count(multipart: &store::MultipartSession) -> Option<u64> {
+    if multipart.part_size <= 0 || multipart.total_bytes <= 0 {
+        return None;
+    }
+    let part_size = multipart.part_size as u64;
+    Some((multipart.total_bytes as u64).div_ceil(part_size))
+}
+
 async fn handle_multipart_part(
     state: &Arc<RelayState>,
     session: &Session,
@@ -553,10 +593,20 @@ async fn handle_multipart_part(
     session_id: &[u8],
     part_number: u32,
     expected_len: u64,
+    rate: &RateLimiter,
 ) -> Frame {
     let Some(session_uuid) = parse_session_id(session_id) else {
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
+    let Some(device) = session.device_key() else {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    // Charged before anything is looked up, for the reason `handle_get` is: an
+    // uncharged part request is a free session probe, and uncharged it is also a
+    // free loop that mints one presigned 64 MiB upload URL per iteration.
+    if !rate.allow_request(device, state.now_ms()).await {
+        return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
+    }
     let Ok(Some(multipart)) = store::find_multipart(pool, session_uuid).await else {
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
@@ -569,11 +619,25 @@ async fn handle_multipart_part(
     if multipart.completed || multipart.aborted || part_number == 0 || expected_len == 0 {
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     }
+    // A session covers exactly the bytes its reservation was charged for, so it
+    // has exactly this many parts. Without the bound, any `u32` is a valid part
+    // number and one reservation mints four billion upload URLs, none of which
+    // the quota has heard of.
+    let Some(max_parts) = session_part_count(&multipart) else {
+        return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
+    };
+    if u64::from(part_number) > max_parts {
+        return Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge));
+    }
     if let Ok(Some(existing)) = store::expected_len_of(pool, session_uuid, part_number as i32).await
     {
+        // Checked before the length bound below, because a part already issued
+        // is answered by its immutability rule whatever the client now claims.
         if existing as u64 != expected_len {
             return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
         }
+    } else if expected_len > multipart.part_size as u64 {
+        return Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge));
     } else if let Err(error) =
         store::record_part(pool, session_uuid, part_number as i32, expected_len as i64).await
     {
@@ -581,10 +645,14 @@ async fn handle_multipart_part(
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     }
 
+    // The part is bound to the length recorded for it, which is the same number
+    // the completion path adds up. A part URL that took any body would let one
+    // recorded part number carry a whole upload.
     presigned(
         state,
         &own_part_key(session_uuid, part_number),
         "PUT",
+        Some(expected_len as i64),
         |url| wire::Response::MultipartPartUpload {
             url,
             expires_in: PRESIGN_TTL_SECONDS,
@@ -623,8 +691,25 @@ async fn handle_multipart_complete(
     let Some(store) = &state.storage else {
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     };
+    // The submitted list is the client's, so it is reconciled against the parts
+    // this relay actually issued before a single key is built from it. A repeated
+    // part number would otherwise be assembled twice and still add up to the
+    // reserved total, and a number never issued names an object of somebody
+    // else's session.
+    let Ok(recorded) = store::recorded_parts(pool, session_uuid).await else {
+        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    };
     let mut ordered = parts.to_vec();
     ordered.sort_by_key(|(number, _)| *number);
+    if ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
+    }
+    if ordered
+        .iter()
+        .any(|(number, _)| !recorded.contains(&(*number as i32)))
+    {
+        return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
+    }
     let keys: Vec<BlobKey> = ordered
         .iter()
         .map(|(number, _etag)| own_part_key(session_uuid, *number))
@@ -659,12 +744,35 @@ async fn handle_multipart_complete(
         tracing::warn!(error = %error, "media: could not assemble a multipart upload");
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     }
-    for key in &keys {
-        let _ = store.delete(key).await;
-    }
+    // Completion is recorded before the parts are cleaned up, and the order is the
+    // whole point. `Backpressure` tells the client to retry, and a retry re-enters
+    // above and heads the parts: with the parts already deleted and `completed_at`
+    // never written, every retry heads an object that is gone, answers
+    // `MalformedHeader`, and the exactly-once short circuit never engages. The
+    // session would be stranded forever with its final object sitting in the bucket.
+    // Recording first makes the retry hit that short circuit and receive the same
+    // `MultipartCompleted` the first call would have, which is what exactly-once
+    // means. Nothing is lost by the swap: `assemble` has already succeeded, so the
+    // final object exists, and the parts are dead weight rather than state.
     if let Err(error) = store::complete_multipart(pool, session_uuid).await {
         tracing::warn!(error = %error, "media: could not mark a multipart session complete");
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    }
+    // A part that will not delete is an orphan, not a failure of this call: the
+    // client's object is assembled and its session is finalized. Counted and logged
+    // rather than discarded with `let _`, because a silent orphan is storage nobody
+    // is looking for. No key or part number is logged; the count is the signal.
+    let mut orphaned = 0u32;
+    for key in &keys {
+        if store.delete(key).await.is_err() {
+            orphaned += 1;
+        }
+    }
+    if orphaned > 0 {
+        tracing::warn!(
+            orphaned,
+            "media: multipart parts survived completion and were not deleted"
+        );
     }
     Frame::Blob {
         payload: wire::Response::MultipartCompleted.encode(),
@@ -672,7 +780,7 @@ async fn handle_multipart_complete(
 }
 
 async fn handle_multipart_abort(
-    _state: &Arc<RelayState>,
+    state: &Arc<RelayState>,
     session: &Session,
     pool: &sqlx::PgPool,
     session_id: &[u8],
@@ -687,6 +795,37 @@ async fn handle_multipart_abort(
         Ok(workspace) => workspace,
         Err(code) => return Frame::Error(FrameError::new(code)),
     };
+    // A completed session has an assembled object in the bucket and an
+    // unfinalized reservation row, because finalization happens at manifest
+    // claim. Releasing it would return the quota for bytes that are still
+    // stored, and, worse, `gc::sweep_unreferenced_storage` builds its known set
+    // from reservation rows, so the object the client was told was stored would
+    // be swept immediately. An abort after a completion is a client error, not a
+    // reversal.
+    if multipart.completed {
+        return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
+    }
+    // A repeated abort is answered the same way the first one was, and does not
+    // run the release a second time.
+    if multipart.aborted {
+        return Frame::Blob {
+            payload: wire::Response::MultipartAborted.encode(),
+        };
+    }
+    // The parts are deleted before the reservation is released, because the
+    // release is what makes the bytes free: an abort that returned the quota and
+    // left the parts in the bucket is a loop for unbounded unaccounted storage.
+    // Deleting an object that is not there is not an error on either backend, so
+    // a repeated abort is idempotent.
+    if let Some(store) = &state.storage {
+        if let Ok(parts) = store::recorded_parts(pool, session_uuid).await {
+            for part_number in parts {
+                let _ = store
+                    .delete(&own_part_key(session_uuid, part_number as u32))
+                    .await;
+            }
+        }
+    }
     let _ = store::abort_multipart(pool, session_uuid).await;
     let _ = store::release(pool, &workspace, multipart.reservation_id).await;
     Frame::Blob {
@@ -724,6 +863,7 @@ async fn handle_control(
 }
 
 async fn handle_manifest(
+    state: &Arc<RelayState>,
     session: &Session,
     pool: &sqlx::PgPool,
     record: &wire::RetentionManifest,
@@ -732,6 +872,42 @@ async fn handle_manifest(
         Ok(workspace) => workspace,
         Err(code) => return Frame::Error(FrameError::new(code)),
     };
+    // The manifest claim is what turns reserved bytes into stored bytes, so it is
+    // the last moment the relay can compare what the client declared against what
+    // it actually wrote. Without this the declaration is the accounting: reserve
+    // one byte, PUT sixty-four megabytes, claim it, and the workspace is charged
+    // one byte forever while the bucket holds the rest. Measured here rather than
+    // inside `retention::apply_manifest` because the object store is the socket
+    // layer's to reach; the retention module takes a pool and nothing else.
+    if let Some(store) = &state.storage {
+        for hash in &record.blobs {
+            let Ok(Some(reservation)) =
+                store::find_active_reservation(pool, &workspace, &record.group, hash).await
+            else {
+                continue;
+            };
+            // An already finalized reservation was charged by an earlier manifest,
+            // and re-naming a hash is ordinary: nothing further is booked for it.
+            if reservation.finalized {
+                continue;
+            }
+            let Ok(key) = object_key(&workspace, &record.group, hash) else {
+                continue;
+            };
+            match store.head(&key).await {
+                // Longer than declared is the under-declaration this refuses. A
+                // shorter object is the client's own loss, charged at what it
+                // asked for, and refusing it would fail an honest early flush.
+                Ok(Some(info)) if info.len > reservation.bytes as u64 => {
+                    return Frame::Error(FrameError::new(ErrorCode::HashMismatch))
+                }
+                Err(error) if error.is_transient() => {
+                    return Frame::Error(FrameError::new(ErrorCode::Backpressure))
+                }
+                _ => {}
+            }
+        }
+    }
     match retention::apply_manifest(pool, &workspace, record).await {
         Ok(retention::ManifestOutcome::Accepted { digest }) => Frame::Blob {
             payload: wire::Response::RetentionAck { digest }.encode(),

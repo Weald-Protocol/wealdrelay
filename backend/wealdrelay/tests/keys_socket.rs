@@ -11,6 +11,7 @@ mod support;
 
 use wealdrelay::frame::{ErrorCode, Frame, KeysBody};
 use wealdrelay::health::Clock;
+use wealdrelay::keys::MAX_PACKAGE_BYTES;
 use wealdrelay::session::{KEYS_FRAMES_PER_MINUTE, MAX_KEY_PACKAGE_FETCH};
 
 use support::{config_for, make_group, other_device, Client, Running, Scratch};
@@ -215,6 +216,51 @@ async fn keys_before_auth_is_refused_like_every_frame_except_join() {
     match stranger.recv_frame().await {
         Frame::Error(error) => assert_eq!(error.code, ErrorCode::MalformedHeader),
         other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// WEALD-L150. The hundred-package cap is a count, so a shelf of individually
+/// legal packages could answer a maximum-count fetch with a frame the codec
+/// refuses, by which time the packages are consumed and delivered to nobody. The
+/// ceiling is therefore enforced at publish, where a refusal costs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_key_package_is_refused_at_publish_and_the_shelf_is_untouched() {
+    let scratch = Scratch::new("keys_socket_package_ceiling").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = make_group(&relay.state, 0x4a).await;
+
+    // Small enough to be a legal frame on its own, large enough that
+    // MAX_KEY_PACKAGE_FETCH of them could not be answered in one.
+    let oversized = vec![0x5au8; MAX_PACKAGE_BYTES + 1];
+    assert!(
+        MAX_PACKAGE_BYTES * (MAX_KEY_PACKAGE_FETCH as usize) < wealdrelay::frame::MAX_FRAME_BYTES,
+        "the ceiling must keep a full fetch inside one frame"
+    );
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake(vec![group.clone()], CLOCK).await;
+    ada.send_frame(&Frame::Keys(KeysBody::Publish {
+        packages: vec![package(1), oversized],
+    }))
+    .await;
+    match ada.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::EnvelopeTooLarge),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // The refusal is all or nothing: the legal package in the same frame is not
+    // on the shelf either.
+    ada.send_frame(&Frame::Keys(KeysBody::Publish {
+        packages: vec![package(2)],
+    }))
+    .await;
+    match ada.recv_frame().await {
+        Frame::Keys(KeysBody::Published { remaining }) => assert_eq!(remaining, 1),
+        other => panic!("expected a shelf depth, got {other:?}"),
     }
 
     relay.shutdown().await;

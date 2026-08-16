@@ -916,3 +916,139 @@ fn two_different_answers_are_not_equal() {
     assert_ne!(from_ahead.send, from_behind.send);
     assert_ne!(from_ahead.want, from_behind.want);
 }
+
+/// WEALD-297. One id the relay does not hold used to make it answer with every id
+/// in the span.
+///
+/// The `Fingerprint` arm has always split a range too wide to list. The `IdList`
+/// arm did not, so a client that opened with a single unknown id over the whole
+/// space got back an id list the size of the group. Past `MAX_IDS_PER_RANGE` that
+/// reply is one the client's own decoder refuses, so the group could never
+/// reconcile again, and each retry cost a full scan and a multi-megabyte encode.
+#[test]
+fn a_single_unknown_id_over_the_whole_space_does_not_produce_an_unencodable_reply() {
+    let relay = items(1..=5_000);
+    let opening = Message {
+        ranges: vec![Range::new(INFINITY, Mode::IdList(vec![id(999_999)]))],
+    };
+
+    let response = respond(&relay, &opening);
+
+    for range in &response.reply.ranges {
+        if let Mode::IdList(ids) = &range.mode {
+            assert!(
+                ids.len() <= IDLIST_LIMIT,
+                "a reply range carries {} ids, over the {IDLIST_LIMIT} the wire and \
+                 the fingerprint arm both bound it to",
+                ids.len()
+            );
+        }
+    }
+
+    // And the reply is one the peer can actually read back, which is the property
+    // the group's ability to converge rests on.
+    let encoded = response.reply.encode();
+    let decoded = Message::decode(&encoded).expect("the relay's own reply must decode");
+    assert_eq!(decoded, response.reply);
+
+    // The relay still pushes what the client is visibly missing.
+    assert_eq!(response.push.len(), relay.len());
+}
+
+/// The bounded case is unchanged: a small range still gets a plain id list, which
+/// is what makes the exchange settle in one more round rather than splitting
+/// forever.
+#[test]
+fn an_id_list_over_a_range_within_the_limit_is_still_answered_with_ids() {
+    let relay = items(1..=IDLIST_LIMIT as u64);
+    let opening = Message {
+        ranges: vec![Range::new(INFINITY, Mode::IdList(vec![id(999_999)]))],
+    };
+    let response = respond(&relay, &opening);
+    assert_eq!(
+        response.reply.ranges,
+        vec![Range::new(INFINITY, Mode::IdList(ids_of(&relay)))]
+    );
+}
+
+/// WEALD-325, the client half of WEALD-297. `advance` answered a disagreeing id
+/// list with every id it held in the span, so a client holding more than
+/// `MAX_IDS_PER_RANGE` items under one range produced a message the relay's own
+/// decoder refuses, byte for byte on every retry and reconnect.
+#[test]
+fn a_client_answering_a_wide_id_list_does_not_produce_an_unencodable_reply() {
+    let client = items(1..=5_000);
+    // The relay claims one id the client does not hold, over the whole space, so
+    // the sets differ and the answering arm is the one under test.
+    let incoming = Message {
+        ranges: vec![Range::new(INFINITY, Mode::IdList(vec![id(999_999)]))],
+    };
+
+    let step = advance(&client, &incoming);
+    let reply = step.reply.expect("a disagreement is answered");
+
+    for range in &reply.ranges {
+        if let Mode::IdList(ids) = &range.mode {
+            assert!(
+                ids.len() <= IDLIST_LIMIT,
+                "a reply range carries {} ids, over the {IDLIST_LIMIT} the wire and \
+                 the fingerprint arm both bound it to",
+                ids.len()
+            );
+        }
+    }
+
+    let decoded = Message::decode(&reply.encode()).expect("the client's own reply must decode");
+    assert_eq!(decoded, reply);
+
+    // The client still knows what it owes the relay and what it is missing.
+    assert_eq!(step.send.len(), client.len());
+    assert_eq!(step.want, vec![id(999_999)]);
+}
+
+#[test]
+fn a_range_of_one_sequence_number_is_named_rather_than_re_asserted() {
+    // WEALD-351. `split` chooses boundaries at item positions and then widens each
+    // boundary past items sharing a `seq`, because a range bound *is* a `seq` and two
+    // ranges with one upper bound are a cover the decoder refuses. Feed it a set
+    // whose items all share one sequence number and the widening runs to the end on
+    // the first pass: what came back was a single fingerprinted range with
+    // `bound == upper`, byte-identical to the range being split. The peer's
+    // fingerprint still differs, so it split again, produced the same bytes again,
+    // and the exchange never terminated while paying a full scan a round.
+    //
+    // Well past IDLIST_LIMIT, so the caller had already chosen splitting over an id
+    // list and this is the arm that has to make the progress.
+    let crowded: Vec<Item> = (0..IDLIST_LIMIT as u64 * 4)
+        .map(|offset| Item {
+            seq: 77,
+            id: id(50_000 + offset),
+        })
+        .collect();
+    let opening = initiate(&crowded);
+    // One range, and it names the ids rather than fingerprinting them, which is the
+    // whole of the fix: an id list is what the peer diffs, so the next round moves
+    // envelopes instead of repeating an assertion.
+    assert_eq!(opening.ranges.len(), 1);
+    let Mode::IdList(named) = &opening.ranges[0].mode else {
+        panic!("an unsplittable range came back as a fingerprint: {opening:?}");
+    };
+    assert_eq!(named.len(), crowded.len());
+    assert!(named.len() <= MAX_IDS_PER_RANGE);
+    assert_eq!(Message::decode(&opening.encode()), Ok(opening.clone()));
+
+    // And the round after it settles: the relay holding the same set answers Skip,
+    // where before it answered the identical fingerprint range forever.
+    let response = respond(&crowded, &opening);
+    assert!(response.reply.is_settled(), "{:?}", response.reply);
+    assert!(response.push.is_empty());
+
+    // The relay that holds none of them names its own emptiness and pushes nothing
+    // it does not have, and the client's next step has something to say exactly once.
+    let response = respond(&[], &opening);
+    assert!(response.push.is_empty());
+    let step = advance(&crowded, &response.reply);
+    assert!(!step.done());
+    assert_eq!(step.send.len(), crowded.len());
+    assert!(step.want.is_empty());
+}

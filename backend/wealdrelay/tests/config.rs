@@ -177,8 +177,10 @@ fn a_value_outside_a_closed_set_is_refused_and_the_allowed_values_are_listed() {
 fn every_permitted_value_of_every_closed_set_is_accepted() {
     // The other half: a spec value this build refuses would be a deployment path
     // that cannot be configured.
-    assert_eq!(resolve(keys::TLS, "acme").unwrap().tls, TlsMode::Acme);
-    assert_eq!(resolve(keys::TLS, "file").unwrap().tls, TlsMode::File);
+    // `acme` and `file` parse into their variants but are refused later by
+    // `enforce_tls`, because nothing in this build wraps the listener. Parsing is
+    // asserted here; the refusal is asserted in
+    // `a_tls_mode_is_refused_because_nothing_in_this_build_wraps_the_listener`.
     assert_eq!(resolve(keys::TLS, "off").unwrap().tls, TlsMode::Off);
     assert_eq!(
         resolve(keys::ACCESS_SET, "off").unwrap().access_set,
@@ -331,6 +333,29 @@ fn a_listen_address_must_be_host_and_port() {
     );
 }
 
+/// A capacity of zero is a relay that boots, reports ready and then refuses every
+/// write with a quota error the operator never asked for. Refused at boot naming
+/// the variable, while `unlimited` still means no ceiling.
+#[test]
+fn a_zero_capacity_is_refused_at_boot_rather_than_starving_every_write() {
+    for key in [keys::MAX_STORAGE_GB, keys::MAX_LOG_GB] {
+        let error = resolve(key, "0").expect_err("zero is refused");
+        assert_eq!(error, ConfigError::ZeroLimit { key });
+        assert_eq!(error.key(), Some(key));
+        assert!(resolve(key, "unlimited").is_ok());
+    }
+    assert_eq!(
+        resolve(keys::MAX_LOG_GB, "unlimited").unwrap().max_log_gb,
+        Limit::Unlimited
+    );
+    assert_eq!(
+        resolve(keys::MAX_STORAGE_GB, "unlimited")
+            .unwrap()
+            .max_storage_gb,
+        Limit::Unlimited
+    );
+}
+
 #[test]
 fn a_limit_is_a_number_or_the_word_unlimited() {
     for key in [keys::MAX_STORAGE_GB, keys::RETENTION_DAYS] {
@@ -354,8 +379,8 @@ fn a_limit_is_a_number_or_the_word_unlimited() {
         Limit::Of(7)
     );
     assert_eq!(
-        resolve(keys::MAX_STORAGE_GB, "0").unwrap().max_storage_gb,
-        Limit::Of(0)
+        resolve(keys::MAX_STORAGE_GB, "1").unwrap().max_storage_gb,
+        Limit::Of(1)
     );
     assert_eq!(
         resolve(keys::MAX_STORAGE_GB, "UNLIMITED")
@@ -645,7 +670,14 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     // straight into a decode, an authorization read and a Postgres transaction,
     // so any admitted device could drive the database at line rate with 1 MiB
     // frames (`crate::send_budget`, `specs/backend/relay/wire.md`).
-    assert_eq!(keys::ALL.len(), 35);
+    // 37 with WEALD_RELAY_JANITOR_INTERVAL_MS and
+    // WEALD_RELAY_GC_MIN_OBJECT_AGE_SECONDS, the two the background janitor reads:
+    // how often it wakes, and how old an unreferenced object must be before it is
+    // collected. The age floor is the one that matters, because an object is
+    // written before the envelope that references it, so a sweep with no floor
+    // would collect a blob that was seconds away from being pointed at
+    // (`src/janitor.rs`).
+    assert_eq!(keys::ALL.len(), 38);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
 }
 
@@ -707,6 +739,21 @@ fn a_shared_fanout_url_is_refused_because_this_build_does_not_implement_one() {
         resolve(keys::LIVE_FANOUT, "redis://localhost:6379").expect_err("shared fanout refused");
     assert!(matches!(error, ConfigError::LiveFanoutUnavailable { .. }));
     assert_eq!(error.key(), Some(keys::LIVE_FANOUT));
+}
+
+#[test]
+fn a_tls_mode_is_refused_because_nothing_in_this_build_wraps_the_listener() {
+    // `serve::bind` binds bare TcpListeners and `serve::run` hands them to
+    // `axum::serve` unwrapped, so accepting either mode would have bound the
+    // public address in cleartext while `--check-config` printed the mode back
+    // as confirmation that it had not.
+    for mode in ["acme", "file"] {
+        let error = resolve(keys::TLS, mode).expect_err("tls mode refused");
+        assert!(matches!(error, ConfigError::TlsUnavailable { .. }));
+        assert_eq!(error.key(), Some(keys::TLS));
+    }
+    let config = resolve(keys::TLS, "off").expect("tls off resolves");
+    assert_eq!(config.tls, TlsMode::Off);
 }
 
 #[test]
@@ -1351,4 +1398,81 @@ fn the_hosted_profile_refuses_a_loopback_ringer() {
     ])
     .expect("a hosted relay with a real ringer starts");
     assert_eq!(config.push, PushMode::On);
+}
+
+// MARK: The environment we actually ship
+
+/// The self-host Compose bundle's relay environment has to resolve.
+///
+/// It did not. `docker-compose.yml` set `WEALD_RELAY_REDIS_URL` for a redis
+/// service and never set `WEALD_RELAY_LIVE`, which defaults on, and
+/// `enforce_live_fanout` refuses exactly that pair: the download exited 78 on
+/// first boot and no self-hoster ever reached a running relay. Nothing in this
+/// crate's tests read the deploy directory, so every config test passed while
+/// the one configuration a customer actually receives could not start.
+///
+/// This parses the shipped file rather than restating it, so a future edit that
+/// reintroduces an illegal combination fails here instead of in somebody's
+/// terminal. See WEALD-468.
+#[test]
+fn the_shipped_compose_environment_resolves() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/deploy/compose/docker-compose.yml"
+    );
+    let text = std::fs::read_to_string(path).expect("the compose bundle is part of the repo");
+
+    // The relay service's `environment:` block, which is the last one in the file
+    // that carries WEALD_RELAY_ keys alongside the database url.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "environment:" {
+            inside = trimmed.starts_with("environment:") && line.starts_with("    ");
+            continue;
+        }
+        if inside && !line.starts_with("      ") {
+            inside = false;
+        }
+        if !inside || trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(": ") else {
+            continue;
+        };
+        if !key.starts_with("WEALD_RELAY_") {
+            continue;
+        }
+        // Compose interpolation is not this test's business; substitute the
+        // documented defaults so the values are the shapes the relay parses.
+        let value = value.trim().trim_matches('"');
+        let value = match value {
+            v if v.contains("${WEALD_RELAY_HOSTNAME") => "relay.acme.com".to_string(),
+            v if v.contains("${POSTGRES_PASSWORD") => {
+                "postgres://wealdrelay:pw@postgres:5432/wealdrelay".to_string()
+            }
+            v if v.contains("${MINIO_BUCKET") => "s3://weald-blobs".to_string(),
+            v if v.contains("unlimited") => "unlimited".to_string(),
+            v => v.to_string(),
+        };
+        pairs.push((key.to_string(), value));
+    }
+
+    assert!(
+        pairs.iter().any(|(k, _)| k == keys::HOSTNAME),
+        "parsed no relay environment out of the compose file: {pairs:?}"
+    );
+    let borrowed: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let config = Config::resolve(&Values::from_pairs(borrowed))
+        .expect("the shipped compose environment must start a relay");
+
+    // And the two values the bundle exists to get right: TLS is terminated by the
+    // Caddy in front, and the relay is told how many proxies that is, so its
+    // per-source bucket keys on the client and not on the Caddy container.
+    assert_eq!(config.tls, TlsMode::Off);
+    assert_eq!(config.trusted_proxy_hops, 1);
 }

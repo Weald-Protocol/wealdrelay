@@ -107,9 +107,19 @@ pub const DEFAULT_COALESCE_MS: u64 = 2000;
 /// answering, and a relay that runs out of memory has failed at its actual job.
 pub const WAKE_DEADLINE_MS: u64 = 2000;
 
-/// The path the ringer serves registration on, appended to the wake URL when
+/// The path the ringer serves registration on, substituted for the wake path when
 /// `WEALD_RELAY_PUSH_REGISTER_URL` is not set. `ringer.md` route 1.
 pub const RINGER_REGISTER_PATH: &str = "/v1/handles";
+
+/// The path the ringer serves wakes on. `ringer.md` route 3, and the tail of every
+/// `WEALD_RELAY_PUSH_URL` the registry's shape permits ("https url of a ringer's
+/// POST /v1/wake route").
+///
+/// It exists so the register default is a substitution rather than an append.
+/// Appending produced `https://host/v1/wake/v1/handles`, a 404 the relay states to
+/// every device in `Capability`, which is a push deployment where nothing ever
+/// registers and no relay-side test can see it.
+pub const RINGER_WAKE_PATH: &str = "/v1/wake";
 
 /// What a wake says, and the whole of what it says.
 ///
@@ -228,6 +238,19 @@ pub struct Settings {
     pub queue_bound: usize,
 }
 
+/// The register route a wake url implies, when the operator named none.
+///
+/// A substitution and not an append. `WEALD_RELAY_PUSH_URL` is a whole route, so the
+/// wake path is trimmed off the end before the registration path goes on; a url that
+/// does not end in the wake path is a ringer mounted somewhere this function cannot
+/// reason about, and the path is appended to it unchanged, which is what the operator
+/// gets to override with `WEALD_RELAY_PUSH_REGISTER_URL`.
+fn default_register_url(wake_url: &str) -> String {
+    let base = wake_url.trim_end_matches('/');
+    let base = base.strip_suffix(RINGER_WAKE_PATH).unwrap_or(base);
+    format!("{}{RINGER_REGISTER_PATH}", base.trim_end_matches('/'))
+}
+
 impl Settings {
     /// Read the six variables into the shape this module uses.
     ///
@@ -242,11 +265,7 @@ impl Settings {
         let register_url = config
             .push_register_url
             .clone()
-            .or_else(|| {
-                wake_url
-                    .as_deref()
-                    .map(|url| format!("{}{RINGER_REGISTER_PATH}", url.trim_end_matches('/')))
-            })
+            .or_else(|| wake_url.as_deref().map(default_register_url))
             .unwrap_or_default();
         Self {
             wake_url,

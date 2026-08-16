@@ -56,6 +56,39 @@ impl S3Store {
         }
     }
 
+    /// Put a file at a literal object key, outside the blob namespace and
+    /// without the configured prefix.
+    ///
+    /// The one caller is `backup`, whose `--out s3://bucket/key` names the whole
+    /// key itself: it is not a blob, it has no workspace and no group, and
+    /// prefixing it would put the artifact somewhere other than where the
+    /// operator said. Streamed from the path rather than read into memory,
+    /// because the tarball is the whole relay and the blob path's "one object at
+    /// a time" ceiling does not apply to it.
+    pub async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<(), StorageError> {
+        let body = ByteStream::from_path(path)
+            .await
+            .map_err(|error| StorageError::ReadFailed {
+                reason: format!("read {}: {error}", path.display()),
+            })?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| {
+                match Self::map_error(&format!("put {}/{key}", self.bucket), error) {
+                    transient @ StorageError::Unreachable { .. } => transient,
+                    other => StorageError::WriteFailed {
+                        reason: other.to_string(),
+                    },
+                }
+            })?;
+        Ok(())
+    }
+
     fn object_key(&self, key: &BlobKey) -> String {
         self.join(&key.path())
     }
@@ -196,8 +229,21 @@ impl BlobStore for S3Store {
     }
 
     async fn list(&self, workspace: &str, group: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .list_entries(workspace, group)
+            .await?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    async fn list_entries(
+        &self,
+        workspace: &str,
+        group: &str,
+    ) -> Result<Vec<super::BlobEntry>, StorageError> {
         let under = self.join(&format!("{workspace}/{group}/"));
-        let mut out = Vec::new();
+        let mut out: Vec<super::BlobEntry> = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut request = self
@@ -212,7 +258,10 @@ impl BlobStore for S3Store {
                 .send()
                 .await
                 .map_err(|error| Self::map_error(&format!("list {under}"), error))?;
-            for key in page.contents().iter().filter_map(|object| object.key()) {
+            for object in page.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
                 // Stripped rather than split on the last separator, so a key the
                 // server returned that is not actually under the prefix is dropped
                 // instead of being reported as a blob in this group. The result is
@@ -221,9 +270,23 @@ impl BlobStore for S3Store {
                 let Some(name) = key.strip_prefix(under.as_str()) else {
                     continue;
                 };
-                if !name.is_empty() {
-                    out.push(name.to_string());
+                if name.is_empty() {
+                    continue;
                 }
+                // `LastModified` comes back on every listed object, which is why
+                // the age floor costs no second request: one Class A list already
+                // carries what a per-object `head` would have been billed for.
+                // Seconds and nanoseconds rather than the fallible millisecond
+                // helper: both are infallible accessors, and a time before the
+                // epoch is not a time an object store reports.
+                let modified_ms = object.last_modified().and_then(|stamp| {
+                    let seconds = u64::try_from(stamp.secs()).ok()?;
+                    Some(seconds * 1000 + u64::from(stamp.subsec_nanos()) / 1_000_000)
+                });
+                out.push(super::BlobEntry {
+                    name: name.to_string(),
+                    modified_ms,
+                });
             }
             // Paginated rather than truncated: a group with more than a thousand
             // blobs is ordinary at the stated posture, and a list that silently
@@ -237,7 +300,7 @@ impl BlobStore for S3Store {
             }
             break;
         }
-        out.sort();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
@@ -396,16 +459,27 @@ impl S3Store {
         Ok(total)
     }
 
-    /// A presigned PUT for `key`, valid for `ttl`.
+    /// A presigned PUT for `key`, valid for `ttl` and bound to `content_length`.
     ///
     /// `media.md`: "a presigned PUT URL valid for 15 minutes". One object per
     /// call: the multipart path (step 9) issues one of these per part rather than
     /// using S3's own multipart API, so both storage backends share exactly one
     /// finalization path in `media::gc` and `media::store` instead of two.
+    ///
+    /// The length is signed rather than merely recorded. The relay charges the
+    /// quota against the length the client declared in `BLOB put` and never
+    /// re-measures the object, so a URL that accepts any body at all makes the
+    /// quota advisory: declare one byte, presign, and PUT five gigabytes to it.
+    /// Signing `Content-Length` puts the ceiling in the object store, where the
+    /// bytes actually arrive: a request whose header differs from the signed value
+    /// fails the signature, and a body that does not match its own header is
+    /// refused by S3 itself. `None` leaves the request unbound and is for the read
+    /// path, which writes nothing.
     pub async fn presign_put(
         &self,
         key: &BlobKey,
         ttl: std::time::Duration,
+        content_length: Option<i64>,
     ) -> Result<String, StorageError> {
         let config =
             aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl).map_err(|error| {
@@ -418,6 +492,7 @@ impl S3Store {
             .put_object()
             .bucket(&self.bucket)
             .key(self.object_key(key))
+            .set_content_length(content_length)
             .presigned(config)
             .await
             .map_err(|error| Self::map_error(&format!("presign put {}", key.path()), error))?;

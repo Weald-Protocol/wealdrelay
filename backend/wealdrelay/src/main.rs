@@ -26,6 +26,28 @@ fn main() -> std::process::ExitCode {
 
     match startup(args, &values) {
         Startup::Print(outcome) => report(&outcome.stdout, &outcome.stderr, outcome.code),
+        Startup::Backup { config, request } => {
+            // No subscriber: a backup writes one line to stdout and an operator
+            // pipes it. JSON log lines around it would be noise in a script.
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return report(
+                        "",
+                        &format!("wealdrelay: cannot start the runtime: {error}"),
+                        wealdrelay::EXIT_UNAVAILABLE,
+                    )
+                }
+            };
+            match runtime.block_on(wealdrelay::backup::run(&config, &request)) {
+                Ok(bytes) => report(
+                    &format!("wrote {} ({bytes} bytes)", request.out.describe()),
+                    "",
+                    0,
+                ),
+                Err(error) => report("", &format!("wealdrelay: {error}"), error.exit_code()),
+            }
+        }
         Startup::Serve(config) => {
             // The subscriber is installed only on the serving path. `--version`
             // writing a JSON log line before its answer would break every script

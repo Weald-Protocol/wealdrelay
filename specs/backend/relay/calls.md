@@ -233,7 +233,22 @@ is refused either way, and what is economised is the complaint.
 | max `CALL.body` bytes | 4096 | `reject/envelope_too_large` | | 4096 |
 | participants per call | 5 | `quota/rate_limited` | 5 | 5 |
 | concurrent calls per instance | `WEALD_RELAY_MAX_CONCURRENT_CALLS` | `quota/rate_limited` | 5 | the ceiling |
+| calls opened per connection | a quarter of the ceiling, at least 1 | `quota/rate_limited` | 5 | the ceiling |
 | concurrent connections per instance | `WEALD_RELAY_MAX_CONNECTIONS` | HTTP 503 with `Retry-After` | | |
+
+The per-connection share exists because the instance ceiling is a finite table
+shared by every workspace the process carries, and a finite table with no
+per-source share is a table one source takes. A call is created by the first
+`Offer` naming a fresh id and released only when its last participant leaves, so
+before the share one admitted device sending fresh call ids inside its 120 frames
+a minute held every slot for the life of its socket, and every other customer's
+calls were refused (WEALD-340). The number and its reasoning are the connection
+table's: at most a quarter, never less than one, released as calls end. It is
+spent only on *opening* a call, so answering a call somebody else opened is never
+refused by it, and the refusal reuses `quota/rate_limited` because the client's
+correct next move is the same one and a distinct code would tell an attacker
+which of the two ceilings it found. The operator's distinction is
+`call_stats.calls_share_refused`, which is where it is actionable.
 
 One code for the three media limits and three different intervals, which is not
 an inconsistency. The code is what a client *branches* on and its correct
@@ -363,6 +378,8 @@ On `/readyz`, on the private listener only:
 - `call_stats.open`: calls open right now
 - `call_stats.media_shed`: media frames dropped for a full queue, since start
 - `call_stats.media_denied`: media frames refused as unadmitted, since start
+- `call_stats.calls_share_refused`: calls refused because one connection already
+  held its share of the table, since start
 - `call_stats.connections` and `call_stats.connections_refused`
 
 Capacity, never identity. Not one of them is per call, per group or per

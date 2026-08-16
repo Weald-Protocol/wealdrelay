@@ -203,13 +203,15 @@ async fn five_wrong_codes_cool_one_tuple_down_and_burn_nothing() {
         Verdict::Unavailable
     );
 
-    // Nothing was burnt. All ten seats are there, the invite is live, and a second
-    // device behind the same shared invite joins on the first try.
+    // Nothing was burnt. All ten seats are there and the invite is live.
     let stored = store::fetch(pool, &record.token).await.unwrap().unwrap();
     assert_eq!(stored.remaining, 10);
     assert_eq!(stored.state, State::Live);
+    // A fresh device value from the cooled source buys nothing: the cooldown is
+    // keyed on the source because the device is whatever bytes the caller supplied
+    // (WEALD-287), so a guesser minting a new device per attempt is still bounded.
     let other_device = vec![0x53; 32];
-    assert!(matches!(
+    assert_eq!(
         reserve::reserve(
             pool,
             &record.token,
@@ -217,6 +219,22 @@ async fn five_wrong_codes_cool_one_tuple_down_and_burn_nothing() {
             &nonce(2),
             &other_device,
             &source,
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Unavailable
+    );
+    // A colleague on their own address is untouched and joins on the first try.
+    let other_source = vec![0x54; 32];
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(2),
+            &other_device,
+            &other_source,
             NOW
         )
         .await
@@ -240,6 +258,192 @@ async fn five_wrong_codes_cool_one_tuple_down_and_burn_nothing() {
         .unwrap(),
         Verdict::Reserved { .. }
     ));
+    scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_fresh_device_per_attempt_buys_no_fresh_allowance_and_writes_no_fresh_row() {
+    // WEALD-287. The device value in a `Reserve` frame is an arbitrary byte string
+    // chosen by the caller, pre-authentication. The old cooldown key included it,
+    // so every attempt with a new device was a new tuple with `failures = 1` and
+    // the five-guess bound was unbounded from one address. The key is now the
+    // source, and this is the property: N attempts with N distinct device values
+    // from one source are refused after the configured ceiling.
+    let (scratch, _blobs, state) = prepared("device_minting").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(0x0a0a0a);
+    let record = issue(
+        &key(1),
+        token(0xc7),
+        code,
+        10,
+        NOW as u64 + invite::DEFAULT_EXPIRY_MS,
+    );
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+
+    let wrong = Code::from_bits(0x0a0a0b).grouped();
+    let source = vec![0x58; 32];
+    // Far more attempts than the ceiling, every one wearing a fresh device.
+    for attempt in 0u8..20 {
+        let device = vec![attempt; 32];
+        let verdict = reserve::reserve(
+            pool,
+            &record.token,
+            &wrong,
+            &nonce(attempt),
+            &device,
+            &source,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verdict, Verdict::Unavailable, "attempt {attempt}");
+    }
+
+    // The right code from that source, on yet another fresh device, is refused:
+    // the source is cooled down and the device is not part of the key.
+    assert_eq!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(0x30),
+            &[0xee; 32],
+            &source,
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Unavailable
+    );
+
+    // One row for the source, not one per minted device: the attempt table is
+    // bounded by real addresses rather than by strings the guesser invents.
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from relay_invite_attempt where token = $1")
+            .bind(&record.token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "a minted device wrote its own row");
+
+    // And the cooled attempts stopped counting failures: the early return happens
+    // before the code is parsed or hashed, so a token in cooldown never reaches
+    // Argon2id and never moves the counter.
+    let failures: i32 =
+        sqlx::query_scalar("select failures from relay_invite_attempt where token = $1")
+            .bind(&record.token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        failures,
+        wealdrelay::invite::code::MAX_FAILURES,
+        "attempts inside the cooldown still ran the verification path"
+    );
+
+    scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_guesser_spread_over_many_sources_is_bounded_by_the_token_ceiling() {
+    // The second half of WEALD-287: dropping the device from the key must not
+    // leave "one source per guess" as the workaround, so the token itself cools
+    // down once the failures across every source reach the global ceiling.
+    let (scratch, _blobs, state) = prepared("distributed").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(0x0b0b0b);
+    let record = issue(
+        &key(1),
+        token(0xc8),
+        code,
+        10,
+        NOW as u64 + invite::DEFAULT_EXPIRY_MS,
+    );
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+
+    let wrong = Code::from_bits(0x0b0b0c).grouped();
+    let per_source = i64::from(wealdrelay::invite::code::MAX_FAILURES);
+    let sources_to_ceiling = wealdrelay::invite::code::MAX_TOKEN_FAILURES / per_source;
+    for source_index in 0..sources_to_ceiling {
+        let source = vec![0x80 + source_index as u8; 32];
+        for attempt in 0..per_source {
+            let verdict = reserve::reserve(
+                pool,
+                &record.token,
+                &wrong,
+                &nonce(attempt as u8),
+                &[0x59; 32],
+                &source,
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert_eq!(verdict, Verdict::Unavailable);
+        }
+    }
+
+    // A brand-new source holding the right code is refused: the token-wide sum
+    // has reached the ceiling, so a distributed guesser gains nothing by
+    // rotating addresses.
+    assert_eq!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(0x40),
+            &[0x59; 32],
+            &[0xaa; 32],
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Unavailable
+    );
+
+    // Nothing was burnt, exactly as with the per-source cooldown.
+    let stored = store::fetch(pool, &record.token).await.unwrap().unwrap();
+    assert_eq!(stored.remaining, 10);
+    assert_eq!(stored.state, State::Live);
+
+    // After the cooldown interval the stale rows are swept by the next failed
+    // attempt, so the table is bounded and the token recovers.
+    let later = NOW + 16 * 60 * 1000;
+    let _ = reserve::reserve(
+        pool,
+        &record.token,
+        &wrong,
+        &nonce(0x41),
+        &[0x59; 32],
+        &[0xab; 32],
+        later,
+    )
+    .await
+    .unwrap();
+    let rows: i64 =
+        sqlx::query_scalar("select count(*) from relay_invite_attempt where token = $1")
+            .bind(&record.token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "stale attempt rows were not swept");
+
+    // And the right code from an untainted source is served again.
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(0x42),
+            &[0x59; 32],
+            &[0xac; 32],
+            later
+        )
+        .await
+        .unwrap(),
+        Verdict::Reserved { .. }
+    ));
+
     scratch.drop_database().await;
 }
 
@@ -512,6 +716,219 @@ async fn revocation_writes_the_tombstone_before_it_deletes_the_ciphertext() {
     scratch.drop_database().await;
 }
 
+/// Revoking mid-join stops the join, and the joiner's own frames cannot undo it.
+///
+/// The failure this pins: `terminate` marks the invite but leaves the reservation
+/// standing, so a commit judged against the reservation alone kept being accepted,
+/// and the final one called `grant`, whose upsert used to clear `voided_at` and
+/// re-arm the grant to the invite's original expiry. Revocation was undone by the
+/// party it was aimed at. WEALD-286.
+#[tokio::test]
+async fn revoking_mid_join_stops_the_commits_and_the_last_one_cannot_revive_the_grant() {
+    let (scratch, _blobs, state) = prepared("revoke_midjoin").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(41);
+    let record = ordinary(0x2a, code);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let device = vec![0x91; 32];
+
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(1),
+            &device,
+            &[0x92; 32],
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Reserved { .. }
+    ));
+
+    // The admin revokes between two frames of the same join.
+    assert!(store::revoke(pool, &record.token).await.unwrap());
+    assert!(access_store::grant_is_voided(pool, WORKSPACE, &device)
+        .await
+        .unwrap());
+
+    // Every remaining Commit is refused, including the last one.
+    assert!(
+        reserve::scope_commit(pool, &record.token, &nonce(1), &device, &root(), NOW)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The seat was not spent by a refused commit, and the grant is still void.
+    let consumed: bool = sqlx::query(
+        "select consumed_at is not null as done from relay_invite_reservation \
+         where token = $1 and join_nonce = $2",
+    )
+    .bind(&record.token)
+    .bind(nonce(1))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get("done");
+    assert!(!consumed);
+    assert!(access_store::grant_is_voided(pool, WORKSPACE, &device)
+        .await
+        .unwrap());
+
+    // Specifically: granting again cannot clear voided_reason = 'revoked'.
+    assert!(
+        !access_store::grant(pool, WORKSPACE, &device, record.expires as i64)
+            .await
+            .unwrap()
+    );
+    let reason: String = sqlx::query_scalar(
+        "select voided_reason from relay_provisional_grant \
+         where workspace_id = $1 and device_hash = $2",
+    )
+    .bind(WORKSPACE)
+    .bind(&device)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(reason, "revoked");
+
+    // And redeeming again with the same device does not buy a fresh grant, so a
+    // revoked joiner cannot walk back through the door the revocation shut.
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(2),
+            &device,
+            &[0x92; 32],
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Unavailable
+    ));
+    scratch.drop_database().await;
+}
+
+/// Revocation ends the parked-join extension too, and leaves no live reservation
+/// behind. The extension is what made a revoked in-flight join worth waiting for: it
+/// widens a ten minute seat to the invite's whole expiry. WEALD-345.
+#[tokio::test]
+async fn revocation_leaves_no_live_reservation_and_no_extendable_one() {
+    let (scratch, _blobs, state) = prepared("revoke_extend").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(44);
+    let record = ordinary(0x2d, code);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let device = vec![0x97; 32];
+
+    reserve::reserve(
+        pool,
+        &record.token,
+        &code.grouped(),
+        &nonce(1),
+        &device,
+        &[0x98; 32],
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert!(store::revoke(pool, &record.token).await.unwrap());
+
+    // Zero live reservations for the token, because terminate releases them in its
+    // own transaction rather than trusting a cascade that never fires on an update.
+    let live: i64 = sqlx::query(
+        "select count(*) as n from relay_invite_reservation \
+         where token = $1 and released_at is null",
+    )
+    .bind(&record.token)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(live, 0);
+
+    // And the extension is refused, so a parked joiner cannot widen a dead seat.
+    assert!(!reserve::extend(pool, &record.token, &nonce(1))
+        .await
+        .unwrap());
+    scratch.drop_database().await;
+}
+
+/// The negative half: an uninterrupted join still completes, so the checks above
+/// refuse only what they are aimed at.
+#[tokio::test]
+async fn an_uninterrupted_join_still_commits_and_spends_its_seat() {
+    let (scratch, _blobs, state) = prepared("uninterrupted").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(42);
+    let record = ordinary(0x2b, code);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let device = vec![0x93; 32];
+
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(1),
+            &device,
+            &[0x94; 32],
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Reserved { .. }
+    ));
+    assert!(
+        reserve::scope_commit(pool, &record.token, &nonce(1), &device, &root(), NOW)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(!access_store::grant_is_voided(pool, WORKSPACE, &device)
+        .await
+        .unwrap());
+    scratch.drop_database().await;
+}
+
+/// An invite that ran out of time cannot be committed against, even by a
+/// reservation that was live when it was taken. The expiry used to be selected and
+/// used only as a grant duration, never enforced. WEALD-286.
+#[tokio::test]
+async fn a_commit_after_the_invite_expires_is_refused() {
+    let (scratch, _blobs, state) = prepared("commit_after_expiry").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(43);
+    let record = ordinary(0x2c, code);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let device = vec![0x95; 32];
+
+    reserve::reserve(
+        pool,
+        &record.token,
+        &code.grouped(),
+        &nonce(1),
+        &device,
+        &[0x96; 32],
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    let after = record.expires as i64 + 1;
+    assert!(
+        reserve::scope_commit(pool, &record.token, &nonce(1), &device, &root(), after)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    scratch.drop_database().await;
+}
+
 // MARK: Bundles
 
 #[tokio::test]
@@ -538,12 +955,16 @@ async fn a_refresh_keeps_the_newest_three_and_the_relay_reads_none_of_them() {
     let held = store::bundles_for(pool, &record.token, &root())
         .await
         .unwrap();
-    assert_eq!(held.len(), store::RETAINED_BUNDLES as usize);
+    // Three refreshed candidates plus the pinned one the issuer sealed into the
+    // signed record, which pruning never evicts. WEALD-338.
+    assert_eq!(held.len(), store::RETAINED_BUNDLES as usize + 1);
     // Newest first, and the ciphertext is exactly what was uploaded: the relay
     // stored it and served it and has no key that could open it.
     assert_eq!(held[0].epoch, 5);
     assert_eq!(held[0].ct, b"sealed at 5");
     assert_eq!(held[2].epoch, 3);
+    assert_eq!(held[3].epoch, 1);
+    assert_eq!(held[3].ct, b"sealed group info one");
 
     // A bogus high-epoch upload cannot mask the last valid one, because three
     // candidates are kept and the invitee accepts only an MLS-valid GroupInfo.
@@ -599,6 +1020,64 @@ async fn a_refresh_keeps_the_newest_three_and_the_relay_reads_none_of_them() {
     )
     .await
     .unwrap());
+    scratch.drop_database().await;
+}
+
+/// The negative proof for WEALD-338. `refresh_bundle` cannot verify group membership
+/// or ciphertext validity, so an admitted workspace principal can upload as many
+/// bogus candidates as it likes. Before the pin, more than `RETAINED_BUNDLES` of them
+/// at distinct epochs evicted the candidate the issuer signed, every joiner rejected
+/// every retained candidate as MLS-invalid, and an insider parked every outstanding
+/// invite without revoking one.
+#[tokio::test]
+async fn a_flood_of_bogus_updates_cannot_evict_the_candidate_the_issuer_sealed() {
+    let (scratch, _blobs, state) = prepared("bundle_flood").await;
+    let pool = pool_of(&state);
+    let record = ordinary(0x3e, Code::from_bits(77));
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let issued = record.bundles[0].clone();
+
+    // Far more than the retention bound, at distinct epochs, so every unpinned row
+    // is evicted several times over.
+    for epoch in 2..=40u64 {
+        assert!(store::refresh_bundle(
+            pool,
+            &record.token,
+            &EncBundle {
+                group: root(),
+                epoch,
+                ct: b"bogus".to_vec(),
+            }
+        )
+        .await
+        .unwrap());
+    }
+
+    // The attacker also collides with the issued row's own epoch, which would evict
+    // the valid candidate by overwrite rather than by pruning.
+    assert!(store::refresh_bundle(
+        pool,
+        &record.token,
+        &EncBundle {
+            group: root(),
+            epoch: issued.epoch,
+            ct: b"bogus overwrite".to_vec(),
+        }
+    )
+    .await
+    .unwrap());
+
+    let held = store::bundles_for(pool, &record.token, &root())
+        .await
+        .unwrap();
+    // The valid candidate is still retrievable, byte for byte, and the table is
+    // still bounded: the unpinned rows plus exactly one pinned row.
+    let pinned = held
+        .iter()
+        .find(|bundle| bundle.epoch == issued.epoch)
+        .expect("the issued candidate survives a flood");
+    assert_eq!(pinned.ct, issued.ct);
+    assert_eq!(held.len(), store::RETAINED_BUNDLES as usize + 1);
     scratch.drop_database().await;
 }
 
@@ -748,6 +1227,28 @@ async fn a_parked_join_extends_once_and_never_past_the_invite() {
     .unwrap()
     .get("ms");
     assert_eq!(held as u64, record.expires);
+
+    // And the credential the seat is useless without. `reserve` grants the device a
+    // provisional grant expiring with the ten minute reservation, and admission reads
+    // that row's own expiry rather than the reservation's, so an extension that moved
+    // only the seat left the joiner refused at AUTH while holding a live seat: exactly
+    // the case the extension exists to prevent, one layer down. WEALD-475.
+    let credential: f64 = sqlx::query(
+        "select (extract(epoch from expires_at) * 1000)::double precision as ms \
+         from relay_provisional_grant where workspace_id = $1 and device_hash = $2",
+    )
+    .bind(WORKSPACE)
+    // `0xb1u8`, not `0xb1`: an untyped integer literal makes this an `[i32; 32]`
+    // and Postgres refuses `bytea = integer[]` at parse time.
+    .bind(&[0xb1u8; 32][..])
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get("ms");
+    assert_eq!(
+        credential as u64, record.expires,
+        "the grant expired with the seat"
+    );
     scratch.drop_database().await;
 }
 
@@ -983,4 +1484,144 @@ async fn the_store_error_says_which_half_failed() {
     for state in [State::Live, State::Spent, State::Revoked] {
         assert!(!state.label().is_empty());
     }
+}
+
+#[tokio::test]
+async fn a_synchronized_burst_of_wrong_codes_spends_the_budget_once() {
+    // WEALD-336. The guess budget used to be read before Argon2id and written after
+    // it, so every connection in a burst read the same count below the ceiling, ran
+    // the verifier, and only then incremented. Sixty-four sockets from one address
+    // therefore bought sixty-four Argon2id calls against a five-guess budget, which
+    // is the amplification the budget exists to deny.
+    //
+    // The proof is the charge count, because the charge is now the gate: a slot is
+    // taken before the code is parsed and a verification cannot happen without one.
+    // Before the fix this row reads sixty-four.
+    let (scratch, _blobs, state) = prepared("burst").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(0x5150);
+    let record = issue(
+        &key(1),
+        token(0xe7),
+        code,
+        10,
+        NOW as u64 + invite::DEFAULT_EXPIRY_MS,
+    );
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+
+    const BURST: usize = 64;
+    let wrong = Code::from_bits(0x5151).grouped();
+    let source = vec![0x81; 32];
+    let gate = Arc::new(tokio::sync::Barrier::new(BURST));
+    let mut attempts = Vec::with_capacity(BURST);
+    for index in 0..BURST {
+        let pool = pool.clone();
+        let token = record.token.clone();
+        let wrong = wrong.clone();
+        let source = source.clone();
+        let gate = Arc::clone(&gate);
+        attempts.push(tokio::spawn(async move {
+            // Every task lands on the pre-check together, which is exactly the
+            // window a check-then-charge budget cannot see.
+            gate.wait().await;
+            reserve::reserve(
+                &pool,
+                &token,
+                &wrong,
+                &nonce(index as u8),
+                &[0x82; 32],
+                &source,
+                NOW,
+            )
+            .await
+            .unwrap()
+        }));
+    }
+    for attempt in attempts {
+        assert_eq!(attempt.await.unwrap(), Verdict::Unavailable);
+    }
+
+    let charged: i32 =
+        sqlx::query_scalar("select failures from relay_invite_attempt where token = $1")
+            .bind(&record.token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        charged,
+        wealdrelay::invite::code::MAX_FAILURES,
+        "a synchronized burst reached the verifier more than the budget allows"
+    );
+    // And the pair is cooled down afterwards, from the burst alone.
+    assert_eq!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(0xff),
+            &[0x82; 32],
+            &source,
+            NOW
+        )
+        .await
+        .unwrap(),
+        Verdict::Unavailable
+    );
+    // Nothing was burnt: the budget is a guess budget, not a seat.
+    let stored = store::fetch(pool, &record.token).await.unwrap().unwrap();
+    assert_eq!(stored.remaining, 10);
+    assert_eq!(stored.state, State::Live);
+    scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_correct_code_gives_its_guess_slot_back() {
+    // The charge happens before the code is checked, so an honest joiner passes
+    // through the guess budget. Five colleagues behind one office address must not
+    // cool that address down by joining successfully, so the slot is refunded once
+    // the 60-bit code has been shown. WEALD-336.
+    let (scratch, _blobs, state) = prepared("refund").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(0x2b2b);
+    let record = issue(
+        &key(1),
+        token(0xe8),
+        code,
+        10,
+        NOW as u64 + invite::DEFAULT_EXPIRY_MS,
+    );
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+
+    let source = vec![0x91; 32];
+    for joiner in 0..6u8 {
+        assert!(
+            matches!(
+                reserve::reserve(
+                    pool,
+                    &record.token,
+                    &code.grouped(),
+                    &nonce(joiner),
+                    &[0x90 + joiner; 32],
+                    &source,
+                    NOW,
+                )
+                .await
+                .unwrap(),
+                Verdict::Reserved { .. }
+            ),
+            "joiner {joiner} was refused by a budget it never spent"
+        );
+    }
+    let charged: i32 =
+        sqlx::query_scalar("select failures from relay_invite_attempt where token = $1")
+            .bind(&record.token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(charged, 0, "a correct code kept its guess slot");
+    // The issuer is told about guesses, and six correct joins are not guesses.
+    let volume = reserve::attempt_volume(pool, &record.token).await.unwrap();
+    assert_eq!(volume.failures, 0);
+    assert_eq!(volume.tuples, 0);
+    scratch.drop_database().await;
 }

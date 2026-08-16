@@ -17,18 +17,18 @@
 //! never initiates (`specs/backend/contracts/decisions/ADR-0007-one-way-polling.md`).
 //! Nothing here makes an outbound request.
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::{collections::HashMap, sync::Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, WriteMode};
 use crate::db::Database;
@@ -175,6 +175,15 @@ pub struct CallStats {
     pub media_shed: u64,
     /// Media frames refused because the sender was not in the call it named.
     pub media_denied: u64,
+    /// Calls refused because one connection already held its share of the call
+    /// table, since start.
+    ///
+    /// Beside `open` for the reason `connections_closed_handshake_deadline` sits
+    /// beside `connections_refused`: a call table at its ceiling is answered by
+    /// raising the ceiling, and one connection holding a quarter of it is answered
+    /// at the edge. Non-zero with `open` nowhere near the ceiling is a client loop
+    /// regenerating its call id, or somebody parking on the table.
+    pub calls_share_refused: u64,
     /// Client sockets open now, and how many have been refused at the cap since
     /// start.
     pub connections: u64,
@@ -192,6 +201,10 @@ pub struct CallStats {
     /// counter both look identical from outside: connections that ended, which is
     /// also what a crash looks like.
     pub connections_closed_handshake_deadline: u64,
+    /// Outbound frames refused at the wire cap and answered with a close. See
+    /// `RelayState::oversized_outbound_frames`; any non-zero value is a relay
+    /// bug an operator should report, never client behaviour.
+    pub oversized_outbound_frames: u64,
     /// Connections closed because an authenticated peer went silent for
     /// `WEALD_RELAY_IDLE_TIMEOUT_MS` and then did not answer the liveness ping,
     /// since start.
@@ -263,7 +276,13 @@ pub struct RelayState {
     /// Pre-authentication connection counts by a process-local, keyed hash of the
     /// transport source. The address never leaves this map as plaintext and every
     /// entry is removed as soon as its socket authenticates or closes.
-    unauthenticated_connections_by_source: Mutex<HashMap<[u8; 32], usize>>,
+    /// `tokio::sync::Mutex` rather than `std::sync::Mutex`, for the reason
+    /// `hub.rs` gives: the std lock poisons on a panic, and this lock guards
+    /// whether a socket may be opened at all, so a single poisoning panic would
+    /// refuse every future connection for the life of the process while
+    /// `/healthz` kept answering. A lock with no poisoning has no recovery arm
+    /// to leave uncovered.
+    unauthenticated_connections_by_source: tokio::sync::Mutex<HashMap<[u8; 32], usize>>,
     /// Key for `unauthenticated_connections_by_source`, generated at startup and
     /// deliberately not shared with the invite source-hash salt or any persisted
     /// data.
@@ -279,6 +298,12 @@ pub struct RelayState {
     /// memory and served on an operator surface, so there is a number and no map.
     pub handshake_deadline_closes: std::sync::atomic::AtomicU64,
     pub idle_deadline_closes: std::sync::atomic::AtomicU64,
+    /// Outbound frames the relay built over `MAX_FRAME_BYTES` and refused to
+    /// write. Every conforming peer rejects such a frame by the same symmetric
+    /// gate the relay applies inbound, so writing one is a silent wedge; the
+    /// writer drops it, closes the connection with a real error, and counts it
+    /// here so the failure is attributable. Any non-zero value is a relay bug.
+    pub oversized_outbound_frames: std::sync::atomic::AtomicU64,
     /// The wake path: the bounded queue, the settings and the counters
     /// (`crate::push`). Present whether push is on or off, because a relay with push
     /// off still has to answer a `Query` with `enabled: false` and still has to say
@@ -322,11 +347,12 @@ impl RelayState {
             send_budget,
             calls: crate::calls::CallRegistry::new(max_concurrent_calls),
             connections: std::sync::atomic::AtomicUsize::new(0),
-            unauthenticated_connections_by_source: Mutex::new(HashMap::new()),
+            unauthenticated_connections_by_source: tokio::sync::Mutex::new(HashMap::new()),
             unauthenticated_connection_source_key: random_secret(),
             connections_refused: std::sync::atomic::AtomicU64::new(0),
             handshake_deadline_closes: std::sync::atomic::AtomicU64::new(0),
             idle_deadline_closes: std::sync::atomic::AtomicU64::new(0),
+            oversized_outbound_frames: std::sync::atomic::AtomicU64::new(0),
             push,
             push_rate: crate::push::store::RateLimiter::new(),
         }
@@ -337,7 +363,7 @@ impl RelayState {
     /// The check and the increment are one `fetch_update`, so two sockets arriving
     /// in the same instant cannot both be told there was room for the last slot.
     /// That is the whole reason this is not a read followed by an add.
-    pub fn admit_connection(&self, source: Option<&str>) -> bool {
+    pub async fn admit_connection(&self, source: Option<&str>) -> bool {
         use std::sync::atomic::Ordering;
 
         let Some(ceiling) = self.connection_ceiling() else {
@@ -351,10 +377,7 @@ impl RelayState {
         // on `AUTH_ACK`, so a NAT cannot cap its own authenticated users.
         let source_ceiling = (ceiling / 4).max(1);
         let source = self.connection_source(source);
-        let mut sources = self
-            .unauthenticated_connections_by_source
-            .lock()
-            .expect("unauthenticated source counter lock");
+        let mut sources = self.unauthenticated_connections_by_source.lock().await;
         if sources.get(&source).copied().unwrap_or(0) >= source_ceiling {
             self.connections_refused.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -374,15 +397,12 @@ impl RelayState {
 
     /// Release the temporary pre-authentication source share after `AUTH_ACK` or
     /// when a socket ends before it can authenticate.
-    pub fn release_unauthenticated_connection(&self, source: Option<&str>) {
+    pub async fn release_unauthenticated_connection(&self, source: Option<&str>) {
         let Some(_) = self.connection_ceiling() else {
             return;
         };
         let source = self.connection_source(source);
-        let mut sources = self
-            .unauthenticated_connections_by_source
-            .lock()
-            .expect("unauthenticated source counter lock");
+        let mut sources = self.unauthenticated_connections_by_source.lock().await;
         let Some(count) = sources.get_mut(&source) else {
             return;
         };
@@ -514,12 +534,16 @@ impl RelayState {
                 open: self.calls.open_calls().await as u64,
                 media_shed: self.calls.shed(),
                 media_denied: self.calls.denied(),
+                calls_share_refused: self.calls.share_refused(),
                 connections: self.open_connections() as u64,
                 connections_refused: self
                     .connections_refused
                     .load(std::sync::atomic::Ordering::Relaxed),
                 connections_closed_handshake_deadline: self
                     .deadline_closes(crate::deadline::Expiry::Handshake),
+                oversized_outbound_frames: self
+                    .oversized_outbound_frames
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 connections_closed_idle_deadline: self
                     .deadline_closes(crate::deadline::Expiry::Idle),
             },
@@ -567,9 +591,14 @@ impl RelayState {
         .fetch_all(db.pool())
         .await
         {
+            // Through `group_for_log` rather than `hex_prefix` directly, so the
+            // sensitivity rule (`Sensitivity::Correlatable` is debug-only) is the
+            // thing that admits the value here too: the document these prefixes
+            // appear in is operator-only (`readyz` gates it on the bearer), which
+            // is the same audience the debug level is.
             Ok(rows) => rows
                 .iter()
-                .map(|group| crate::logging::hex_prefix(group))
+                .filter_map(|group| crate::logging::group_for_log(group, tracing::Level::DEBUG))
                 .collect(),
             // A database that cannot answer is already reported by the `database`
             // field. Reporting an empty frozen list on top of that is honest: the
@@ -639,10 +668,17 @@ pub fn public_router(state: Arc<RelayState>) -> Router {
     // exists, still checked by the same constant-time comparison, and still
     // reporting a number and nothing else.
     let router = match state.config.operator_token.clone() {
-        Some(token) => router.route(
-            "/admitted",
-            get(admitted).layer(axum::Extension(OperatorToken(token))),
-        ),
+        Some(token) => router
+            .route(
+                "/admitted",
+                get(admitted).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/gc/restore-marker",
+                post(set_restore_marker)
+                    .delete(clear_restore_marker)
+                    .layer(axum::Extension(OperatorToken(token))),
+            ),
         None => router,
     };
     router.with_state(state)
@@ -757,6 +793,82 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
+/// Headroom over `MAX_FRAME_BYTES` for the transport's own message ceiling.
+///
+/// The WebSocket layer reassembles a whole message before the relay sees it, so the
+/// allocation bound has to live on the transport rather than on the length check in
+/// `ws::handle_message`: that check runs after the bytes exist. A small allowance
+/// keeps a maximum-size frame deliverable while anything materially larger is
+/// refused by tungstenite before it is buffered.
+const WS_MESSAGE_ALLOWANCE: usize = 4096;
+
+/// The largest message and the largest fragment the transport will assemble.
+pub const WS_MAX_MESSAGE_BYTES: usize = crate::frame::MAX_FRAME_BYTES + WS_MESSAGE_ALLOWANCE;
+
+/// Why a request's client address could not be established.
+///
+/// One variant, because there is one way to get this wrong that is not a
+/// programming error: the operator declared proxies that did not append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardedError {
+    /// Fewer forwarding entries than declared hops. Ambiguous, so refused.
+    ChainTooShort,
+}
+
+/// The address the pre-authentication budgets should charge, given how many
+/// reverse proxies the operator declared.
+///
+/// Pure, and separated from the handler so the spoofing cases are testable
+/// without a socket. Two rules, and the second only exists because of the first:
+///
+/// - `hops == 0` means the relay is reached directly, so the transport peer is
+///   the client and `X-Forwarded-For` is not read at all. A direct client that
+///   sends the header gets exactly the bucket its real address earns, which is
+///   what stops a header from being a way to pick your own quota.
+/// - `hops == n > 0` means `n` proxies this operator runs each appended one
+///   entry on the way in: the innermost appended the address it saw (the
+///   client, or the next proxy out), so the client is at index `len - n`. A
+///   chain with fewer than `n` entries did not come through the declared path
+///   and is refused rather than guessed at. Note the innermost proxy appends
+///   the client, not itself, so a single declared hop behind the Compose
+///   bundle's Caddy sees a one-entry chain and that entry is the client.
+///
+/// Counting from the right is the whole security property. The leftmost entry is
+/// attacker-controlled in every deployment, because the first proxy appends what
+/// it saw without deleting what the client claimed.
+pub fn client_source(
+    hops: u64,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<Option<String>, ForwardedError> {
+    if hops == 0 {
+        return Ok(peer.map(|address| address.ip().to_string()));
+    }
+    // Every value of the header, in order, then every comma-separated element
+    // inside each value: a chain crossing several proxies may arrive as one
+    // header or as several, and the two are the same chain.
+    //
+    // `X-Forwarded-For` only. RFC 7239 `Forwarded` is the standardised spelling
+    // and no proxy in any deployment this relay supports emits it, so reading it
+    // would be a second parser covering nothing, with its own quoted-string and
+    // `for=` obfuscation rules to get wrong.
+    let chain: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|element| !element.is_empty())
+        .collect();
+    let hops = hops as usize;
+    // Each declared proxy appended exactly one entry, so a well formed chain has
+    // at least `hops` of them and the client is the first of that suffix.
+    if chain.len() < hops {
+        return Err(ForwardedError::ChainTooShort);
+    }
+    Ok(Some(chain[chain.len() - hops].to_string()))
+}
+
 /// The socket the client actually talks on.
 ///
 /// On the public listener beside `/healthz`, because it is the customer-facing
@@ -764,15 +876,35 @@ async fn healthz() -> impl IntoResponse {
 async fn relay_socket(
     ws: axum::extract::WebSocketUpgrade,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<RelayState>>,
 ) -> axum::response::Response {
-    // The peer's address, for the redeem path's per-source budget and for nothing
-    // else. It is hashed with the workspace salt before it reaches any table
-    // (`invite::reserve::source_hash`), so what the relay stores is a value it
-    // cannot turn back into an address. `None` when the router was mounted without
-    // connection info, which is every unit test: the budget then falls back to the
-    // one the joiner cannot forge, which is its own device.
-    let source = peer.map(|axum::extract::ConnectInfo(address)| address.ip().to_string());
+    // The client's address, for the redeem path's per-source budget and for
+    // nothing else. It is hashed with the workspace salt before it reaches any
+    // table (`invite::reserve::source_hash`), so what the relay stores is a value
+    // it cannot turn back into an address. `None` when the router was mounted
+    // without connection info, which is every unit test: the budget then falls
+    // back to the one the joiner cannot forge, which is its own device.
+    //
+    // Which address counts as the client's is a deployment fact, not a transport
+    // fact: behind the Compose bundle's Caddy, or behind any provider edge that
+    // terminates TLS, the transport peer is the proxy and every public client
+    // shares it. `client_source` reads that fact off
+    // `WEALD_RELAY_TRUSTED_PROXY_HOPS`.
+    let source = match client_source(
+        state.config.trusted_proxy_hops,
+        &headers,
+        peer.map(|axum::extract::ConnectInfo(address)| address),
+    ) {
+        Ok(source) => source,
+        // A declared proxy chain that is not there. Refusing is the point: the
+        // alternative is falling back to the transport peer, which is the shared
+        // bucket this key exists to stop, or to the leftmost header entry, which
+        // is a value the client wrote.
+        Err(ForwardedError::ChainTooShort) => {
+            return (StatusCode::BAD_REQUEST, "forwarded chain is not trusted\n").into_response();
+        }
+    };
     // The cap, before the upgrade rather than after it.
     //
     // `operations.md` recorded the absence of this as a known gap: the per
@@ -785,7 +917,7 @@ async fn relay_socket(
     // 503 with `Retry-After`, which is the transport's own way of saying what
     // `quota` says in a frame. There is no frame to say it in: the socket does not
     // exist yet.
-    if !state.admit_connection(source.as_deref()) {
+    if !state.admit_connection(source.as_deref()).await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "5")],
@@ -801,7 +933,39 @@ async fn relay_socket(
     // so anything written after this line would run while the connection was still
     // open. A slot leaked once per connection would be a relay that stops
     // accepting after `WEALD_RELAY_MAX_CONNECTIONS` clients have ever visited.
-    ws.on_upgrade(move |socket| crate::ws::serve_connection(socket, state, source))
+    //
+    // `on_failed_upgrade` is the other path out. axum spawns the callback above
+    // only when the upgrade completes; a peer that sends a well-formed upgrade
+    // request and resets the TCP connection before the 101 lands never reaches
+    // `serve_connection`, and the default failed-upgrade handler is a no-op. The
+    // slot and the pre-authentication source share taken above would then be held
+    // forever, so `WEALD_RELAY_MAX_CONNECTIONS` aborted upgrades took the relay
+    // offline with no authentication and no payload. The two handlers are mutually
+    // exclusive by construction, so the release runs exactly once per admission.
+    //
+    // The transport's own size ceiling is set here because tungstenite reassembles
+    // an entire message before axum yields it: the `MAX_FRAME_BYTES` check in
+    // `ws::handle_message` runs only after the allocation it would refuse. Without
+    // this bound an unauthenticated peer could hold 64 MiB (the axum default) per
+    // connection on the read side, eight times the send-queue byte budget the
+    // capacity story is sized against.
+    let failed_state = Arc::clone(&state);
+    let failed_source = source.clone();
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(WS_MAX_MESSAGE_BYTES)
+        .on_failed_upgrade(move |_error| {
+            // The callback is synchronous and the source-share release now takes
+            // an async lock, so the release is handed to the runtime. Ordering
+            // does not matter here: both releases are idempotent decrements and
+            // nothing observes them together.
+            tokio::spawn(async move {
+                failed_state
+                    .release_unauthenticated_connection(failed_source.as_deref())
+                    .await;
+                failed_state.release_connection();
+            });
+        })
+        .on_upgrade(move |socket| crate::ws::serve_connection(socket, state, source))
 }
 
 /// The private listener. Detailed readiness, bound to loopback by default.
@@ -833,10 +997,17 @@ pub fn private_router(state: Arc<RelayState>) -> Router {
     // this function has just made impossible: dead code on the one path where a
     // wrong answer hands out bootstrap authority, and dead code cannot be tested.
     let router = match state.config.operator_token.clone() {
-        Some(token) => router.route(
-            "/admitted",
-            get(admitted).layer(axum::Extension(OperatorToken(token))),
-        ),
+        Some(token) => router
+            .route(
+                "/admitted",
+                get(admitted).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/gc/restore-marker",
+                post(set_restore_marker)
+                    .delete(clear_restore_marker)
+                    .layer(axum::Extension(OperatorToken(token))),
+            ),
         None => router,
     };
     router.with_state(state)
@@ -908,15 +1079,147 @@ async fn admitted(
     }
 }
 
-async fn readyz(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+/// What `POST /gc/restore-marker` answers, and what `DELETE` answers when it has
+/// cleared one. One field, and the field is how many collector passes are still
+/// suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RestoreMarker {
+    pub passes_remaining: i32,
+}
+
+/// How many passes to suppress, when the caller names a number.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RestoreMarkerRequest {
+    pub passes: Option<i32>,
+}
+
+/// `POST /gc/restore-marker`: suppress the storage-listing sweep for the next few
+/// collector passes, because this relay's database has just been restored.
+///
+/// This is the operator half of the restore path in
+/// `specs/backend/cloud/backup-dr.md`. The database half of a restore leaves the
+/// relay holding rows older than its own bucket, so every object uploaded since the
+/// recovery point looks unreferenced to `media::gc`; the caller that completed the
+/// restore posts this before the relay is let back into service, and the collector
+/// counts it down. Whoever restores writes it: the control plane's restore job for a
+/// hosted instance, the operator running the runbook for a self-hosted one.
+///
+/// Idempotent, and a second post replaces rather than adds: two restores in a week
+/// should leave the second one's full protection.
+async fn set_restore_marker(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<RestoreMarkerRequest>>,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    };
+    let passes = request
+        .and_then(|Json(body)| body.passes)
+        .unwrap_or(crate::media::restore::DEFAULT_SUPPRESSED_PASSES);
+    if passes <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "passes must be positive; DELETE clears the marker\n",
+        )
+            .into_response();
+    }
+    match crate::media::restore::set(database.pool(), passes, "database restore").await {
+        Ok(passes_remaining) => {
+            (StatusCode::OK, Json(RestoreMarker { passes_remaining })).into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::logging::scrub(&error.to_string()),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /gc/restore-marker`: the restore is settled, let the sweep run again.
+///
+/// The marker clears itself once its passes are spent, so this exists for the
+/// operator who finished sooner and does not want the reconcile switched off for
+/// days it no longer needs.
+async fn clear_restore_marker(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    };
+    match crate::media::restore::clear(database.pool()).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(RestoreMarker {
+                passes_remaining: 0,
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::logging::scrub(&error.to_string()),
+        )
+            .into_response(),
+    }
+}
+
+/// The unauthenticated `/readyz` body: a verdict, and nothing else.
+///
+/// Two fields saying the same thing, on purpose. `ready` is the field's name in the
+/// full document, and `ok` is what the control plane's body sniff looks for to tell
+/// the relay's own 503 apart from a provider edge answering for a host it cannot
+/// route to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReadyVerdict {
+    pub ok: bool,
+    pub ready: bool,
+}
+
+async fn readyz(
+    State(state): State<Arc<RelayState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let readiness = state.readiness().await;
     // 503 when not ready, so a poller that only reads the status code is not
-    // misled, and 200 with the document when it is. The document is served in both
-    // cases: a caller debugging a 503 needs to know which field caused it.
+    // misled, and 200 when it is.
     let code = if readiness.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(readiness))
+    // The detailed document sits behind the operator bearer, exactly like
+    // `/admitted` and for the rationale written on `private_router`: the private
+    // listener is a network boundary and a network boundary is not an
+    // authentication boundary, because every co-tenant service in a provider
+    // environment can reach this port. The full document carries `frozen_groups`
+    // (group id prefixes, the correlation handles the public/private split exists
+    // to withhold), refusal counters, pool saturation and security posture; a
+    // caller without the bearer gets the one thing readiness owes an
+    // orchestrator, which is the verdict.
+    let authorized = state
+        .config
+        .operator_token
+        .as_deref()
+        .is_some_and(|expected| operator_authorized(expected, &headers));
+    if authorized {
+        (code, Json(readiness)).into_response()
+    } else {
+        (
+            code,
+            Json(ReadyVerdict {
+                ok: readiness.ready,
+                ready: readiness.ready,
+            }),
+        )
+            .into_response()
+    }
 }

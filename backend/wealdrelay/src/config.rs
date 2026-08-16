@@ -178,8 +178,10 @@ pub mod keys {
     pub const PUSH_TOKEN: &str = "WEALD_RELAY_PUSH_TOKEN";
     /// What `Capability` states, when it differs from the wake url.
     ///
-    /// Defaults to `PUSH_URL` with the ringer's own `/v1/handles` path, because that
-    /// is where the reference ringer serves registration. The relay states it rather
+    /// Defaults to `PUSH_URL` with its `/v1/wake` path replaced by the ringer's own
+    /// `/v1/handles` path, because that is where the reference ringer serves
+    /// registration. A replacement and not an append: `PUSH_URL` is a whole route.
+    /// The relay states it rather
     /// than letting the device guess, since guessing ours would mean a self-hoster's
     /// users silently registering with a ringer their operator did not choose.
     pub const PUSH_REGISTER_URL: &str = "WEALD_RELAY_PUSH_REGISTER_URL";
@@ -187,6 +189,36 @@ pub mod keys {
     pub const PUSH_COALESCE_MS: &str = "WEALD_RELAY_PUSH_COALESCE_MS";
     /// The bound on the wake queue. A bound, not a target.
     pub const PUSH_QUEUE: &str = "WEALD_RELAY_PUSH_QUEUE";
+    /// How long between collector passes, in milliseconds. Positive: zero would be
+    /// a task that scans Postgres without pause, which is not a posture anyone
+    /// wants, and the way to turn collection off is to not run a relay.
+    pub const JANITOR_INTERVAL_MS: &str = "WEALD_RELAY_JANITOR_INTERVAL_MS";
+    /// The age floor under the storage-listing sweep, in seconds. An unreferenced
+    /// object younger than this is never deleted, because "no reservation row" is
+    /// also what every object uploaded after a restore point looks like once the
+    /// database has been rolled back to it. Set by the control plane against the
+    /// backup cadence it actually runs; 48 hours without it, against a stated
+    /// 12-hour recovery-point objective. Zero is legal and means no floor.
+    pub const GC_MIN_OBJECT_AGE_SECONDS: &str = "WEALD_RELAY_GC_MIN_OBJECT_AGE_SECONDS";
+    /// How many reverse proxies the relay sits behind, each of which appends the
+    /// address it received the request from to `X-Forwarded-For`.
+    ///
+    /// Zero by default, and zero means the transport peer is the client and every
+    /// forwarding header is ignored: a relay reached directly must never let a
+    /// client name its own address, because both the pre-authentication
+    /// connection bucket and the invite-code cooldown key on that value
+    /// (`crate::health::client_source`). Set it to the number of hops the
+    /// deployment actually has, which is `1` behind the Compose bundle's Caddy
+    /// and `1` behind a provider edge that terminates TLS. Without it every
+    /// client behind the proxy shares one bucket, so one attacker, or ordinary
+    /// concurrent onboarding, caps and cools down every unrelated user.
+    ///
+    /// Counted from the right, never the left: the leftmost entries are whatever
+    /// the client sent and the rightmost `n` were appended by proxies this
+    /// operator declared. A chain too short to have come through that many
+    /// declared proxies is refused rather than guessed at, because guessing is
+    /// exactly the spoof the count exists to close.
+    pub const TRUSTED_PROXY_HOPS: &str = "WEALD_RELAY_TRUSTED_PROXY_HOPS";
     /// Which deployment this is. `self_host` by default; `hosted` refuses the
     /// settings `specs/backend/relay/server.md` says the hosted tier forbids.
     /// Configuration, never a compile-time branch: both profiles are in every
@@ -232,6 +264,9 @@ pub mod keys {
         PUSH_REGISTER_URL,
         PUSH_COALESCE_MS,
         PUSH_QUEUE,
+        JANITOR_INTERVAL_MS,
+        GC_MIN_OBJECT_AGE_SECONDS,
+        TRUSTED_PROXY_HOPS,
     ];
 }
 
@@ -409,6 +444,15 @@ pub struct Config {
     pub push_register_url: Option<String>,
     pub push_coalesce_ms: u64,
     pub push_queue: u64,
+    /// How long the collector waits between passes. Never zero: `positive` refuses
+    /// it, for the reason on `keys::JANITOR_INTERVAL_MS`.
+    pub janitor_interval_ms: u64,
+    /// How old an unreferenced object must be before the storage-listing sweep may
+    /// delete it. See `keys::GC_MIN_OBJECT_AGE_SECONDS`.
+    pub gc_min_object_age_seconds: u64,
+    /// Declared reverse-proxy hops in front of this relay. Zero means direct, and
+    /// zero ignores forwarding headers entirely. See `keys::TRUSTED_PROXY_HOPS`.
+    pub trusted_proxy_hops: u64,
 }
 
 /// Why a configuration was refused.
@@ -463,6 +507,22 @@ pub enum ConfigError {
     /// A shared fanout url on a build that does not implement one.
     #[error("{key}={value} names a shared fanout, which this build does not implement")]
     LiveFanoutUnavailable { key: &'static str, value: String },
+    /// A TLS mode on a build that terminates no TLS.
+    ///
+    /// Same principle as `LiveFanoutUnavailable`, and for a louder reason: a
+    /// setting the binary accepts and does not honour is worse than one it
+    /// refuses, and here the unhonoured setting is the one an operator reads as
+    /// "this socket is encrypted". Nothing in this crate wraps the listener, so
+    /// `acme` and `file` would bind the public address in cleartext while
+    /// `--check-config` printed the mode back as confirmation.
+    #[error(
+        "{key}={value} asks this build to terminate TLS, which it does not implement: \
+         terminate TLS at a reverse proxy and set {key}=off"
+    )]
+    TlsUnavailable {
+        key: &'static str,
+        value: &'static str,
+    },
     /// Calls turned on without the ceiling that sizes them.
     ///
     /// Fatal at startup and never defaulted. A relay that invented a number would
@@ -565,6 +625,7 @@ impl ConfigError {
             | Self::RefusedOnHostedProfile { key, .. }
             | Self::LiveFanoutSingleProcess { key, .. }
             | Self::LiveFanoutUnavailable { key, .. }
+            | Self::TlsUnavailable { key, .. }
             | Self::CallsCeilingMissing { key, .. }
             | Self::CallsCeilingUnused { key, .. }
             | Self::CallsSingleProcess { key, .. }
@@ -763,6 +824,25 @@ impl Config {
     ///
     /// Skipped when the ephemeral path is off, because there is then no beat to
     /// fail to cross an instance boundary.
+    /// Refuse a TLS mode nothing in the binary implements.
+    ///
+    /// `serve::bind` binds bare `TcpListener`s and `serve::run` hands them to
+    /// `axum::serve` unwrapped; there is no acceptor and no certificate loader in
+    /// this crate. Until there is, the only honest answer to `acme` or `file` is
+    /// to refuse to start, so the operator meets the gap at startup rather than
+    /// as plaintext frames on the public address.
+    fn enforce_tls(&self) -> Result<(), ConfigError> {
+        let value = match self.tls {
+            TlsMode::Acme => "acme",
+            TlsMode::File => "file",
+            TlsMode::Off => return Ok(()),
+        };
+        Err(ConfigError::TlsUnavailable {
+            key: keys::TLS,
+            value,
+        })
+    }
+
     fn enforce_live_fanout(&self) -> Result<(), ConfigError> {
         if let LiveFanout::Shared(value) = &self.live_fanout {
             return Err(ConfigError::LiveFanoutUnavailable {
@@ -930,8 +1010,8 @@ impl Config {
                     ("off", TlsMode::Off),
                 ],
             )?,
-            max_storage_gb: limit(values, keys::MAX_STORAGE_GB)?,
-            max_log_gb: limit(values, keys::MAX_LOG_GB)?,
+            max_storage_gb: capacity(values, keys::MAX_STORAGE_GB)?,
+            max_log_gb: capacity(values, keys::MAX_LOG_GB)?,
             retention_days: limit(values, keys::RETENTION_DAYS)?,
             // `enforce` in every environment including local, so nobody ever
             // develops against the permissive path and discovers the difference
@@ -1049,7 +1129,24 @@ impl Config {
                 crate::push::DEFAULT_COALESCE_MS,
             )?,
             push_queue: positive(values, keys::PUSH_QUEUE)?.unwrap_or(crate::push::DEFAULT_QUEUE),
+            janitor_interval_ms: positive(values, keys::JANITOR_INTERVAL_MS)?
+                .unwrap_or(crate::janitor::DEFAULT_INTERVAL_MS),
+            // `count` rather than `positive`: zero is a meaningful setting here and
+            // means no floor at all, which is the self-hoster who keeps no backups
+            // and wants a planted object collected on the next pass.
+            gc_min_object_age_seconds: count(
+                values,
+                keys::GC_MIN_OBJECT_AGE_SECONDS,
+                crate::media::gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+            )?,
+            // `count` with a zero default rather than `positive`: zero is the
+            // meaningful value here, not a refused one. It says the relay is
+            // reached directly, which is what a developer running it on a laptop
+            // has, and it is the only setting under which a forwarding header is
+            // safe to ignore rather than trust.
+            trusted_proxy_hops: count(values, keys::TRUSTED_PROXY_HOPS, 0)?,
         };
+        resolved.enforce_tls()?;
         resolved.enforce_live_fanout()?;
         resolved.enforce_calls()?;
         resolved.enforce_push()?;
@@ -1160,6 +1257,20 @@ fn address(
         });
     }
     Ok(value.to_string())
+}
+
+/// A capacity ceiling, where zero is refused rather than obeyed.
+///
+/// The same reasoning as ``positive`` and ``connection_limit``: zero is not a
+/// smaller ceiling, it is a relay that starts, passes health, reports ready and
+/// then answers `quota` to every write. A provisioner template that renders an
+/// unset variable as `0` must fail at boot naming the variable, not silently at
+/// the first `SEND`. `unlimited` remains the only way to say no ceiling.
+fn capacity(values: &Values, key: &'static str) -> Result<Limit, ConfigError> {
+    match limit(values, key)? {
+        Limit::Of(0) => Err(ConfigError::ZeroLimit { key }),
+        other => Ok(other),
+    }
 }
 
 fn limit(values: &Values, key: &'static str) -> Result<Limit, ConfigError> {

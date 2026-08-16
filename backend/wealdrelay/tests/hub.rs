@@ -545,3 +545,104 @@ async fn an_owed_downgrade_is_discharged_by_a_beat_when_no_envelope_follows() {
     }
     assert_eq!(hub.downgrades(), 1);
 }
+
+/// `holds` answers per connection, which is what the refused re-`SUB` path needs.
+///
+/// A repeated `SUB` that is refused must not drop the session's record of a
+/// subscription whose hub entry is still live: the entry keeps receiving fanout
+/// while the group stops counting against `MAX_GROUPS_PER_CONNECTION`, and the
+/// connection can then take the whole limit again, repeatably. `ws::perform` asks
+/// this before forgetting, so the distinction between "this connection holds it"
+/// and "somebody does" is the whole answer.
+#[tokio::test]
+async fn holds_is_per_connection_and_survives_a_second_subscribe() {
+    let hub = Hub::new();
+    let (sender, _receiver) = outbound_channel();
+    let (other_sender, _other_receiver) = outbound_channel();
+    let id = hub.connect();
+    let other = hub.connect();
+
+    assert!(!hub.holds(&group(1), id).await, "nothing is held yet");
+
+    hub.subscribe(
+        &group(1),
+        id,
+        sender.clone(),
+        wealdrelay::frame::PROTOCOL_VERSION,
+    )
+    .await;
+    assert!(hub.holds(&group(1), id).await);
+    // Another connection's entry in the same group is not this connection's.
+    assert!(!hub.holds(&group(1), other).await);
+    // Nor is this connection's entry in one group an entry in another.
+    assert!(!hub.holds(&group(2), id).await);
+
+    hub.subscribe(
+        &group(1),
+        other,
+        other_sender,
+        wealdrelay::frame::PROTOCOL_VERSION,
+    )
+    .await;
+    assert!(hub.holds(&group(1), other).await);
+
+    // Idempotent re-subscribe leaves it held exactly once, which is the state the
+    // refused re-`SUB` is deciding about.
+    hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
+        .await;
+    assert!(hub.holds(&group(1), id).await);
+    assert_eq!(hub.subscribers(&group(1)).await, 2);
+
+    hub.disconnect(id).await;
+    assert!(!hub.holds(&group(1), id).await);
+    assert!(hub.holds(&group(1), other).await);
+}
+
+#[tokio::test]
+async fn a_full_queue_ends_a_subscriber_rather_than_downgrading_it_for_a_handshake() {
+    // The exception to this file's rule, and `wire.md` states it: a subscriber that
+    // cannot take a handshake message has its connection ended rather than
+    // downgraded, because a downgrade means reconcile and reconciliation is over the
+    // envelope log only. There is no reconciliation for MLS state, so a member told
+    // to reconcile after missing the commit that advanced an epoch is a member that
+    // is quietly finished reading the group: everything published afterwards is
+    // ciphertext under a key it never received, with nothing on the wire saying so.
+    // Ending the connection makes the client reconnect and take the replay from
+    // zero, which is the one recovery that exists. See WEALD-476.
+    let hub = Hub::new();
+    let (sender, mut receiver) = outbound_channel();
+    let id = hub.connect();
+    hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
+        .await;
+    for _ in 0..SEND_QUEUE_BOUND {
+        hub.fanout(&group(1), &envelope(1), u64::MAX).await;
+    }
+
+    let commit = Frame::Handshake {
+        group: group(1),
+        seq: 4,
+        message: vec![9; 32],
+    };
+    assert_eq!(
+        hub.fanout_frame(
+            &group(1),
+            &commit,
+            hub.connect(),
+            wealdrelay::hub::MIN_FANOUT_VERSION
+        )
+        .await,
+        vec![(id, Delivery::Gone)]
+    );
+    // Gone means gone: removed from the group, and no downgrade counted, because a
+    // downgrade is precisely what did not happen.
+    assert_eq!(hub.subscribers(&group(1)).await, 0);
+    assert_eq!(hub.downgrades(), 0);
+
+    // And everything the queue did accept is still on it. Ending the connection is
+    // not a licence to discard what was already owed.
+    let mut seen = 0;
+    while receiver.try_recv().is_ok() {
+        seen += 1;
+    }
+    assert_eq!(seen, SEND_QUEUE_BOUND);
+}

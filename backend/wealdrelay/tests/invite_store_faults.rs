@@ -1085,3 +1085,72 @@ async fn a_scope_commit_that_cannot_count_what_it_wrote_is_reported() {
 
     scratch.drop_database().await;
 }
+
+/// The negative proof for WEALD-342. `reserve` takes the seat and writes the
+/// reservation in one statement, precisely so a crash cannot spend a seat nobody
+/// holds, and then issued the provisional grant in a second statement outside any
+/// transaction. The grant is what lets the joiner open a socket at all, so a failed
+/// grant left exactly the state that argument refuses to allow: a spent seat and no
+/// credential to spend it with, and nothing gives it back.
+#[tokio::test]
+async fn a_seat_is_not_spent_when_the_provisional_grant_cannot_be_written() {
+    let (scratch, _blobs, state) = prepared("invitefault_grant_atomicity").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(0x5ea7);
+    // One use, so a seat wrongly spent is an invite that admits nobody afterwards.
+    let record = issue(0x7a, code, 1);
+    store::create(pool, WORKSPACE, &record, NOW)
+        .await
+        .expect("write");
+    let device = vec![0x7b; 32];
+    let source = vec![0x7c; 32];
+
+    // A trigger rather than a renamed table: `reserve` reads
+    // `relay_provisional_grant` through `grant_is_voided` before it writes it, so
+    // renaming the table away fails at the read and never reaches the write whose
+    // failure path this test exists for.
+    refuse(pool, "relay_provisional_grant", "insert").await;
+    is_told_to_come_back(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(1),
+            &device,
+            &source,
+            NOW,
+        )
+        .await,
+        "a reserve whose grant cannot be written",
+    );
+    stop_refusing(pool, "relay_provisional_grant", "insert").await;
+
+    // The seat is still there, and so is the invite's whole capacity.
+    let after = store::fetch(pool, &record.token)
+        .await
+        .expect("read")
+        .expect("the record");
+    assert_eq!(
+        after.remaining, 1,
+        "the failed grant spent a seat: {after:?}"
+    );
+
+    // And the proof that matters to a joiner: the next attempt still works. Before
+    // the transaction this returned `Unavailable`, because the one use was gone.
+    assert!(matches!(
+        reserve::reserve(
+            pool,
+            &record.token,
+            &code.grouped(),
+            &nonce(2),
+            &device,
+            &source,
+            NOW,
+        )
+        .await
+        .expect("read"),
+        Verdict::Reserved { .. }
+    ));
+
+    scratch.drop_database().await;
+}

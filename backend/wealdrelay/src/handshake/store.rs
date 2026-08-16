@@ -113,8 +113,33 @@ pub async fn append(pool: &PgPool, handshake: &Handshake) -> Result<Appended, St
 /// This is what a joining or reconnecting client replays to reach the group's
 /// current epoch. Ordered by the relay's own sequence, which is the only order in
 /// which the messages can be applied at all.
+///
+/// Unbounded on purpose, and therefore not what the subscribe path calls: a full
+/// replay of a long-lived group is that whole log resident at once, and every
+/// message may be near `MAX_FRAME_BYTES`. `page` is the bounded read; this stays
+/// for callers that genuinely want the log in hand.
 pub async fn since(pool: &PgPool, group: &[u8], from_seq: u64) -> Result<Vec<Stored>, StoreError> {
+    page(pool, group, from_seq, None).await
+}
+
+/// One page of the replay: the same read with a row limit.
+///
+/// The subscribe path reads a page, drains it to the socket, then reads from the
+/// sequence after the last row it saw, so peak residency is one page rather than a
+/// group's entire commit history. Paging is safe where truncating is not: every
+/// message is still delivered, in the same order, and a commit appended while the
+/// replay is in flight lands in a later page.
+pub async fn page(
+    pool: &PgPool,
+    group: &[u8],
+    from_seq: u64,
+    limit: Option<u32>,
+) -> Result<Vec<Stored>, StoreError> {
     let from = i64::try_from(from_seq).unwrap_or(i64::MAX);
+    // The absent case becomes the largest row count the reader could ever produce
+    // rather than a second query string, so there is one statement here and no way
+    // for the two to drift apart.
+    let limit = i64::from(limit.unwrap_or(u32::MAX));
     // `query_as` rather than `query` plus a `try_get` per column. Both decode, but
     // this way a row the reader cannot make sense of fails the query itself and
     // there is one failure path instead of three. That matters here more than
@@ -122,10 +147,12 @@ pub async fn since(pool: &PgPool, group: &[u8], from_seq: u64) -> Result<Vec<Sto
     // applies what it got, believes it is current, and then cannot decrypt anything
     // published since.
     let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-        "select seq, message from relay_handshake where group_id = $1 and seq >= $2 order by seq",
+        "select seq, message from relay_handshake where group_id = $1 and seq >= $2 \
+         order by seq limit $3",
     )
     .bind(group)
     .bind(from)
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(db)?;

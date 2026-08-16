@@ -184,7 +184,7 @@ pub struct Running {
     pub address: std::net::SocketAddr,
     pub state: Arc<RelayState>,
     pub stop: Option<tokio::sync::oneshot::Sender<()>>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub task: tokio::task::JoinHandle<Result<(), serve::ServeError>>,
 }
 
 impl Running {
@@ -1281,6 +1281,25 @@ pub async fn entry_hash_of(pool: &sqlx::PgPool, workspace: &str, device: &Signin
         .await
         .expect("a workspace salt");
     wealdrelay::access::entry_hash(&device.verifying_key().to_bytes(), &salt)
+}
+
+/// Wait until the hub has let go of one principal's last socket.
+///
+/// Waited for and then asserted rather than slept through, for the reason
+/// `push_adversarial.rs` records: a test that pushes on before the socket is reaped
+/// proves the suppression it was trying to lift, and the failure lands somewhere
+/// else entirely. Panics rather than returning, because every caller's next line is
+/// only meaningful once this is true.
+pub async fn wait_until_disconnected(state: &Arc<RelayState>, entry_hash: &[u8]) {
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while state.hub.connections_for(entry_hash).await != 0 && std::time::Instant::now() < give_up {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        state.hub.connections_for(entry_hash).await,
+        0,
+        "the socket was never let go, so a wake for this principal would be suppressed"
+    );
 }
 
 /// The path and query of a presigned URL, which is all a test needs: the host in

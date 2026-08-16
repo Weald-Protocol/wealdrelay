@@ -89,6 +89,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0011_bootstrap_handoff",
         include_str!("../migrations/0011_bootstrap_handoff.sql"),
     ),
+    (
+        "0012_invite_attempt_by_source",
+        include_str!("../migrations/0012_invite_attempt_by_source.sql"),
+    ),
+    (
+        "0013_invite_bundle_issued",
+        include_str!("../migrations/0013_invite_bundle_issued.sql"),
+    ),
+    (
+        "0014_ciphertext_storage_external",
+        include_str!("../migrations/0014_ciphertext_storage_external.sql"),
+    ),
+    (
+        "0015_gc_restore_marker",
+        include_str!("../migrations/0015_gc_restore_marker.sql"),
+    ),
 ];
 
 /// The ledger of what has been applied. Created before anything else, and by the

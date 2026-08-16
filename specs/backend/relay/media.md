@@ -38,8 +38,16 @@ path stays boring.
    the workspace quota, then answers with either a presigned PUT URL valid for
    15 minutes, or `exists` for that same workspace/group/hash, which makes a
    retry after a dropped upload free. An expired or aborted reservation is
-   released by a cleanup job.
-3. Client PUTs the ciphertext directly to object storage.
+   released by a cleanup job. The URL is **signed for exactly the declared
+   ciphertext length**: `Content-Length` is part of the signature, so a request
+   announcing any other length is not the request that was signed, and a body that
+   disagrees with its own header is refused by the object store. Without that, the
+   quota is advisory, because the relay charges the declared length and never
+   re-measures the object: declare one byte, presign, and PUT the store's whole
+   single-request ceiling. Each multipart part URL is bound the same way, to the
+   length recorded for that part number.
+3. Client PUTs the ciphertext directly to object storage, at exactly the length it
+   declared.
 4. Client publishes a signed **retention manifest** that includes the hash, then
    emits a `media.ref` payload inside the group, carrying the ciphertext hash,
    per-blob key, name, mime type, size and dimensions. The name is carried here
@@ -49,6 +57,17 @@ path stays boring.
    digests. Sealed, so the relay is no better off than before. The client retries this ordered
    pair until both receipts are durable. Only group members can read the ref and
    learn the key.
+
+The claim in step 4 is where reserved bytes become stored bytes, so it is also
+where the declaration is checked against reality. Before a manifest is applied,
+the relay heads each object it names that still has an unfinalized reservation,
+and refuses the whole manifest with `hash-mismatch` if the stored object is
+longer than the bytes that reservation was charged for. Without that check the
+declaration is the accounting: reserve one byte, PUT sixty-four megabytes, claim
+it, and the workspace is charged one byte while the bucket holds the rest, so the
+storage ceiling never binds. A shorter object is accepted and charged at the
+declared length, because an honest client that compressed better than it
+predicted should not be refused.
 
 The blob is unreferenced between steps 3 and 4. An upload with no accepted
 manifest claim is collected after 24 hours, which covers the client that crashed
@@ -60,9 +79,34 @@ an explicit valid tombstone.
 session instead, with the same 15-minute refreshable window per part. Part
 numbers, expected ciphertext lengths and the reservation id are immutable; a
 completed upload is finalized exactly once before the reservation becomes stored
-usage. Stale multipart sessions are aborted and their reservations released. A
-2 GiB video over a hotel connection has to survive a reconnect or the feature
-does not work.
+usage. A 2 GiB video over a hotel connection has to survive a reconnect or the
+feature does not work.
+
+A session owns exactly `ceil(total_bytes / part_size)` parts, and a part number
+outside that range, or a part longer than the session's part size, is refused
+with `envelope-too-large`. Each `MULTIPART part` is charged one request against
+the same per-device budget `BLOB get` and `BLOB list` are charged against,
+because an uncharged part request mints a presigned 64 MiB upload URL for free.
+Completion reconciles the client's submitted part list against the parts the
+relay recorded: a duplicate number, or a number never issued for that session, is
+refused rather than assembled, so no part is written into the object twice.
+
+Part objects are the relay's, not the workspace's: they live under the synthetic
+`_multipart/<session>` key space, so no sweep that walks real workspaces can see
+them. They are therefore deleted explicitly, on all three exits. Completion
+deletes them after assembly, abort deletes them before releasing the reservation
+(release is what makes the bytes free again, and returning quota while leaving
+the parts in the bucket is unbounded unaccounted storage), and the janitor
+deletes the recorded parts of every stale session it aborts. All three are
+idempotent, because deleting an object that is not there is not an error on
+either backend.
+
+An abort is only a reversal of an unfinished session. A session that has already
+completed is refused, because its reservation stays unfinalized until a manifest
+claims the hash: releasing it there would return quota for bytes that are in the
+bucket and drop the reservation row the collection rule reads to know the
+assembled object is referenced. A session already aborted is answered with the
+same `MultipartAborted` the first abort gave, and the release is not run twice.
 
 ## Download
 
@@ -108,6 +152,21 @@ Text envelopes are never rejected for quota. Blocking someone from sending a
 message because a colleague uploaded a video is a worse failure than a slightly
 over-quota bill, and text is a rounding error against media anyway.
 
+**One object is charged once, and a missing object is not a charge.** A finalized
+reservation is the relay's own record that it confirmed the object exists, so a
+finalized row whose object is *not* in the store is a contradiction, and it is
+reachable by ordinary means: the retention sweep removes the object before the row
+on purpose, so a crash or a failed row delete leaves exactly that state, as does an
+operator removing a bucket object. On the next `BLOB put` for the same triple the
+relay retires every such stale row and returns its bytes to the workspace before
+deciding whether the upload fits, so the re-upload is charged as a first upload
+rather than a second helping for one object. What it must not do is answer
+`exists`: the object is genuinely absent, and telling the client its upload is
+unnecessary would turn a billing error into missing media. A row delete the sweep
+could not perform is counted in the sweep's own note and logged, because an
+uncollectable row holding a charge that nothing reclaims is the state an operator
+has to be able to see.
+
 ## Garbage collection
 
 Two mechanisms, because neither is sufficient alone.
@@ -139,9 +198,12 @@ RetentionDestruction { group, kind, target_digest, policy_version?,
 
 The first `RetentionControl` is emitted by the group creator with the first
 epoch's verifier. A subsequent control must be signed by the prior verifier and
-introduce exactly one successor verifier; manifests must be signed by the
-verifier for their named epoch. The relay validates this chain before accepting
-a manifest or `drop_before` instruction. Clients independently derive the same
+introduce exactly one successor verifier; manifests must name the group's latest
+epoch and be signed by that epoch's verifier. The relay validates this chain
+before accepting a manifest or `drop_before` instruction, and a manifest naming a
+superseded epoch is refused and recorded as evidence: the party still holding an
+older epoch's key is the member the rotation removed, and an omission from the
+latest manifest is what the collection rule reads as permission to delete. Clients independently derive the same
 verifiers from their MLS state and warn if a public control record disagrees, so
 the relay cannot turn a storage-control record into an unnoticed membership
 decision.

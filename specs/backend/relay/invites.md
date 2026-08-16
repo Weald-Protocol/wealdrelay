@@ -103,11 +103,32 @@ a second out-of-band interaction after joining; the code folds that verification
 into the one message the admin was already going to send.
 
 The code is Argon2id-hashed with the token as salt, so the relay can rate-limit
-attempts without learning it. Five wrong attempts from the same source/device
-pair impose a 15-minute cooldown for that pair; they never burn the invite or
-other seats behind a shared invite. The relay returns the same generic
-unavailable response during a cooldown and notifies the issuer's connected
-client of suspicious attempt volume without naming a source IP.
+attempts without learning it. Five wrong attempts against one token from one
+source impose a 15-minute cooldown for that token and source, and twenty-five
+wrong attempts against one token across all sources cool the whole token down
+for the same interval. The key deliberately carries no device value: the device
+in a `Reserve` frame is an arbitrary byte string supplied pre-authentication, so
+a key that included it would let a guesser mint a fresh allowance per attempt
+(WEALD-287). A cooled-down attempt is refused before the Argon2id hash runs.
+
+The attempt slot is charged before the code is parsed or hashed, not after the
+hash fails, and is refunded once a correct code has been shown. Reading the
+budget before the verifier and writing it after would let a burst of connections
+from one address all read the same count below the ceiling and all run Argon2id,
+which turns a five-guess budget into an unbounded CPU and memory amplifier; the
+charge is a single statement on the `(token, source)` row, so simultaneous
+attempts serialize on it and take distinct slots (WEALD-336). The charge is
+skipped, and the attempt refused, when the pair is already cooled down, so a
+cooled guesser cannot go on inflating the token-wide sum and cool an invite down
+for everybody. The refund is what keeps the budget a guess budget: it is
+reachable only past verification, so it cannot reset a ceiling without the
+60-bit code it protects, and without it five colleagues behind one office
+address would cool that address down by joining successfully.
+Failures never burn the invite or other seats behind a shared invite, and
+colleagues joining from their own addresses are unaffected by one address's
+cooldown. The relay returns the same generic unavailable response during a
+cooldown and notifies the issuer's connected client of suspicious attempt
+volume without naming a source IP.
 
 ## The join flow
 
@@ -176,6 +197,12 @@ list.
    `reserved(join_nonce, device_hash, expires_at)` against it. A reservation
    lasts ten minutes and is idempotent for the same nonce. This is the
    linearization point for `uses`.
+
+   The provisional grant that lets the joiner open a socket is written inside
+   that same transaction, so the seat and the credential to spend it are one
+   atom. Either both exist or neither does. A grant that failed after the seat
+   was taken produced the state this rule exists to forbid: capacity spent on a
+   reservation nobody could use, with nothing to give it back (WEALD-342).
 
    Ten minutes covers only the network join after local setup, not the time to
    read or store a recovery phrase. A reservation is extended, once, to the
@@ -261,6 +288,16 @@ list.
    was still outstanding. The relay can evaluate all three without learning
    anything it did not already hold.
 
+   Voiding is terminal, and that matters because revocation is aimed at exactly
+   the party that drives the rest of a join. A grant that has been voided is
+   never brought back by another `grant`: the upsert refuses to clear
+   `voided_at`, so the final `Commit` of a join the admin already killed cannot
+   re-arm the credential to the invite's original expiry. A device that has been
+   revoked, superseded or expired needs a new invite, and redeeming again is
+   refused before it can spend a seat. Every `Commit` also re-reads the invite's
+   state, its tombstone and its expiry, because revocation lands between two
+   frames of the same join and the reservation alone does not know about it.
+
 8. **Self-join the rest.** The mandatory workspace-root scope is already
 committed in step 6. Everything else the roster entitles the joiner to, meaning
 the workspace default channels and every `parent` channel it is entitled to,
@@ -284,8 +321,19 @@ containing `(token, group, epoch, ct)`. The relay accepts an update only from an
 authenticated current access-set principal and never decrypts it. Because it
 cannot verify group membership, it treats the update as an availability hint:
 it retains the newest three candidates per `(token, group)`, rate-limits writes,
-and the invitee accepts only an MLS-valid GroupInfo for the invited group. A
-bogus high-epoch upload therefore cannot mask the last valid update. The inviter
+and the invitee accepts only an MLS-valid GroupInfo for the invited group.
+
+Retaining the newest three is not on its own what stops a bogus upload from
+masking the last valid one, and this section used to claim that it was. Four
+bogus uploads at four distinct epochs evict every older row, so an admitted
+workspace principal could park every outstanding invite for a group without
+revoking one. What stops it is a lineage the relay can authenticate indirectly:
+**the candidate carried in the signed invite record is pinned**. It arrived over
+the authenticated issue path inside a record the issuer signed, so pruning never
+evicts it and a colliding refresh at its epoch never overwrites it. The worst a
+flood achieves is that the joiner falls back to the seal the issuer gave it,
+which is the state it would have been in had nobody refreshed at all. A scope
+therefore holds at most four rows: three refreshed and one pinned. The inviter
 may also cancel an invite; the relay then deletes all of its update records.
 
 This is intentionally per-invite rather than a single group-wide publication
@@ -412,6 +460,13 @@ blocking.
    transparency log, which was vacuous: at bootstrap the log did not exist yet,
    because the trust root creates it. Now the log begins with genesis, so there is
    no unlogged prefix.
+
+The reservation is what the relay checks, on every path. A connection that names
+a group of a workspace with no access set yet is not thereby founding it: group
+rows exist before genesis on every provisioned relay, so the workspace resolved
+from a named group id is only admitted to the bootstrapping state when the
+connecting device holds the live, unconsumed reservation on that workspace's own
+bootstrap invite. Without that the answer is the ordinary refusal.
 
 For self-hosters the genesis key never leaves their machine and this whole
 section is a formality. For hosted it is the crux of the trust-root race in

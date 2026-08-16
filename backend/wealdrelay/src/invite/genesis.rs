@@ -244,10 +244,16 @@ pub async fn ensure(pool: &PgPool, workspace_id: &str, now_ms: i64) -> Result<En
         // cannot begin a transaction says so before it has written a workspace row
         // for a genesis it is then going to fail to mint.
         let mut tx = pool.begin().await.map_err(super::store::db)?;
-        crate::access::store::salt(pool, workspace_id)
+        // Both of these run on `tx`, never on `pool`. Each pool call made here
+        // checked out another connection while this transaction held one, so a
+        // handful of concurrent mints could hold every connection in the pool and
+        // wait on each other for the next, starving `AUTH` and `SEND` of the pool
+        // they share. It also makes the workspace row atomic with the genesis it
+        // is being written for.
+        crate::access::store::salt_within(&mut tx, workspace_id)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))?;
-        if let Some(existing) = read(pool, workspace_id).await? {
+        if let Some(existing) = read(&mut *tx, workspace_id).await? {
             return Ok(existing);
         }
         if attempted {
@@ -288,7 +294,7 @@ pub async fn ensure(pool: &PgPool, workspace_id: &str, now_ms: i64) -> Result<En
         };
         invite.sig = sign(&signing, &invite.digest_input());
 
-        super::store::insert_within(&mut tx, pool, workspace_id, &invite, true, now_ms).await?;
+        super::store::insert_within(&mut tx, workspace_id, &invite, true, now_ms).await?;
         let print = fingerprint(&public_key);
         let inserted = sqlx::query(
             "insert into relay_genesis \
@@ -326,13 +332,19 @@ pub async fn ensure(pool: &PgPool, workspace_id: &str, now_ms: i64) -> Result<En
     }
 }
 
-async fn read(pool: &PgPool, workspace_id: &str) -> Result<Option<Ensured>, StoreError> {
+/// Executor-generic so the mint loop can run it on its own open transaction. Read
+/// on the pool while that transaction is held, it checked out a second connection
+/// and made issuance compete with `AUTH` and `SEND` for the pool.
+async fn read<'a, E>(executor: E, workspace_id: &str) -> Result<Option<Ensured>, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
     let row = sqlx::query(
         "select fingerprint, token, secret_key is null as redeemed \
          from relay_genesis where workspace_id = $1",
     )
     .bind(workspace_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(super::store::db)?;
     Ok(row.map(|row| Ensured::Existing {
@@ -411,6 +423,9 @@ pub(crate) async fn consume_in_tx(
     .bind(workspace_id)
     .execute(&mut **tx)
     .await?;
+    // The sealed handoff describes this invite, and this invite is now spent, so the
+    // ciphertexts go in the same transaction that retires the key.
+    super::handoff::forget_in_tx(tx, workspace_id).await?;
 
     let public_key: Vec<u8> =
         sqlx::query("select public_key from relay_genesis where workspace_id = $1")

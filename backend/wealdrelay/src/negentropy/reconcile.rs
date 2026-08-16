@@ -31,7 +31,10 @@
 //!
 //! Every round either settles a range or divides it by ``SPLIT_FACTOR``, and a
 //! range holding one item cannot be divided further, so the exchange terminates in
-//! at most `log8(n) + 2` rounds. ``ClientStep::done`` is the client's own view of
+//! at most `log8(n) + 2` rounds. The one input that cannot be divided at all is a
+//! range whose items all share one `seq`, which a client can hold after a
+//! renumbering even though the relay's schema forbids it; ``split`` answers that
+//! with an id list rather than the fingerprint it could only repeat (WEALD-351). ``ClientStep::done`` is the client's own view of
 //! it: every range settled and nothing left to move. A relay that kept sending
 //! differing fingerprints for a range that cannot shrink would be caught by the
 //! round bound in the property suite rather than by trust.
@@ -40,7 +43,7 @@ use std::collections::BTreeSet;
 
 use super::{
     fingerprint, ids_of, items_in, Id, Item, Message, Mode, Range, IDLIST_LIMIT, INFINITY,
-    SPLIT_FACTOR,
+    MAX_IDS_PER_RANGE, SPLIT_FACTOR,
 };
 
 /// What the relay decided about one round.
@@ -138,6 +141,27 @@ fn split(items: &[Item], upper: u64) -> Vec<Range> {
         ranges.push(Range::new(bound, Mode::Fingerprint(fingerprint(chunk))));
         index = end;
     }
+    // The one input this cannot divide: every item sharing one `seq`. The widening
+    // loop above then runs `end` to the end of the slice on the first pass, and what
+    // comes back is a single fingerprinted range with `bound == upper`, which is
+    // byte-identical to the range that was being split. The peer's fingerprint still
+    // differs, so it splits again, produces the same bytes again, and the exchange
+    // never terminates while costing a full scan a round. The termination argument in
+    // this module's header assumes every round settles a range or divides it, and
+    // this is the input where dividing is not available.
+    //
+    // Naming the ids instead is the progress the split could not make: an id list is
+    // what the peer diffs, so the very next round moves envelopes rather than
+    // re-asserting a fingerprint. `MAX_IDS_PER_RANGE` is the wire bound on an id
+    // list and it is far above `IDLIST_LIMIT`, which is only the threshold for
+    // preferring ids to a fingerprint. Above even that bound the range is not
+    // expressible either way, and the fingerprint stands: reaching it needs more than
+    // four thousand items at one sequence number on one side, and what answers it is
+    // a round cap on the socket rather than a message this function could emit
+    // (WEALD-351).
+    if ranges.len() == 1 && items.len() > IDLIST_LIMIT && items.len() <= MAX_IDS_PER_RANGE {
+        return vec![Range::new(upper, Mode::IdList(ids_of(items)))];
+    }
     ranges
 }
 
@@ -180,8 +204,19 @@ pub fn respond(local: &[Item], incoming: &Message) -> Response {
                 let ours_set: BTreeSet<Id> = ours.iter().copied().collect();
                 if theirs.is_subset(&ours_set) {
                     ranges.push(Range::new(upper, Mode::Skip));
-                } else {
+                } else if mine.len() <= IDLIST_LIMIT {
                     ranges.push(Range::new(upper, Mode::IdList(ours)));
+                } else {
+                    // The same rule the `Fingerprint` arm applies, and for the same
+                    // reason: an id list is bounded by `MAX_IDS_PER_RANGE` on the
+                    // wire, so answering a wide range with every id in it produces a
+                    // reply the peer's own decoder refuses. One id the relay does
+                    // not hold was enough to reach here with a whole group's
+                    // history in `mine`, which made that group unable to reconcile
+                    // at all while costing a full scan and a multi-megabyte encode
+                    // every retry. Splitting narrows the disagreement instead, and
+                    // the round after this one lands in the bounded arm.
+                    ranges.extend(split(mine, upper));
                 }
             }
         }
@@ -236,12 +271,22 @@ pub fn advance(local: &[Item], incoming: &Message) -> ClientStep {
                 }
                 if ours_set == theirs_set {
                     ranges.push(Range::new(upper, Mode::Skip));
-                } else {
+                } else if mine.len() <= IDLIST_LIMIT {
                     // The answering id list is what makes the relay push what this
                     // client is missing, so it goes out even when the only
                     // difference is in the client's favour.
                     anything_to_say = true;
                     ranges.push(Range::new(upper, Mode::IdList(ours)));
+                } else {
+                    // The rule `respond` already applies in its own `IdList` arm,
+                    // and for the same reason: an id list is bounded by
+                    // `MAX_IDS_PER_RANGE` on the wire, so answering a wide range
+                    // with every id in it produces a message the relay's decoder
+                    // refuses, and the client would resend those identical bytes on
+                    // every retry. Splitting narrows the disagreement instead and
+                    // the next round lands in the bounded arm above.
+                    anything_to_say = true;
+                    ranges.extend(split(mine, upper));
                 }
             }
         }

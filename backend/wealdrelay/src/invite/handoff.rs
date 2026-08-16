@@ -414,7 +414,10 @@ pub async fn store(
     // `do nothing` rather than an overwrite: the row that is already there was
     // sealed over a code this process does not have, and replacing it would swap a
     // usable ciphertext for one whose plaintext the relay can no longer produce.
-    read(pool, workspace_id)
+    // The unfiltered read, because this call confirms the write landed rather than
+    // answers the route. An operator who configured an expiry already in the past
+    // still learns the row is there, and the route still refuses to serve it.
+    read_unexpired(pool, workspace_id, false)
         .await?
         .ok_or_else(|| super::store::StoreError::Database("handoff vanished mid-seal".into()))
 }
@@ -425,16 +428,30 @@ pub async fn store(
 /// more than once and that redemption is the one-time operation. The control plane
 /// polls this while it waits for a relay to come up, so a read that spent it would
 /// destroy the invite before the buyer ever saw it.
+///
+/// Expiry, though, is enforced here rather than left to the column: past
+/// `expires_at` the bootstrap invite can no longer be redeemed, so the ciphertexts
+/// are of a link that 404s and a code that opens nothing, and serving them forever
+/// is one half of a two-channel split lying around for the life of the instance.
 pub async fn read(
     pool: &sqlx::PgPool,
     workspace_id: &str,
 ) -> Result<Option<SealedHandoff>, super::store::StoreError> {
+    read_unexpired(pool, workspace_id, true).await
+}
+
+async fn read_unexpired(
+    pool: &sqlx::PgPool,
+    workspace_id: &str,
+    only_unexpired: bool,
+) -> Result<Option<SealedHandoff>, super::store::StoreError> {
     use sqlx::Row as _;
     let row = sqlx::query(
         "select blob, sealed_code, genesis_fingerprint from relay_bootstrap_handoff \
-         where workspace_id = $1",
+         where workspace_id = $1 and ($2 = false or expires_at > now())",
     )
     .bind(workspace_id)
+    .bind(only_unexpired)
     .fetch_optional(pool)
     .await
     .map_err(super::store::db_error)?;
@@ -443,4 +460,34 @@ pub async fn read(
         sealed_code: row.get("sealed_code"),
         genesis_fingerprint: row.get("genesis_fingerprint"),
     }))
+}
+
+/// Drop every handoff whose bootstrap window has closed.
+///
+/// Returns how many rows went. The read already refuses an expired row, so this is
+/// not what makes the route safe; it is what stops the ciphertexts from sitting in
+/// the database and in every backup taken after they stopped being useful. Called
+/// by the same sweep that expires reservations, and safe to call twice.
+pub async fn sweep_expired(pool: &sqlx::PgPool) -> Result<u64, super::store::StoreError> {
+    let result = sqlx::query("delete from relay_bootstrap_handoff where expires_at <= now()")
+        .execute(pool)
+        .await
+        .map_err(super::store::db_error)?;
+    Ok(result.rows_affected())
+}
+
+/// Drop the ciphertexts once the bootstrap invite they describe is spent.
+///
+/// Runs inside the redemption transaction so the row and the secret half of the
+/// genesis key disappear together: a handoff that outlived its redemption is a
+/// sealed enrollment link for a workspace somebody has already enrolled into.
+pub(crate) async fn forget_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from relay_bootstrap_handoff where workspace_id = $1")
+        .bind(workspace_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }

@@ -1751,7 +1751,7 @@ async fn a_presigned_url_is_issued_for_both_directions_and_names_its_object() {
     let key = BlobKey::new("ws-presign", "grp", "hash").expect("key");
 
     let put = store
-        .presign_put(&key, Duration::from_secs(900))
+        .presign_put(&key, Duration::from_secs(900), None)
         .await
         .expect("a presigned put");
     let get = store
@@ -1782,7 +1782,7 @@ async fn a_presigned_url_is_issued_for_both_directions_and_names_its_object() {
         "staging".to_string(),
     );
     assert!(prefixed
-        .presign_put(&key, Duration::from_secs(900))
+        .presign_put(&key, Duration::from_secs(900), None)
         .await
         .expect("a prefixed presigned put")
         .contains("staging/ws-presign/grp/hash"));
@@ -1804,7 +1804,7 @@ async fn a_lifetime_longer_than_s3_will_sign_is_refused_rather_than_panicking() 
     let key = BlobKey::new("ws-presign", "grp", "hash").expect("key");
     let beyond = Duration::from_secs(8 * 24 * 60 * 60);
 
-    match store.presign_put(&key, beyond).await {
+    match store.presign_put(&key, beyond, None).await {
         Err(StorageError::WriteFailed { reason }) => {
             assert!(reason.contains("presigning config"), "{reason}")
         }
@@ -1867,7 +1867,9 @@ async fn presigning_without_a_usable_credential_is_a_typed_refusal() {
     let key = BlobKey::new("ws", "grp", "hash").expect("key");
 
     for outcome in [
-        store.presign_put(&key, Duration::from_secs(900)).await,
+        store
+            .presign_put(&key, Duration::from_secs(900), None)
+            .await,
         store.presign_get(&key, Duration::from_secs(900)).await,
     ] {
         match outcome {
@@ -2177,4 +2179,81 @@ async fn an_assembly_that_fails_late_is_classified_by_how_it_failed() {
             ),
         }
     }
+}
+
+/// A presigned PUT bound to a length will not take a longer body.
+///
+/// The relay charges `relay_quota.stored_bytes` against the length the client
+/// declared in `BLOB put` and never re-measures the object, so an unbound URL made
+/// the quota advisory: declare one byte, presign, PUT five gigabytes, pay for one.
+/// Signing `Content-Length` moves the ceiling to where the bytes actually land.
+///
+/// Proven against MinIO rather than asserted as URL text, because what is being
+/// claimed is that a real S3 implementation refuses the request: a signature is
+/// only worth anything against something that verifies it. The oversized body is
+/// ten bytes, not five gigabytes, because the refusal happens on the signature and
+/// the header, and the smallest object that proves it is the right one.
+#[tokio::test]
+async fn a_presigned_put_bound_to_a_length_refuses_a_longer_body() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// One raw request straight at the bucket, with a `Content-Length` the caller
+    /// chooses. No Weald code is in this path on purpose: a presigned URL is used
+    /// by a client the relay never sees.
+    async fn put(url: &str, declared: usize, body: &[u8]) -> u16 {
+        let without_scheme = url.strip_prefix("http://").expect("an http url");
+        let (authority, path) = without_scheme.split_once('/').expect("a path");
+        let mut stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .expect("connect to the bucket");
+        let head = format!(
+            "PUT /{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: {declared}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.expect("send head");
+        stream.write_all(body).await.expect("send body");
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer).await;
+        String::from_utf8_lossy(&answer[..answer.len().min(64)])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    require_minio();
+    let bucket = TestBucket::create("presign-length").await;
+    let store = S3Store::with_client(bucket.client.clone(), bucket.name.clone(), String::new());
+    let key = BlobKey::new("ws-presign-len", "grp", "hash").expect("key");
+    let url = store
+        .presign_put(&key, Duration::from_secs(900), Some(4))
+        .await
+        .expect("a bound presigned put");
+
+    // The declared length is part of the signature, so a request announcing any
+    // other length is not the request that was signed.
+    let oversized = put(&url, 10, b"0123456789").await;
+    assert!(
+        (400..500).contains(&oversized),
+        "an oversized body was accepted with {oversized}"
+    );
+    assert!(
+        store.head(&key).await.expect("a head").is_none(),
+        "the oversized body was stored anyway"
+    );
+
+    // And the honest client, at exactly the length the quota was charged for.
+    let exact = put(&url, 4, b"abcd").await;
+    assert_eq!(exact, 200, "the declared length was refused");
+    assert_eq!(
+        store
+            .head(&key)
+            .await
+            .expect("a head")
+            .expect("the object is there")
+            .len,
+        4
+    );
+
+    bucket.destroy().await;
 }

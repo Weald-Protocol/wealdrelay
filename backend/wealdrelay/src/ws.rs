@@ -153,10 +153,23 @@ impl OutboundSender {
         self.inner.capacity()
     }
 
-    /// Ask the channel to close, waiting for room. `Close` carries no payload and so
-    /// spends no budget: it is the frame that must always be able to get through.
-    pub async fn close(&self) -> Result<(), mpsc::error::SendError<Outbound>> {
-        self.inner.send(Outbound::Close).await
+    /// Ask the channel to close, without waiting.
+    ///
+    /// `try_send` rather than `send`, for the reason `close_on_deadline` gives:
+    /// `Close` spends no budget, but it still occupies one of the 256 channel
+    /// slots, and the writer task only drains those by awaiting the socket. A
+    /// peer that has stopped reading therefore parks the writer forever, so an
+    /// awaiting close parks its caller forever too, on precisely the connection
+    /// this call exists to let go of. That leaked the connection slot, the hub
+    /// entries and the send budget at `handle_message`, and stalled a whole
+    /// rotation at `Hub::evict`, where one wedged victim blocked every later
+    /// one.
+    ///
+    /// A full queue means the peer is 256 frames behind and will not read a
+    /// polite close either; dropping the sender is what actually ends the
+    /// socket. False means "not queued", and no caller treats that as failure.
+    pub fn close(&self) -> bool {
+        self.inner.try_send(Outbound::Close).is_ok()
     }
 
     /// Queue a liveness ping, without waiting.
@@ -221,6 +234,29 @@ pub fn try_queue(sender: &OutboundSender, frame: Frame) -> Queued {
     }
 }
 
+/// Encode a frame for the wire, or refuse it as over the cap.
+///
+/// The writer's authoritative length check: `Frame::queued_bytes` is an estimate
+/// for the queue budget, so the ceiling every peer enforces (`MAX_FRAME_BYTES`,
+/// the same bound `Frame::decode` and `handle_message` apply inbound) has to be
+/// measured against the encoded bytes themselves. `Err` carries the offending
+/// length so the caller can say what it refused.
+pub fn encode_bounded(frame: &Frame) -> Result<Vec<u8>, usize> {
+    let bytes = frame.encode();
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(bytes.len());
+    }
+    Ok(bytes)
+}
+
+/// How long teardown waits for the writer task to finish its last send.
+///
+/// Five seconds is a drain, not a deadline: every frame still queued is already
+/// bounded by `SEND_QUEUE_BYTE_BUDGET`, so a peer reading at any usable rate is
+/// finished well inside it, and a peer reading at none is not going to be finished
+/// by a larger number.
+pub const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A connection's outbound channel, bounded by ``SEND_QUEUE_BOUND`` frames and
 /// ``SEND_QUEUE_BYTE_BUDGET`` bytes, whichever is reached first.
 pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
@@ -257,15 +293,43 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
 
     // The writer is its own task so the bound is real: when it is full the reader
     // below stops making progress, which stops it reading the socket.
-    let writer = tokio::spawn(async move {
+    let writer_state = Arc::clone(&state);
+    let mut writer = tokio::spawn(async move {
         loop {
             match receiver.recv().await {
                 Some(Outbound::Frame(frame)) => {
+                    // The outbound mirror of the inbound `MAX_FRAME_BYTES` gate at
+                    // `handle_message`. Every conforming peer refuses a frame over
+                    // the cap by the same symmetric rule, so writing one is not a
+                    // send, it is a silent permanent wedge for this group with
+                    // nothing in telemetry pointing at the cause. Counted, logged
+                    // with the tag and the length, told to the peer as a real
+                    // error, and then the connection is closed: an attributable
+                    // failure instead of an invisible one.
+                    let bytes = match encode_bounded(&frame) {
+                        Ok(bytes) => bytes,
+                        Err(length) => {
+                            writer_state
+                                .oversized_outbound_frames
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(
+                                tag = ?frame.tag(),
+                                length,
+                                cap = MAX_FRAME_BYTES,
+                                "relay built an outbound frame over the wire cap; closing the connection"
+                            );
+                            let apology =
+                                Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge));
+                            let _ = sink.send(Message::Binary(apology.encode())).await;
+                            let _ = sink.close().await;
+                            break;
+                        }
+                    };
                     // A write that fails is a client that has gone without saying so.
                     // Ending the task is the whole of the response: there is nobody to
                     // tell, and a writer that kept trying would hold a task, a queue
                     // and a socket per vanished client.
-                    if sink.send(Message::Binary(frame.encode())).await.is_err() {
+                    if sink.send(Message::Binary(bytes)).await.is_err() {
                         break;
                     }
                 }
@@ -361,7 +425,9 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
         ) {
             deadlines.authenticated(elapsed_ms());
             if holds_unauthenticated_source_share {
-                state.release_unauthenticated_connection(source.as_deref());
+                state
+                    .release_unauthenticated_connection(source.as_deref())
+                    .await;
                 holds_unauthenticated_source_share = false;
             }
         }
@@ -381,14 +447,29 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
     // client has stopped reading, which is the case where the relay most needs to let
     // go of the connection.
     drop(sender);
-    let _ = writer.await;
+    // Bounded, then aborted. `sink.send` has no timeout of its own, so a peer that
+    // stops reading at the TCP level parks the writer inside a single send for as
+    // long as it likes. Awaiting that join unbounded would hand the connection slot
+    // released below to the peer's read rate, which is the exact hold `deadline.rs`
+    // exists to end: the reader gives up on schedule and the slot leaks anyway.
+    // The wait is a courtesy to a slow but live peer, not a guarantee to a hostile
+    // one, so on expiry the task is aborted, which drops the sink and closes the
+    // socket underneath it.
+    if tokio::time::timeout(WRITER_DRAIN_TIMEOUT, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     // Last, and on every path out of this function, because this is the only
     // function that can know the connection is finished. `relay_socket` took the
     // slot before the upgrade; releasing it there would have released it while the
     // socket was still open, and releasing it only on the clean path would leak
     // one per client that vanished.
     if holds_unauthenticated_source_share {
-        state.release_unauthenticated_connection(source.as_deref());
+        state
+            .release_unauthenticated_connection(source.as_deref())
+            .await;
     }
     state.release_connection();
 }
@@ -436,8 +517,11 @@ pub async fn handle_message(
     };
 
     if bytes.len() > MAX_FRAME_BYTES {
-        // Refused on length before anything is parsed, so an oversized frame
-        // costs the relay a length check rather than a parse.
+        // Refused on length before anything is parsed. The allocation itself is
+        // bounded a layer down: the upgrade sets `max_message_size` to
+        // `health::WS_MAX_MESSAGE_BYTES`, so nothing materially larger than a
+        // legal frame is ever reassembled and this check is what remains for the
+        // sliver between the two ceilings.
         let _ = try_queue(
             sender,
             Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge)),
@@ -462,7 +546,7 @@ pub async fn handle_message(
         Reaction::Reply(frames) => queue_all(sender, frames),
         Reaction::ReplyAndClose(frames) => {
             let _ = queue_all(sender, frames);
-            let _ = sender.close().await;
+            let _ = sender.close();
             false
         }
         Reaction::Defer(work) => perform(sender, state, session, connection, work, now_ms).await,
@@ -815,12 +899,37 @@ async fn administer_invite(
     )
     .await
     {
-        Ok(response) => queue_all(
-            sender,
-            vec![Frame::Invite {
-                body: response.encode(),
-            }],
-        ),
+        Ok(response) => {
+            // The half of revocation the hub owns. `store::revoke` voids every grant
+            // derived from the invite, but a voided grant is only read at `AUTH`, so a
+            // joiner already holding a socket kept it until it disconnected. The
+            // grant's `device_hash` is the salted `entry_hash` the hub indexes
+            // connections by (`access::store::admits`), which is the same key an
+            // `ACCESS` publication evicts with above.
+            if let admin::Response::Revoked { token } = &response {
+                // Scoped to this workspace before anything is closed: the tombstone is
+                // keyed by token alone, so an admin of another workspace must not be
+                // able to close its connections by presenting its token.
+                if crate::invite::store::belongs_to(database.pool(), token, workspace)
+                    .await
+                    .unwrap_or(false)
+                {
+                    if let Ok(Some(hashes)) =
+                        crate::invite::store::tombstoned_hashes(database.pool(), token).await
+                    {
+                        for hash in &hashes {
+                            state.hub.evict(hash).await;
+                        }
+                    }
+                }
+            }
+            queue_all(
+                sender,
+                vec![Frame::Invite {
+                    body: response.encode(),
+                }],
+            )
+        }
         Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
     }
 }
@@ -1098,7 +1207,28 @@ async fn key_packages(
     body: crate::frame::KeysBody,
 ) -> bool {
     let answer = crate::keys::handle(state, session, body).await;
-    queue_all(sender, vec![answer])
+    if queue_all(sender, vec![answer.frame]) {
+        return true;
+    }
+    // The fetch consumed the packages in the statement that selected them, so a
+    // queue that refused the answer has destroyed one-time keys that reached
+    // nobody. The shelf is finite and a peer can repeat the fetch, so without
+    // this the whole shelf walks away and the device stops being addable while
+    // believing it is stocked. Restoring only ever touches the rows this call
+    // consumed.
+    if !answer.restore.is_empty() {
+        if let Some(database) = &state.database {
+            if let Err(error) = crate::keys::store::restore(database.pool(), &answer.restore).await
+            {
+                tracing::warn!(
+                    error = %error,
+                    count = answer.restore.len(),
+                    "keys: an undelivered fetch could not be restored to the shelf"
+                );
+            }
+        }
+    }
+    false
 }
 
 /// One push-wake registration, clear or query.
@@ -1237,9 +1367,18 @@ async fn report_access_state(
             vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
         );
     };
-    // Resolved from the groups this connection named, every time, never from what
-    // the session remembers: a relay answering from memory would hand out one
-    // workspace's salt after that workspace stopped being its.
+    // Answered from the workspace this session was admitted to, and from nothing
+    // else. `store::state_for` resolves the first requested group that names any
+    // workspace, while `store::admission` binds the session to the first requested
+    // group that actually admits the device, so the two disagree exactly when a
+    // client names groups from two workspaces: a member of B naming one of A's
+    // group ids first would be handed A's salt, which is the value every entry
+    // hash is keyed on, and A's set head. That is the cross-tenant oracle
+    // `authorize_group` exists to refuse (BR-013), so the admitted workspace wins.
+    //
+    // The group-resolved form remains only for a session that carries no workspace
+    // claim at all, which is `WEALD_RELAY_ACCESS_SET=off`: there is no tenancy
+    // boundary in that mode to cross.
     //
     // The one exception is the founding device, and it is re-established from the
     // tables rather than remembered: a device holding the live, unconsumed
@@ -1247,7 +1386,11 @@ async fn report_access_state(
     // which to build that workspace's first set, and there are no groups to resolve
     // it from because the set it is building is what admits the device that will
     // make them.
-    let found = match store::state_for(database.pool(), session.requested()).await {
+    let resolved = match session.authorized_workspace() {
+        Some(workspace) => store::state_of(database.pool(), workspace).await.map(Some),
+        None => store::state_for(database.pool(), session.requested()).await,
+    };
+    let found = match resolved {
         Ok(Some(state)) => Ok(Some(state)),
         Ok(None) => {
             // A session with no device key has not authenticated, and an empty key
@@ -1394,6 +1537,28 @@ pub async fn perform(
                     // revocation that lands in the same instant closes this socket
                     // rather than missing it by a frame.
                     state.hub.identify(&entry, connection, sender.clone()).await;
+                    // And membership is read again after the registration, because
+                    // the first read and `identify` do not happen under one lock.
+                    // A rotation that committed between them found an empty
+                    // `principals` entry when it evicted, so its `evict` closed
+                    // zero sockets and this one would have stayed authorized
+                    // indefinitely. The two reads bracket the registration: a
+                    // rotation that lands before this second read is seen by it,
+                    // and one that lands after it finds the socket registered and
+                    // closes it. Either way no admitted socket survives the set
+                    // that dropped its device.
+                    match admit(state, session, &device_key).await {
+                        Admitted::InSet {
+                            entry: confirmed, ..
+                        } if confirmed == entry => {}
+                        _ => {
+                            state.hub.disconnect(connection).await;
+                            return refuse(
+                                sender,
+                                session.rejected(ErrorCode::WriterNotInAccessSet),
+                            );
+                        }
+                    }
                     let remaining = key_packages_remaining(state, &device_key).await;
                     let ack = session.authenticated(remaining);
                     if let Some(workspace) = workspace {
@@ -1495,7 +1660,18 @@ pub async fn perform(
             if let Err(code) = authorize_group(state, session, &group).await {
                 // Refused means no subscription was created, so the slot the `SUB` arm
                 // took for it is given back. See `Session::forget_subscription`.
-                session.forget_subscription(&group);
+                //
+                // Unless this connection was already subscribed. A repeated `SUB` for
+                // a group this socket holds is refused without touching the live hub
+                // entry (`Hub::subscribe` is idempotent and this path never reaches
+                // it), so forgetting the group there would drop the session's record
+                // of a subscription that is still being fanned out to. A client that
+                // re-`SUB`s its 256 groups while the database is briefly unreachable
+                // would zero its counter with 256 entries live and could then take
+                // 256 more, repeatably.
+                if !state.hub.holds(&group, connection).await {
+                    session.forget_subscription(&group);
+                }
                 return queue_all(sender, vec![Frame::Error(FrameError::new(code))]);
             }
             crate::sync::subscribe(
@@ -1593,17 +1769,29 @@ pub async fn key_packages_remaining(state: &Arc<RelayState>, device_key: &[u8]) 
 }
 
 /// The highest sequence number a group holds, or zero for an empty one.
-pub async fn head_seq(state: &Arc<RelayState>, group: &[u8]) -> u64 {
+///
+/// `None` means the relay could not read it, which is deliberately not the same
+/// value as an empty group. `sync::subscribe` names this number in `SUB_ACK`, and
+/// the whole reason a truncated backfill is honest is that the ack names a head
+/// beyond what arrived, so the client knows to come back for the rest. A failed
+/// read reported as zero collapses to `head.max(from_seq)`, which is the client's
+/// own cursor: it concludes it is fully caught up and never reconciles, and the
+/// envelopes it skipped surface later as a hole in somebody else's author chain.
+/// A relay with no database is a different case and still answers zero: nothing is
+/// claimed that is not true, and the honest backfill from a log it cannot read is
+/// none.
+pub async fn head_seq(state: &Arc<RelayState>, group: &[u8]) -> Option<u64> {
     let Some(database) = &state.database else {
-        return 0;
+        return Some(0);
     };
-    let head: Option<Option<i64>> =
+    let head: Option<i64> =
         sqlx::query_scalar("select max(seq) from relay_envelope where group_id = $1")
             .bind(group)
             .fetch_optional(database.pool())
             .await
-            .ok();
-    u64::try_from(head.flatten().unwrap_or_default()).unwrap_or_default()
+            .ok()?
+            .flatten();
+    Some(u64::try_from(head.unwrap_or_default()).unwrap_or_default())
 }
 
 #[cfg(test)]

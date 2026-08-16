@@ -352,3 +352,108 @@ async fn the_route_is_absent_without_an_operator_bearer_even_with_a_handoff_key(
     let (status, _) = ask(&state, &handoff::handoff_path(&key(HANDOFF_PUBLIC)), None).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn past_its_expiry_the_handoff_is_not_served() {
+    // The negative proof for `expires_at`. Past the bootstrap window the invite can
+    // no longer be redeemed, so the sealed link is one that 404s and the sealed code
+    // opens nothing: the ciphertexts stop being served rather than sitting on the
+    // instance for the life of the box, where a leaked operator bearer plus the
+    // control plane's handoff key would be both halves of the two-channel split.
+    let scratch = Scratch::new("handoff_expired").await;
+    let blobs = tempfile::tempdir().expect("a blob directory");
+    let config = config(&scratch, blobs.path(), true, true);
+    let state = Arc::new(
+        wealdrelay::serve::prepare(config.clone())
+            .await
+            .expect("the relay prepares"),
+    );
+    let database = state.database.as_ref().expect("a database");
+    let workspace = wealdrelay::serve::bootstrap_workspace(&config.hostname);
+    let bearer = format!("Bearer {TOKEN}");
+    let path = handoff::handoff_path(&key(HANDOFF_PUBLIC));
+
+    // Before: served.
+    let (status, _) = ask(&state, &path, Some(&bearer)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // Move the expiry into the past, which is the same state the clock reaching it
+    // produces and the only one a test can reach without waiting a day.
+    sqlx::query(
+        "update relay_bootstrap_handoff set expires_at = now() - interval '1 second' \
+         where workspace_id = $1",
+    )
+    .bind(&workspace)
+    .execute(database.pool())
+    .await
+    .expect("the expiry moves");
+
+    assert!(
+        wealdrelay::invite::handoff::read(database.pool(), &workspace)
+            .await
+            .expect("the read succeeds")
+            .is_none(),
+        "an expired handoff was still readable"
+    );
+    let (status, _) = ask(&state, &path, Some(&bearer)).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_sweep_removes_an_expired_handoff_row() {
+    // The route refusing an expired row is the access control; this is the erasure.
+    // A ciphertext that can never be opened usefully should not survive in the
+    // database or in the backups taken from it.
+    let scratch = Scratch::new("handoff_sweep").await;
+    let blobs = tempfile::tempdir().expect("a blob directory");
+    let config = config(&scratch, blobs.path(), true, true);
+    let state = wealdrelay::serve::prepare(config.clone())
+        .await
+        .expect("the relay prepares");
+    let database = state.database.as_ref().expect("a database");
+    let workspace = wealdrelay::serve::bootstrap_workspace(&config.hostname);
+
+    // A live row is left alone.
+    assert_eq!(
+        wealdrelay::invite::handoff::sweep_expired(database.pool())
+            .await
+            .expect("the sweep runs"),
+        0
+    );
+    assert!(
+        wealdrelay::invite::handoff::read(database.pool(), &workspace)
+            .await
+            .expect("the read succeeds")
+            .is_some()
+    );
+
+    sqlx::query(
+        "update relay_bootstrap_handoff set expires_at = now() - interval '1 second' \
+         where workspace_id = $1",
+    )
+    .bind(&workspace)
+    .execute(database.pool())
+    .await
+    .expect("the expiry moves");
+
+    assert_eq!(
+        wealdrelay::invite::handoff::sweep_expired(database.pool())
+            .await
+            .expect("the sweep runs"),
+        1
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("select count(*) from relay_bootstrap_handoff where workspace_id = $1")
+            .bind(&workspace)
+            .fetch_one(database.pool())
+            .await
+            .expect("the count succeeds");
+    assert_eq!(remaining, 0);
+    // And twice is the same as once.
+    assert_eq!(
+        wealdrelay::invite::handoff::sweep_expired(database.pool())
+            .await
+            .expect("the sweep runs"),
+        0
+    );
+}

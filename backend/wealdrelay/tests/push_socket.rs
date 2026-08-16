@@ -206,7 +206,10 @@ async fn a_query_on_a_push_on_relay_names_the_ringer_the_operator_chose() {
             register_url,
         }) => {
             assert!(enabled);
-            assert_eq!(register_url, "https://ringer.invalid/v1/wake/v1/handles");
+            // The wake path is substituted, not appended: the configured
+            // `WEALD_RELAY_PUSH_URL` is a whole `/v1/wake` route, and appending gave
+            // every device a 404 to register against.
+            assert_eq!(register_url, "https://ringer.invalid/v1/handles");
             assert!(
                 register_url.starts_with("https://"),
                 "a client refuses anything else"

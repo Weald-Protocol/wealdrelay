@@ -272,6 +272,15 @@ relay_start() {
   # No WEALD_RELAY_REDIS_URL. The harness runs exactly one relay process, and
   # server.md makes that variable the way a deployment declares it runs more than
   # one ("omit for single-process installs"), which is why config.rs refuses a
+  # Push is off by default and is the one knob here that reaches a vendor when it
+  # is not. `WEALD_STACK_PUSH=on WEALD_STACK_PUSH_URL=https://api.weald.team/v1/wake`
+  # points a laptop relay at the deployed ringer, which is how a real phone is
+  # woken from a local workspace: the handle is the whole of the authority
+  # (`specs/backend/relay/ringer.md`), so this needs no local credential and the
+  # ringer does not learn the workspace, the group or which relay called. Off by
+  # default because a harness run should reach no vendor at all, and every suite
+  # that exercises push does it against its own listener.
+  #
   # process-local live fanout when it is set. Declaring it here was the harness
   # saying something untrue about itself: it kept the relay from starting at all
   # once the ephemeral path landed, and the alternative fix, WEALD_RELAY_LIVE=off,
@@ -287,6 +296,8 @@ relay_start() {
   WEALD_RELAY_MIN_ENC="${WEALD_STACK_MIN_ENC:-mls}" \
   WEALD_RELAY_WRITE_MODE="${WEALD_STACK_WRITE_MODE:-full}" \
   WEALD_RELAY_IMAGE_DIGEST="${WEALD_STACK_IMAGE_DIGEST:-}" \
+  WEALD_RELAY_PUSH="${WEALD_STACK_PUSH:-off}" \
+  WEALD_RELAY_PUSH_URL="${WEALD_STACK_PUSH_URL:-}" \
     nohup "$bin" > "$RELAY_LOG_FILE" 2>&1 &
   echo $! > "$RELAY_PID_FILE"
 

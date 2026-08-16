@@ -22,6 +22,7 @@ fn printed(startup: Startup) -> Outcome {
     match startup {
         Startup::Print(outcome) => outcome,
         Startup::Serve(_) => panic!("expected a printed outcome, got a serve"),
+        Startup::Backup { .. } => panic!("expected a printed outcome, got a backup"),
     }
 }
 
@@ -33,6 +34,9 @@ fn a_complete_configuration_and_no_arguments_serves() {
             assert_eq!(config.listen, Config::DEFAULT_LISTEN);
         }
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
+        Startup::Backup { request, .. } => {
+            panic!("expected a serve, got a backup to {:?}", request.out)
+        }
     }
 }
 
@@ -230,6 +234,9 @@ fn two_instances_with_process_fanout_refuse_to_start() {
     match startup(Vec::<String>::new(), &Values::from_pairs(pairs)) {
         Startup::Serve(config) => assert_eq!(config.live_label(), "off"),
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
+        Startup::Backup { request, .. } => {
+            panic!("expected a serve, got a backup to {:?}", request.out)
+        }
     }
 }
 
@@ -261,6 +268,9 @@ fn push_on_with_no_destination_refuses_to_start_and_names_the_variable() {
     match startup(Vec::<String>::new(), &Values::from_pairs(pairs.clone())) {
         Startup::Serve(config) => assert_eq!(config.push_label(), "on"),
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
+        Startup::Backup { request, .. } => {
+            panic!("expected a serve, got a backup to {:?}", request.out)
+        }
     }
 
     // And a plaintext destination on a real host does not start, because a handle in
@@ -330,7 +340,7 @@ fn check_config_prints_the_wake_destination_and_never_the_bearer() {
     // The registration url is resolved rather than echoed, so an operator sees what
     // their devices are actually told rather than an empty column.
     assert!(
-        text.contains("https://ringer.weald.team/v1/wake/v1/handles"),
+        text.contains("https://ringer.weald.team/v1/handles"),
         "{text}"
     );
     for key in [

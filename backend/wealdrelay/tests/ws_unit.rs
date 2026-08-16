@@ -25,8 +25,8 @@ use wealdrelay::frame::{ErrorCode, Frame, FrameError, PROTOCOL_VERSION};
 use wealdrelay::health::RelayState;
 use wealdrelay::session::{Session, State, Work, SEND_QUEUE_BOUND};
 use wealdrelay::ws::{
-    downgrade_frame, handle_message, head_seq, key_packages_remaining, outbound_channel, perform,
-    try_queue, Outbound, Queued,
+    downgrade_frame, encode_bounded, handle_message, head_seq, key_packages_remaining,
+    outbound_channel, perform, try_queue, Outbound, Queued,
 };
 
 /// The relay's clock. Fixed, because `testing.md` forbids a wall-clock read inside
@@ -278,7 +278,12 @@ async fn a_relay_that_cannot_look_reports_no_key_packages_and_no_head() {
     // act on it: a device that was told it still had key packages would not top up.
     let state = blind();
     assert_eq!(key_packages_remaining(&state, &[0x11; 32]).await, 0);
-    assert_eq!(head_seq(&state, &group(5)).await, 0);
+    assert_eq!(
+        head_seq(&state, &group(5)).await,
+        Some(0),
+        "a relay with no database knows the honest head is zero; `None` is reserved \
+         for a read that failed, which is refused rather than acknowledged"
+    );
 
     // And the same two answers as a client sees them, through the work the session
     // deferred. `AUTH` is the exception and the important one: a relay that cannot
@@ -641,4 +646,30 @@ async fn a_keys_frame_from_a_session_with_no_workspace_is_refused_like_a_strange
         );
         assert_eq!(error_code(&queued(&mut receiver)), ErrorCode::Backpressure);
     }
+}
+
+#[test]
+fn the_outbound_writer_refuses_a_frame_over_the_wire_cap() {
+    use wealdrelay::frame::MAX_FRAME_BYTES;
+    // The outbound mirror of the inbound gate: a frame every conforming peer
+    // must reject by the symmetric `MAX_FRAME_BYTES` rule is refused before it
+    // reaches the socket, with the offending length named, instead of being
+    // written and silently discarded by the peer.
+    let oversized = Frame::Recon {
+        group: vec![0xAB; 32],
+        payload: vec![0; MAX_FRAME_BYTES],
+    };
+    match encode_bounded(&oversized) {
+        Err(length) => assert!(length > MAX_FRAME_BYTES),
+        Ok(bytes) => panic!("an oversized frame encoded to {} bytes", bytes.len()),
+    }
+
+    // And an ordinary frame passes through as its exact encoding.
+    let small = Frame::SubAck {
+        group: vec![0xAB; 32],
+        head_seq: 7,
+    };
+    let bytes = encode_bounded(&small).expect("a legal frame encodes");
+    assert_eq!(bytes, small.encode());
+    assert!(bytes.len() <= MAX_FRAME_BYTES);
 }

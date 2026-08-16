@@ -22,7 +22,7 @@ lines it is doing something this contract does not ask for.
     handles
       handle        16 bytes, the primary key, minted here
       token         the APNs device token
-      platform      ios | macos
+      platform      ios | macos | android
       topic         the APNs topic, a bundle identifier, optionally with .voip
       expires_at    when this mapping is forgotten
       created_at
@@ -33,6 +33,16 @@ principal, no device name, no last-seen, no wake log and no counter keyed by
 anything but the handle. The ringer cannot answer "which workspaces does this
 device belong to" because it has never been told, and it cannot answer "which
 relay woke this handle" because it does not record the caller.
+
+One aggregate is served from this table and named here so it is not mistaken for
+a drift: `GET /v1/ops/push` on the control plane reports, per platform, how many
+live rows exist, how many were created in the last day and how many expire within
+the week, beside this process's wake outcomes counted per platform. Platform is
+the only label any of it carries. Three integers about a platform reconstruct no
+row, name no device and are not a last-seen, and without them an operator cannot
+tell "Firebase is refusing us" from "everything is fine" while every Android phone
+in the fleet has gone quiet. A count keyed by anything narrower than a platform
+stays refused.
 
 It learns that a handle was woken at a time. That is strictly less than the relay
 already knows about the same device's connection timing, and it is the irreducible
@@ -48,6 +58,11 @@ relay never sees a token.
 
     request   { token, platform, topic, prior_handle? }
     response  201 { handle, expires_at }
+
+`handle` is lowercase hex of the 16 bytes. `expires_at` is an RFC3339 UTC string,
+never a number: it is what the ringer emits and what every client parses, and the
+type is part of the contract because a client that guessed the other one silently
+failed every mint.
 
 `token` is validated as hex of the platform's expected length and nothing else;
 the ringer does not verify it with Apple at registration time, because a token

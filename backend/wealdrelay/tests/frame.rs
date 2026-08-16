@@ -564,14 +564,33 @@ fn a_protocol_version_this_build_does_not_speak_aborts_the_frame() {
     // than a bad field. Both directions of the handshake carry a version, so both
     // are checked.
     let client_hello = Frame::Connect {
-        version: PROTOCOL_VERSION + 1,
+        version: 0,
         groups: Vec::new(),
         sent_at: 0,
     };
     assert_eq!(
         Frame::decode(&client_hello.encode()),
-        Err(FrameDecodeError::UnsupportedVersion(PROTOCOL_VERSION + 1))
+        Err(FrameDecodeError::UnsupportedVersion(0))
     );
+
+    // WEALD-300. Above the ceiling is not a decode failure. `CONNECT` carries the
+    // client's maximum offer, and the selection is the session's to make and to
+    // state in `CONNECT_ACK`; refusing the bytes here made that clamp unreachable
+    // and broke every future client against every deployed relay. The negotiation
+    // rule lives in `Session::handle` and is proved by
+    // `tests/session.rs::a_connect_above_this_builds_ceiling_is_served_at_the_ceiling`.
+    for version in [PROTOCOL_VERSION + 1, u16::MAX] {
+        let newer = Frame::Connect {
+            version,
+            groups: Vec::new(),
+            sent_at: 0,
+        };
+        assert_eq!(
+            Frame::decode(&newer.encode()),
+            Ok(newer.clone()),
+            "a newer client's CONNECT must reach the session to be clamped"
+        );
+    }
 
     let relay_hello = Frame::ConnectAck {
         version: 0,
@@ -791,7 +810,9 @@ fn every_decode_failure_maps_to_the_code_the_relay_answers_with() {
         .unwrap_err(),
         Frame::decode(
             &Frame::Connect {
-                version: 7,
+                // Below the floor. Above the ceiling decodes now: see
+                // `a_protocol_version_this_build_does_not_speak_aborts_the_frame`.
+                version: 0,
                 groups: Vec::new(),
                 sent_at: 0,
             }

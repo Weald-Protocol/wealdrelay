@@ -396,14 +396,25 @@ async fn a_chain_row_with_a_null_where_a_value_belongs_is_a_fault_and_not_a_prio
     }
 
     // A head the reader can read, so the nulls below are reached one at a time.
-    inject(
-        pool,
+    //
+    // The body has to be a real encoded set rather than the empty `bytea` this
+    // used to insert. `store::current` decodes it, and canonical CBOR has no
+    // zero-length encoding, so an empty column made the reader fail here with a
+    // decode error and none of the null columns below were ever reached: the
+    // scaffolding was failing before the faults it exists to set up. Bound as a
+    // parameter for the same reason it is a real set: there is no way to write
+    // one as a SQL literal.
+    let scaffold = genesis_over(&[0u8; 32]).encode();
+    sqlx::query(
         "insert into relay_access_set \
          (workspace_id, version, digest, prev_hash, issued_at, signer, signed_as, body) \
          values ('ws-access', 7, repeat('a', 32)::bytea, repeat('b', 32)::bytea, 1, \
-                 repeat('c', 32)::bytea, 'authorizer', ''::bytea)",
+                 repeat('c', 32)::bytea, 'authorizer', $1)",
     )
-    .await;
+    .bind(&scaffold)
+    .execute(pool)
+    .await
+    .expect("the injected head must land");
     assert!(store::current(pool, WORKSPACE)
         .await
         .unwrap()

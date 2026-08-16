@@ -57,6 +57,29 @@ pub struct Current {
 /// than a check-then-insert, because two connections publishing a genesis set at the
 /// same moment must agree about the salt or their entry hashes disagree forever.
 pub async fn salt(pool: &PgPool, workspace: &str) -> Result<Vec<u8>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(db)?;
+    salt_within(&mut conn, workspace).await
+}
+
+/// The same ensure-and-read, on a connection the caller already holds.
+///
+/// This exists because the pool version cannot be called from inside an open
+/// transaction. Doing so checks out a *second* connection from a pool of
+/// `WEALD_RELAY_DB_POOL_SIZE` while the first is still held by the transaction,
+/// so issuance competes with every authenticated session for the same small set
+/// of connections: `AUTH` and `SEND` both need one, and neither can get it while
+/// enough issuers are each holding one and waiting for another. That is a
+/// self-inflicted resource cycle rather than a lock bug, which is why it reads as
+/// a wedge with no CPU and why a socket upgrade still succeeds: the HTTP path
+/// touches no database at all.
+///
+/// It is also the correct transactional shape. The workspace row the invite's
+/// foreign keys need now lands or rolls back with the invite, instead of
+/// committing separately and leaving a workspace row for a record that failed.
+pub async fn salt_within(
+    conn: &mut sqlx::PgConnection,
+    workspace: &str,
+) -> Result<Vec<u8>, StoreError> {
     let fresh: [u8; 32] = random_salt();
     sqlx::query(
         "insert into relay_workspace (workspace_id, salt) values ($1, $2) \
@@ -64,12 +87,12 @@ pub async fn salt(pool: &PgPool, workspace: &str) -> Result<Vec<u8>, StoreError>
     )
     .bind(workspace)
     .bind(fresh.as_slice())
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(db)?;
     let row = sqlx::query("select salt from relay_workspace where workspace_id = $1")
         .bind(workspace)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(db)?;
     row.try_get::<Vec<u8>, _>("salt").map_err(db)
@@ -105,7 +128,7 @@ pub async fn current(pool: &PgPool, workspace: &str) -> Result<Current, StoreErr
 
 async fn read_prior(pool: &PgPool, workspace: &str) -> Result<Option<Prior>, StoreError> {
     let Some(row) = sqlx::query(
-        "select version, digest from relay_access_set where workspace_id = $1 \
+        "select version, digest, body from relay_access_set where workspace_id = $1 \
          order by version desc limit 1",
     )
     .bind(workspace)
@@ -117,6 +140,13 @@ async fn read_prior(pool: &PgPool, workspace: &str) -> Result<Option<Prior>, Sto
     };
     let version: i64 = row.try_get("version").map_err(db)?;
     let digest: Vec<u8> = row.try_get("digest").map_err(db)?;
+    // The workspace this chain names, read back from the bytes that were accepted
+    // rather than from the row's workspace id: the two are different namespaces,
+    // and what a successor must match is what the prior set actually said.
+    let body: Vec<u8> = row.try_get("body").map_err(db)?;
+    let chain_workspace = super::AccessSet::decode(&body)
+        .map_err(|error| StoreError::Database(error.to_string()))?
+        .workspace;
     let entries = sqlx::query(
         "select entry_hash from relay_access_entry where workspace_id = $1 and version = $2 \
          order by entry_hash",
@@ -178,6 +208,7 @@ async fn read_prior(pool: &PgPool, workspace: &str) -> Result<Option<Prior>, Sto
     };
 
     Ok(Some(Prior {
+        workspace: chain_workspace,
         // Not negative by `relay_access_set_version_not_negative`.
         version: version as u64,
         digest,
@@ -615,13 +646,41 @@ pub async fn admission(
     groups: &[Vec<u8>],
     device_key: &[u8],
 ) -> Result<Verdict, StoreError> {
-    let mut workspace = None;
+    // Every workspace the named groups point at, in the order named and without
+    // repeats, rather than the first one found.
+    //
+    // Group ids are client-derived and travel in invite `scopes`, so a member of
+    // workspace A can name an id workspace B is about to create, and the
+    // conflict-blind insert in `ensure_groups` binds that row to A. Resolving on
+    // the first row found then let A choose which workspace B's own connection is
+    // evaluated against: B names A's squatted id alongside its own groups, resolves
+    // to A, is not in A's set, and is refused for the whole session rather than for
+    // the one group. Preferring the workspace that actually admits this device
+    // takes that choice away from the squatter. It does not unbind the row: the
+    // relay cannot tell who derived an opaque 32-byte id, so the squatted group
+    // itself is still refused by `authorize_group`, which is the pre-existing
+    // limit of a blind relay and not something resolution order can fix.
+    let mut candidates: Vec<String> = Vec::new();
     for group in groups {
         if let Some(found) = workspace_of(pool, group).await? {
-            workspace = Some(found);
+            if !candidates.iter().any(|known| known == &found) {
+                candidates.push(found);
+            }
+        }
+    }
+    let mut workspace = None;
+    for candidate in &candidates {
+        if !matches!(
+            admits(pool, candidate, device_key).await?,
+            Admission::Refused
+        ) {
+            workspace = Some(candidate.clone());
             break;
         }
     }
+    // None of them carries this device, so the answer is a refusal either way and
+    // the first named workspace is the one it is phrased against, exactly as before.
+    let workspace = workspace.or_else(|| candidates.first().cloned());
     // The same second way in that `publish_for` has, and for the same moment: a
     // workspace whose trust root has not been admitted yet has no groups, because
     // groups are made by the trust root. A device holding the live, unconsumed
@@ -658,10 +717,24 @@ pub async fn admission(
             workspace,
         }),
         // No set at all is a different answer from "your key is not in the set", and
-        // this is the only place the difference is actionable.
+        // this is the only place the difference is actionable. It is still not an
+        // open door: `relay_group` rows exist before genesis on every provisioned
+        // relay, so a workspace resolved from a group id alone would let anyone who
+        // knew that id become the trust root. `Bootstrap` therefore requires the
+        // same live, unconsumed reservation the no-group path above requires, and
+        // requires it on this workspace.
         Admission::Refused => match read_prior(pool, &workspace).await? {
             Some(_) => Ok(Verdict::Refused),
-            None => Ok(Verdict::Bootstrap(workspace)),
+            None => {
+                let founding = crate::invite::genesis::founding_workspace(pool, device_key)
+                    .await
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+                if founding.as_deref() == Some(workspace.as_str()) {
+                    Ok(Verdict::Bootstrap(workspace))
+                } else {
+                    Ok(Verdict::Refused)
+                }
+            }
         },
     }
 }
@@ -678,26 +751,66 @@ pub async fn admission(
 /// invite machinery that creates these arrives with `specs/backend/relay/invites.md`;
 /// what step 6 owes is that a grant, once it exists, dies exactly when the three
 /// rules say it does.
-pub async fn grant(
-    pool: &PgPool,
+/// A void is never cleared here. Revocation is aimed at exactly the party that
+/// drives the rest of a join, so an upsert that reset `voided_at` handed that party
+/// the undo button: the last frame of a join the admin had already killed would
+/// re-arm the grant to the invite's original expiry. Voiding is therefore terminal
+/// for a `(workspace, device_hash)` pair, and a device that has been revoked,
+/// superseded or expired needs a new invite rather than another frame.
+///
+/// Returns whether a live grant now exists, so a caller can refuse rather than
+/// carry on believing it issued one.
+///
+/// Written against an executor rather than the pool so a caller that must not be
+/// able to issue a grant without the write that pays for it, or pay for one without
+/// issuing it, can run both inside its own transaction. `invite::reserve` is that
+/// caller: the seat and the grant are one atom there (WEALD-342). A `&PgPool` is an
+/// executor too, so every other call site is unchanged and still autocommits.
+pub async fn grant<'a, E>(
+    executor: E,
     workspace: &str,
     device_hash: &[u8],
     expires_at_ms: i64,
-) -> Result<(), StoreError> {
-    sqlx::query(
+) -> Result<bool, StoreError>
+where
+    E: sqlx::Executor<'a, Database = Postgres>,
+{
+    let done = sqlx::query(
         "insert into relay_provisional_grant (workspace_id, device_hash, expires_at) \
          values ($1, $2, to_timestamp($3::double precision / 1000)) \
          on conflict (workspace_id, device_hash) do update \
-         set expires_at = excluded.expires_at, voided_at = null, voided_reason = null, \
-             seen_version = null",
+         set expires_at = excluded.expires_at, seen_version = null \
+         where relay_provisional_grant.voided_at is null",
     )
     .bind(workspace)
     .bind(device_hash)
     .bind(expires_at_ms)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(db)?;
-    Ok(())
+    Ok(done.rows_affected() > 0)
+}
+
+/// Whether this device's grant in this workspace has been voided.
+///
+/// Read before a reservation takes a seat, so a revoked device is refused without
+/// spending one of the invite's uses. It is not the enforcement: `grant` refusing to
+/// clear a void is, and this only keeps the common case from costing a seat.
+pub async fn grant_is_voided(
+    pool: &PgPool,
+    workspace: &str,
+    device_hash: &[u8],
+) -> Result<bool, StoreError> {
+    let voided: Option<bool> = sqlx::query_scalar(
+        "select voided_at is not null from relay_provisional_grant \
+         where workspace_id = $1 and device_hash = $2",
+    )
+    .bind(workspace)
+    .bind(device_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    Ok(voided.unwrap_or(false))
 }
 
 /// Void every grant derived from a revoked invite, explicitly.
@@ -781,6 +894,26 @@ pub async fn workspace_of(pool: &PgPool, group: &[u8]) -> Result<Option<String>,
 /// would refuse the whole session with `retry/backpressure`.
 const GROUP_ID_BYTES: usize = 32;
 
+/// The most `relay_group` rows one workspace may hold.
+///
+/// An abuse ceiling and deliberately not the product's policy bound. The policy
+/// figure is 512 ("Groups per workspace, meaning per project",
+/// `specs/backend/relay/channels.md`), it is sized against client MLS state, and it
+/// lives where it can be enforced: `WorkspaceGroups.Limits.groupsPerWorkspace` in
+/// the app. The relay cannot enforce it, because the relay is blind. It sees opaque
+/// 32-byte ids and cannot tell a channel group from a dm group, and
+/// `specs/backend/relay/private-messaging.md` allows 512 dm groups per workspace
+/// *per device* while calling that "the per-device share" of the same 512, so the
+/// two documented figures cannot both be a workspace total. A relay that picked one
+/// would be arbitrating a policy question it has no information for, and picking the
+/// smaller would take a workspace offline for doing what a spec permits.
+///
+/// So this is set where the only thing it can refuse is abuse: sixteen times the
+/// policy bound, above a fully connected hundred-device workspace's channel and dm
+/// groups together, and a hard stop on a device minting fresh ids in a reconnect
+/// loop. What it converts is unbounded into bounded, which is the whole claim.
+pub const MAX_GROUPS_PER_WORKSPACE: u32 = 8192;
+
 /// Create the group rows a connection named, under the workspace that admitted it.
 ///
 /// ## Why this exists at all
@@ -812,25 +945,69 @@ const GROUP_ID_BYTES: usize = 32;
 /// belonging to another workspace is left alone rather than moved, so a device in
 /// workspace A naming workspace B's group id changes nothing and is then refused
 /// by `authorize_group` as it was before.
+///
+/// ## Bounded, because `CONNECT` is client-derived
+///
+/// Group ids are opaque 32-byte values the client derives, and a connection may
+/// name up to `MAX_GROUPS_PER_CONNECTION` of them. Reconnecting with the same ids
+/// writes nothing, so idempotence bounds the honest case; it does nothing about a
+/// device that names 256 *fresh* random ids per handshake, which before this cap
+/// grew `relay_group` without limit, forever, with no expiry and no sweep
+/// (WEALD-317). The count is evaluated inside the insert rather than read first,
+/// so two connections racing cannot both pass a check and then both write: the
+/// check-then-insert shape is how the key package cap was exceeded twenty times
+/// over. Concurrent statements may still overshoot slightly, by at most what one
+/// snapshot misses, which is a bound either way rather than none.
 pub async fn ensure_groups(
     pool: &PgPool,
     workspace: &str,
     groups: &[Vec<u8>],
 ) -> Result<u64, StoreError> {
     let mut created = 0;
+    // Read once, to say so once. The guard inside the insert is what actually holds
+    // the bound (and holds it under a race); this is here because a workspace that
+    // silently stopped getting group rows would present as `denied/group_unknown` on
+    // a client that had done nothing wrong, and an operator would have nothing to
+    // read. Never the workspace id, which is a tenant identifier: the count and the
+    // ceiling are what an operator needs and all they get.
+    let held = group_count(pool, workspace).await?;
+    if held >= i64::from(MAX_GROUPS_PER_WORKSPACE) {
+        tracing::warn!(
+            held,
+            ceiling = MAX_GROUPS_PER_WORKSPACE,
+            "access: a workspace is at its group ceiling, new group ids are not being created"
+        );
+        return Ok(0);
+    }
     for group in groups.iter().filter(|group| group.len() == GROUP_ID_BYTES) {
         let outcome = sqlx::query(
-            "insert into relay_group (group_id, workspace_id) values ($1, $2) \
+            "insert into relay_group (group_id, workspace_id) \
+             select $1, $2 \
+             where (select count(*) from relay_group where workspace_id = $2) < $3 \
              on conflict (group_id) do nothing",
         )
         .bind(group.as_slice())
         .bind(workspace)
+        .bind(i64::from(MAX_GROUPS_PER_WORKSPACE))
         .execute(pool)
         .await
         .map_err(db)?;
         created += outcome.rows_affected();
     }
     Ok(created)
+}
+
+/// How many group rows one workspace holds.
+///
+/// Index-only on `relay_group_workspace_idx`. Public because the ceiling is worth
+/// asserting against from a test without reaching for raw SQL.
+pub async fn group_count(pool: &PgPool, workspace: &str) -> Result<i64, StoreError> {
+    let row = sqlx::query("select count(*) as held from relay_group where workspace_id = $1")
+        .bind(workspace)
+        .fetch_one(pool)
+        .await
+        .map_err(db)?;
+    row.try_get::<i64, _>("held").map_err(db)
 }
 
 /// How many principals this relay has admitted, across every workspace on it.

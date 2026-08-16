@@ -213,7 +213,11 @@ async fn an_applied_migration_that_has_since_been_edited_is_refused() {
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
             "0010_envelope_budget".to_string(),
-            "0011_bootstrap_handoff".to_string()
+            "0011_bootstrap_handoff".to_string(),
+            "0012_invite_attempt_by_source".to_string(),
+            "0013_invite_bundle_issued".to_string(),
+            "0014_ciphertext_storage_external".to_string(),
+            "0015_gc_restore_marker".to_string()
         ]
     );
 
@@ -703,11 +707,11 @@ async fn the_public_listener_serves_liveness_and_nothing_else() {
     // behind a security release.
     let scratch = Scratch::new("listeners").await;
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(
-        serve::prepare(config_for(&scratch, blobs.path()))
-            .await
-            .unwrap(),
-    );
+    let mut config = config_for(&scratch, blobs.path());
+    // The detailed readiness document is operator-only (WEALD-295), so this suite
+    // configures the bearer the way the hosted shape does.
+    config.operator_token = Some("listeners-operator-bearer".to_string());
+    let state = Arc::new(serve::prepare(config).await.unwrap());
     let (public, private) = serve::bind(&state).await.unwrap();
     let public_address = public.local_addr().unwrap();
     let private_address = private.local_addr().unwrap();
@@ -725,8 +729,24 @@ async fn the_public_listener_serves_liveness_and_nothing_else() {
     assert_eq!(status, 404, "the public listener must not serve /readyz");
     assert!(!body.contains("access_set"));
 
-    // Private: the whole document.
+    // Private, without the bearer: the verdict and nothing else. The private
+    // listener is a network boundary, not an authentication boundary, so posture
+    // and correlation handles are not served to whoever can reach the port.
     let (status, body) = get(&format!("http://{private_address}/readyz")).await;
+    assert_eq!(status, 200, "{body}");
+    let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(verdict["ready"], true);
+    assert!(
+        verdict.get("access_set").is_none(),
+        "the unauthenticated verdict carried posture: {body}"
+    );
+
+    // Private, with the bearer: the whole document.
+    let (status, body) = get_with_bearer(
+        &format!("http://{private_address}/readyz"),
+        "listeners-operator-bearer",
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     let document: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(document["access_set"], "enforce");
@@ -741,7 +761,7 @@ async fn the_public_listener_serves_liveness_and_nothing_else() {
     );
 
     let _ = stop.send(());
-    served.await.unwrap();
+    served.await.unwrap().expect("serving ends cleanly");
 
     // And the sockets are closed once it has stopped.
     assert!(
@@ -765,6 +785,7 @@ async fn readyz_answers_503_when_the_relay_is_not_ready() {
     let blobs = tempfile::tempdir().unwrap();
     let mut config = config_for(&scratch, blobs.path());
     config.write_mode = wealdrelay::config::WriteMode::ReadOnly;
+    config.operator_token = Some("notready-operator-bearer".to_string());
     let state = Arc::new(serve::prepare(config).await.unwrap());
     let (public, private) = serve::bind(&state).await.unwrap();
     let private_address = private.local_addr().unwrap();
@@ -773,14 +794,23 @@ async fn readyz_answers_503_when_the_relay_is_not_ready() {
         let _ = wait.await;
     }));
 
+    // The status code answers everybody; the reason is for the bearer.
     let (status, body) = get(&format!("http://{private_address}/readyz")).await;
+    assert_eq!(status, 503);
+    let verdict: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(verdict["ready"], false);
+    let (status, body) = get_with_bearer(
+        &format!("http://{private_address}/readyz"),
+        "notready-operator-bearer",
+    )
+    .await;
     assert_eq!(status, 503);
     let document: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(document["ready"], false);
     assert_eq!(document["write_mode"], "read_only");
 
     let _ = stop.send(());
-    served.await.unwrap();
+    served.await.unwrap().expect("serving ends cleanly");
     scratch.drop_database().await;
 }
 
@@ -1111,7 +1141,11 @@ async fn a_pool_the_caller_already_holds_can_be_wrapped_and_used() {
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
             "0010_envelope_budget".to_string(),
-            "0011_bootstrap_handoff".to_string()
+            "0011_bootstrap_handoff".to_string(),
+            "0012_invite_attempt_by_source".to_string(),
+            "0013_invite_bundle_issued".to_string(),
+            "0014_ciphertext_storage_external".to_string(),
+            "0015_gc_restore_marker".to_string()
         ]
     );
     // The same pool, and not a copy of the configuration that opened another one.
@@ -1305,7 +1339,11 @@ async fn a_transaction_that_cannot_be_committed_is_reported_and_not_assumed() {
             "0008_envelope_read_path".to_string(),
             "0009_push".to_string(),
             "0010_envelope_budget".to_string(),
-            "0011_bootstrap_handoff".to_string()
+            "0011_bootstrap_handoff".to_string(),
+            "0012_invite_attempt_by_source".to_string(),
+            "0013_invite_bundle_issued".to_string(),
+            "0014_ciphertext_storage_external".to_string(),
+            "0015_gc_restore_marker".to_string()
         ]
     );
 
@@ -1382,9 +1420,9 @@ async fn a_relay_with_no_storage_still_answers_liveness_and_refuses_readiness() 
     // line has to say `none` rather than name a backend that is not there.
     let scratch = Scratch::new("nostore").await;
     let blobs = tempfile::tempdir().unwrap();
-    let prepared = serve::prepare(config_for(&scratch, blobs.path()))
-        .await
-        .unwrap();
+    let mut config = config_for(&scratch, blobs.path());
+    config.operator_token = Some("nostore-operator-bearer".to_string());
+    let prepared = serve::prepare(config).await.unwrap();
     let state = Arc::new(wealdrelay::health::RelayState::new(
         prepared.config.clone(),
         prepared.database.clone(),
@@ -1403,7 +1441,11 @@ async fn a_relay_with_no_storage_still_answers_liveness_and_refuses_readiness() 
         get(&format!("http://{public_address}/healthz")).await.0,
         200
     );
-    let (status, body) = get(&format!("http://{private_address}/readyz")).await;
+    let (status, body) = get_with_bearer(
+        &format!("http://{private_address}/readyz"),
+        "nostore-operator-bearer",
+    )
+    .await;
     assert_eq!(status, 503, "{body}");
     let document: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(document["ready"], false);
@@ -1416,7 +1458,8 @@ async fn a_relay_with_no_storage_still_answers_liveness_and_refuses_readiness() 
     let _ = stop.send(());
     served
         .await
-        .expect("serving ends when the shutdown future completes");
+        .expect("serving ends when the shutdown future completes")
+        .expect("serving ends cleanly");
     scratch.drop_database().await;
 }
 

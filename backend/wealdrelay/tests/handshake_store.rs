@@ -91,6 +91,52 @@ async fn the_order_is_dense_from_zero_and_replays_in_the_order_it_was_written() 
     scratch.drop_database().await;
 }
 
+/// The paged read is what the subscribe path calls, so what has to hold is that
+/// walking it page by page delivers the same messages, in the same order, as the
+/// unbounded read: a replay that came back short is a member that cannot decrypt
+/// anything published since. Before the page existed the whole log was one query and
+/// one allocation, which is the residency this bounds.
+#[tokio::test]
+async fn a_paged_replay_reassembles_the_whole_log_in_order() {
+    let (scratch, _blobs, state) = prepared("handshake_paged").await;
+    let pool = pool_of(&state);
+    let group = make_group(&state, 0x18).await;
+
+    for index in 0u8..7 {
+        store::append(pool, &message(&group, &[b'c', index]))
+            .await
+            .expect("append");
+    }
+
+    // Two rows a page against seven rows, so the walk crosses four pages and the
+    // last one is short: the exact shape the subscribe loop stops on.
+    let mut walked = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let page = store::page(pool, &group, cursor, Some(2))
+            .await
+            .expect("page");
+        assert!(page.len() <= 2, "the limit is a limit");
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().expect("a row").seq + 1;
+        walked.extend(page.into_iter().map(|stored| (stored.seq, stored.message)));
+    }
+
+    let whole = store::since(pool, &group, 0).await.expect("replay");
+    assert_eq!(
+        walked,
+        whole
+            .into_iter()
+            .map(|stored| (stored.seq, stored.message))
+            .collect::<Vec<_>>(),
+        "paging changes residency, not what a subscriber receives"
+    );
+
+    scratch.drop_database().await;
+}
+
 #[tokio::test]
 async fn a_resend_takes_the_number_it_already_had() {
     let (scratch, _blobs, state) = prepared("handshake_resend").await;

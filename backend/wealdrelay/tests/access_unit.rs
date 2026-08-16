@@ -21,8 +21,8 @@ use wealdrelay::config::{keys, Config, Values};
 use wealdrelay::frame::{ErrorCode, Frame};
 use wealdrelay::health::RelayState;
 use wealdrelay::hub::Hub;
-use wealdrelay::session::{Session, Work};
-use wealdrelay::ws::{outbound_channel, Outbound};
+use wealdrelay::session::{Session, Work, SEND_QUEUE_BOUND};
+use wealdrelay::ws::{outbound_channel, try_queue, Outbound, Queued};
 
 fn config() -> Config {
     Config::resolve(&Values::from_pairs([
@@ -169,4 +169,51 @@ async fn a_principal_is_filed_once_per_connection_and_evicting_it_closes_every_s
     // the caller asked for is that it is not connected.
     assert_eq!(hub.evict(&entry).await, 0);
     assert_eq!(hub.connections_for(&[0x5b; 32]).await, 0);
+}
+
+/// WEALD-294. Eviction must not be held up by a victim that stopped reading.
+///
+/// `OutboundSender::close` used to await a slot on a 256-frame channel that only
+/// the writer task drains, and the writer drains it by awaiting the socket. A
+/// revoked device that simply stops reading therefore parked `evict` at itself
+/// forever, so every later device in the same rotation stayed connected and the
+/// admin's own reader loop hung. The bound below is what fails when it returns.
+#[tokio::test]
+async fn evicting_a_peer_that_stopped_reading_still_evicts_everybody_behind_it() {
+    let hub = Hub::new();
+    let entry = vec![0x5a; 32];
+
+    // The wedged victim: its queue is filled to the bound and nothing drains it,
+    // which is what a peer with a closed TCP window looks like from in here.
+    let wedged = hub.connect();
+    let (wedged_sender, wedged_receiver) = outbound_channel();
+    for index in 0..SEND_QUEUE_BOUND {
+        assert_eq!(
+            try_queue(
+                &wedged_sender,
+                Frame::SubAck {
+                    group: [0x11; 32].to_vec(),
+                    head_seq: index as u64,
+                }
+            ),
+            Queued::Sent
+        );
+    }
+    hub.identify(&entry, wedged, wedged_sender).await;
+
+    // The victim behind it in the same rotation, reading normally.
+    let healthy = hub.connect();
+    let (healthy_sender, mut healthy_receiver) = outbound_channel();
+    hub.identify(&entry, healthy, healthy_sender).await;
+
+    let evicted = tokio::time::timeout(std::time::Duration::from_secs(5), hub.evict(&entry))
+        .await
+        .expect("eviction parked on a peer that stopped reading");
+    assert_eq!(evicted, 2, "both are evicted");
+    assert!(
+        matches!(healthy_receiver.try_recv(), Ok(Outbound::Close)),
+        "a device behind a wedged one in the same rotation was never told to go"
+    );
+    assert_eq!(hub.connections_for(&entry).await, 0);
+    drop(wedged_receiver);
 }

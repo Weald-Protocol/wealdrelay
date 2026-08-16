@@ -29,7 +29,6 @@ secret to rotate, and no admin account to create.
 | `relay` | The relay. One process, no sidecars. | No. |
 | `postgres` | Envelope log, group heads, key packages, quotas. | No. |
 | `minio` | Encrypted media blobs, S3 API. | Yes: point `WEALD_RELAY_STORAGE_URL` at a directory instead. |
-| `redis` | Fanout between relay processes, presence. | Yes for a single-process install: delete the service and unset `WEALD_RELAY_REDIS_URL`. |
 | `caddy` | Automatic TLS. | Only if something else already terminates TLS for you. |
 
 Only Caddy publishes a port. The relay is reachable from the internet through

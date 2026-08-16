@@ -725,6 +725,53 @@ fn at_the_bound_the_oldest_wake_goes() {
 }
 
 #[test]
+fn a_flood_of_messages_never_sheds_a_waiting_ring() {
+    // A message wake is regenerated the moment the device reads its log. A ring is
+    // not: shed it and the call rings out on a callee whose phone stayed silent.
+    let mut queue = Queue::new(2);
+    assert_eq!(
+        queue.admit(handle(20), Category::Call, NOW, 0),
+        Admit::Queued
+    );
+    assert_eq!(
+        queue.admit(handle(21), Category::Message, NOW, 0),
+        Admit::Queued
+    );
+    for seed in 22..40 {
+        assert_eq!(
+            queue.admit(handle(seed), Category::Message, NOW, 0),
+            Admit::Dropped
+        );
+    }
+    let due = queue.take_due(NOW);
+    assert!(
+        due.contains(&(handle(20), Category::Call)),
+        "the ring survived the flood"
+    );
+}
+
+#[test]
+fn when_every_waiting_entry_is_a_ring_an_ordinary_wake_yields() {
+    let mut queue = Queue::new(2);
+    assert_eq!(
+        queue.admit(handle(40), Category::Call, NOW, 0),
+        Admit::Queued
+    );
+    assert_eq!(
+        queue.admit(handle(41), Category::Call, NOW, 0),
+        Admit::Queued
+    );
+    assert_eq!(
+        queue.admit(handle(42), Category::Message, NOW, 0),
+        Admit::Dropped
+    );
+    assert_eq!(
+        queue.take_due(NOW),
+        vec![(handle(40), Category::Call), (handle(41), Category::Call)]
+    );
+}
+
+#[test]
 fn a_queue_cannot_be_built_with_no_room() {
     // `Config` refuses a zero bound on the way in, and clamping here means this type
     // has no state in which `admit` would have to answer for a capacity nobody chose.
@@ -824,12 +871,34 @@ fn the_registration_url_is_derived_from_the_wake_url_when_it_is_not_set() {
         (keys::PUSH_URL, "https://ringer.example/v1/wake"),
     ]);
     let settings = Settings::from_config(&config);
+    // The wake path is substituted, not appended. `PUSH_URL` is a whole `/v1/wake`
+    // route (env-registry.json: "https url of a ringer's POST /v1/wake route"), so
+    // appending stated `/v1/wake/v1/handles`, which is a 404 on the reference ringer
+    // and therefore a push deployment where no device ever registers.
     assert_eq!(
         settings.register_url,
         format!(
-            "https://ringer.example/v1/wake{}",
+            "https://ringer.example{}",
             wealdrelay::push::RINGER_REGISTER_PATH
         )
+    );
+    // The real production string, spelled out, because this is the one that was wrong.
+    let live = config_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://api.weald.team/v1/wake"),
+    ]);
+    assert_eq!(
+        Settings::from_config(&live).register_url,
+        "https://api.weald.team/v1/handles"
+    );
+    // A trailing slash after the wake path is trimmed too.
+    let slashed = config_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://api.weald.team/v1/wake/"),
+    ]);
+    assert_eq!(
+        Settings::from_config(&slashed).register_url,
+        "https://api.weald.team/v1/handles"
     );
     // A trailing slash does not produce a doubled one.
     let trailing = config_with(&[(keys::PUSH, "on"), (keys::PUSH_URL, "https://r.example/")]);

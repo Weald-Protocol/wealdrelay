@@ -20,13 +20,16 @@
 //!
 //! ## What five wrong codes do, and what they do not do
 //!
-//! Five failures from one `(token, source, device)` tuple cool that tuple down for
-//! fifteen minutes. They do not burn the invite, they do not touch capacity, and
-//! they do not affect the other seats behind a shared invite: one person
-//! fat-fingering a code cannot lock out the nine colleagues invited alongside them.
-//! The issuer's connected client is told the attempt volume and is never told a
-//! source address, because the relay hashes the source with the workspace salt and
-//! has nothing else to tell.
+//! Five failures from one `(token, source)` pair cool that pair down for fifteen
+//! minutes, and twenty-five failures against one token from any mix of sources
+//! cool the whole token down. The key deliberately carries no device: the device
+//! value is an arbitrary byte string the joiner supplies before authenticating, so
+//! a key that included it was a key the guesser chose, and the five-guess bound
+//! against the 60-bit code was unbounded from a single address. The failures do
+//! not burn the invite, they do not touch capacity, and colleagues joining from
+//! their own addresses are untouched. The issuer's connected client is told the
+//! attempt volume and is never told a source address, because the relay hashes the
+//! source with the workspace salt and has nothing else to tell.
 
 use sqlx::{PgPool, Row};
 
@@ -89,7 +92,10 @@ pub async fn reserve(
     source: &[u8],
     now_ms: i64,
 ) -> Result<Verdict, StoreError> {
-    if cooled_down(pool, token, source, device_hash, now_ms).await? {
+    // Before the record fetch and long before `code::verify`: a cooled-down pair
+    // or token never reaches Argon2id, so the guess loop cannot double as a
+    // memory and CPU exhaustion lever.
+    if cooled_down(pool, token, source, now_ms).await? {
         return Ok(Verdict::Unavailable);
     }
     let Some(record) = super::store::fetch(pool, token).await? else {
@@ -99,12 +105,38 @@ pub async fn reserve(
         return Ok(Verdict::Unavailable);
     }
 
+    // Charge the attempt slot before the code is parsed or hashed, not after it
+    // fails. The read above is a fast path and nothing more: two connections from
+    // one source can both pass it, and a check-then-charge budget bounds nothing
+    // against a burst that arrives inside the width of one Argon2id call. The
+    // charge below is the linearization point, for the same reason the seat
+    // decrement is: one statement takes the slot, so N simultaneous wrong codes
+    // from one source take N distinct slots and only the configured number of them
+    // reach the verifier. WEALD-336.
+    if !claim_attempt(pool, token, source, now_ms).await? {
+        return Ok(Verdict::Unavailable);
+    }
+
     let Ok(parsed) = Code::parse(typed_code) else {
-        record_failure(pool, token, source, device_hash, now_ms).await?;
         return Ok(Verdict::Unavailable);
     };
     if !code::verify(parsed, token, &record.invite.code_hash) {
-        record_failure(pool, token, source, device_hash, now_ms).await?;
+        return Ok(Verdict::Unavailable);
+    }
+    // The code was right, so the slot was not a guess: give it back. Without the
+    // refund the budget counts honest joins, and five colleagues behind one office
+    // address would cool down the pair that just admitted them. A refund is safe
+    // to hand out here and nowhere else, because reaching this line requires the
+    // 60-bit code.
+    refund_attempt(pool, token, source).await?;
+
+    // A device whose grant was voided (revoked, superseded, expired) is refused
+    // before it can spend a seat. Voiding is terminal, so redeeming again would take
+    // a use of the invite and end with a credential that admits nothing.
+    if crate::access::store::grant_is_voided(pool, &record.workspace_id, device_hash)
+        .await
+        .map_err(|error| StoreError::Database(error.to_string()))?
+    {
         return Ok(Verdict::Unavailable);
     }
 
@@ -119,11 +151,19 @@ pub async fn reserve(
     let expires_at_ms = (now_ms + RESERVATION_SECONDS * 1000)
         .min(i64::try_from(record.invite.expires).unwrap_or(i64::MAX));
 
-    // One statement, so it is one transaction and there is no window between taking
-    // the seat and recording who holds it. The `where remaining > 0` inside the
-    // update is the linearization point: a check-then-decrement would let two devices
-    // both believe they had won the last seat, and a second statement to insert the
-    // reservation would let a crash spend a seat nobody holds.
+    // One statement, so there is no window between taking the seat and recording who
+    // holds it. The `where remaining > 0` inside the update is the linearization
+    // point: a check-then-decrement would let two devices both believe they had won
+    // the last seat, and a second statement to insert the reservation would let a
+    // crash spend a seat nobody holds.
+    //
+    // That argument stopped one statement short, so the statement runs inside an
+    // explicit transaction with the grant below rather than autocommitting alone
+    // (WEALD-342). The provisional grant is what lets the joiner open a socket at
+    // all, so a seat taken without one is precisely the seat nobody holds that the
+    // paragraph above refuses to allow. Both writes are this database, so the atom
+    // costs nothing but the transaction.
+    let mut tx = pool.begin().await.map_err(db)?;
     let taken = sqlx::query(
         "with taken as ( \
              update relay_invite set remaining = remaining - 1 \
@@ -139,23 +179,59 @@ pub async fn reserve(
     .bind(device_hash)
     .bind(expires_at_ms)
     .bind(now_ms)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db)?;
     if taken.is_none() {
+        // Nothing was written, so the rollback gives nothing back. Explicit anyway:
+        // an early return that left the transaction to its `Drop` would be one more
+        // place for a later edit to leak a held connection.
+        tx.rollback().await.map_err(db)?;
         return Ok(Verdict::Unavailable);
     }
 
     // The reservation is a connection credential from this moment: the joiner has to
     // be able to open a socket to perform its external commit, and no access set
     // names it yet.
-    crate::access::store::grant(pool, &record.workspace_id, device_hash, expires_at_ms)
-        .await
-        .map_err(|error| StoreError::Database(error.to_string()))?;
+    // A device whose grant was already voided (revoked, superseded, expired) does not
+    // get a live one back by redeeming again: `grant` refuses to clear a void, and a
+    // reservation whose credential is dead would strand the joiner on a socket it
+    // cannot open.
+    //
+    // Inside the transaction that took the seat, so the two outcomes a caller can
+    // see are the two honest ones: a seat spent and a credential to use it, or
+    // neither. A refused grant (the device was voided between the read above and
+    // here) and a database error both roll the seat back, so a client that retries
+    // is not charged for the attempt that could never have worked, and the invite's
+    // `uses` cannot be drained by a device that is refused every time.
+    let granted = match crate::access::store::grant(
+        &mut *tx,
+        &record.workspace_id,
+        device_hash,
+        expires_at_ms,
+    )
+    .await
+    {
+        Ok(granted) => granted,
+        Err(error) => {
+            tx.rollback().await.map_err(db)?;
+            return Err(StoreError::Database(error.to_string()));
+        }
+    };
+    if !granted {
+        tx.rollback().await.map_err(db)?;
+        return Ok(Verdict::Unavailable);
+    }
+    tx.commit().await.map_err(db)?;
     Ok(Verdict::Reserved { expires_at_ms })
 }
 
 /// Extend a parked join, once, to the invite's own expiry.
+///
+/// Only while the invite is live. Without that filter this was the lever that made a
+/// revoked-but-in-flight join worth waiting for: it widens a ten minute reservation
+/// to the invite's whole expiry, so a parked joiner could sit for days and then
+/// commit. Revocation now ends the extension as well as the commit. WEALD-345.
 ///
 /// The relay verifies nothing about the client's claim that local setup finished and
 /// does not need to: the extension consumes the seat it already holds, is bound to
@@ -163,18 +239,51 @@ pub async fn reserve(
 /// parked-join path expires the seat it is waiting on, and a joiner who did
 /// everything asked of them finds a burnt invite and a recovery phrase for a
 /// workspace they never entered.
+/// Both halves move or neither does. The seat and the credential are two rows and
+/// extending only the first is the bug this function was written to prevent
+/// happening in a different place: `store::reserve` gave the device a provisional
+/// grant expiring with the ten minute reservation, and widening the reservation
+/// alone left the joiner holding a seat it could no longer authenticate to use,
+/// because admission reads the grant's own expiry (`access::store::admits`). The
+/// joiner did everything asked of them and was refused at AUTH with a live seat.
+/// WEALD-475.
 pub async fn extend(pool: &PgPool, token: &[u8], nonce: &[u8]) -> Result<bool, StoreError> {
+    let mut tx = pool.begin().await.map_err(db)?;
     let done = sqlx::query(
         "update relay_invite_reservation r set expires_at = i.expires_at, extended = true \
          from relay_invite i where i.token = r.token and r.token = $1 and r.join_nonce = $2 \
-           and r.extended = false and r.consumed_at is null and r.released_at is null",
+           and r.extended = false and r.consumed_at is null and r.released_at is null \
+           and i.state = 'live'",
     )
     .bind(token)
     .bind(nonce)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
-    Ok(done.rows_affected() > 0)
+    if done.rows_affected() == 0 {
+        tx.rollback().await.map_err(db)?;
+        return Ok(false);
+    }
+    // The credential, to the same instant and never past it: `i.expires_at` is the
+    // invite's own expiry, which is the ceiling the doc comment above promises. The
+    // void guard is the same one `access::store::grant` carries and for the same
+    // reason: an extension must not be the lever that undoes a revocation, and a
+    // device voided between the reservation and here stays voided with its seat
+    // widened and its credential dead, which is the refusal we want.
+    sqlx::query(
+        "update relay_provisional_grant g set expires_at = i.expires_at \
+         from relay_invite i, relay_invite_reservation r \
+         where r.token = $1 and r.join_nonce = $2 and i.token = r.token \
+           and g.workspace_id = i.workspace_id and g.device_hash = r.device_hash \
+           and g.voided_at is null",
+    )
+    .bind(token)
+    .bind(nonce)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(true)
 }
 
 /// Record one accepted scope commit, and consume the seat on the last one.
@@ -196,9 +305,12 @@ pub async fn scope_commit(
                 (extract(epoch from r.expires_at) * 1000)::double precision as expires_ms, \
                 (select count(*) from relay_invite_scope s where s.token = r.token) as scopes, \
                 i.workspace_id, \
+                exists (select 1 from relay_invite_tombstone t where t.token = r.token) \
+                    as tombstoned, \
                 (extract(epoch from i.expires_at) * 1000)::double precision as invite_expires_ms \
          from relay_invite_reservation r join relay_invite i on i.token = r.token \
-         where r.token = $1 and r.join_nonce = $2 and r.released_at is null",
+         where r.token = $1 and r.join_nonce = $2 and r.released_at is null \
+           and i.state = 'live'",
     )
     .bind(token)
     .bind(nonce)
@@ -211,6 +323,25 @@ pub async fn scope_commit(
     if row.get::<Vec<u8>, _>("device_hash") != device_hash {
         return Ok(None);
     }
+
+    // Revocation has to reach a join that is already in flight. `terminate` leaves
+    // the reservation in place and marks the invite, so the state filter above is
+    // the first half; the tombstone is the second, because it is the record that
+    // survives and it is what the grant rules read. Both are checked on every
+    // commit rather than once at reserve time, since the admin's revocation lands
+    // between two frames of the same join.
+    if row.get::<bool, _>("tombstoned") {
+        return Ok(None);
+    }
+
+    // The invite's own expiry, enforced rather than merely selected. Without this a
+    // reservation taken a minute before expiry could be committed indefinitely, and
+    // the grant it ends in would be dated from an invite that is long dead.
+    let invite_expires_ms: f64 = row.get("invite_expires_ms");
+    if now_ms as f64 >= invite_expires_ms {
+        return Ok(None);
+    }
+
     let consumed: bool = row.get("consumed");
     let expires_ms: f64 = row.get("expires_ms");
     if !consumed && now_ms as f64 >= expires_ms {
@@ -292,6 +423,10 @@ async fn consume(
     .execute(pool)
     .await
     .map_err(db)?;
+    // A void survives this. If revocation reached the grant while the join was in
+    // flight, the seat is still spent (the reservation was real and the group work
+    // was done) but the credential stays dead: the last frame of a join must not be
+    // able to undo the admin's decision.
     crate::access::store::grant(pool, &workspace_id, device_hash, invite_expires_ms)
         .await
         .map_err(|error| StoreError::Database(error.to_string()))?;
@@ -361,50 +496,146 @@ async fn live_reservation(
     Ok(row.map(|row| row.get::<f64, _>("expires_ms") as i64))
 }
 
-/// Whether this tuple is inside its fifteen-minute cooldown.
+/// Whether this pair, or the whole token, is inside its fifteen-minute cooldown.
+///
+/// Two bounds in one read. The pair bound is the per-address one; the token-wide
+/// sum is what holds against a guesser spread over many addresses, because sources
+/// are cheap in aggregate even though no single one is attacker-chosen. The sum
+/// counts only rows still inside their window: `sweep_attempts` removes the rest,
+/// so a token that has been quiet for a cooldown interval starts from zero.
 async fn cooled_down(
     pool: &PgPool,
     token: &[u8],
     source: &[u8],
-    device_hash: &[u8],
     now_ms: i64,
 ) -> Result<bool, StoreError> {
     let row = sqlx::query(
         "select 1 as present from relay_invite_attempt \
-         where token = $1 and source_hash = $2 and device_hash = $3 \
-           and cooldown_until > to_timestamp($4::double precision / 1000)",
+         where token = $1 and source_hash = $2 \
+           and cooldown_until > to_timestamp($3::double precision / 1000) \
+         union all \
+         select 1 as present from relay_invite_attempt \
+         where token = $1 \
+           and (window_started > to_timestamp($3::double precision / 1000) - make_interval(secs => $5::double precision) \
+                or cooldown_until > to_timestamp($3::double precision / 1000)) \
+         group by token having coalesce(sum(failures), 0) >= $4 \
+         limit 1",
     )
     .bind(token)
     .bind(source)
-    .bind(device_hash)
     .bind(now_ms)
+    .bind(code::MAX_TOKEN_FAILURES)
+    .bind(code::COOLDOWN_SECONDS as f64)
     .fetch_optional(pool)
     .await
     .map_err(db)?;
     Ok(row.is_some())
 }
 
-/// Count one wrong code against one tuple, and cool that tuple down at five.
-async fn record_failure(
+/// Take one attempt slot against one pair before the code is verified, and say
+/// whether the caller may proceed to Argon2id.
+///
+/// Charging first is what makes the budget real. The `on conflict do update` is one
+/// statement, so it takes the row lock: concurrent attempts against one pair
+/// serialize on it and each one sees its own incremented count, where a preceding
+/// read would have let all of them see the same count below the ceiling. The update
+/// is skipped when the pair is already cooled down, which does two things at once:
+/// it refuses the attempt (no row comes back), and it stops a cooled guesser from
+/// inflating the token-wide sum, which would otherwise let one address cool a whole
+/// invite down for everybody.
+///
+/// The token-wide sum is read in the same statement and bounds the spread-out
+/// guesser. It sums the other sources and adds this charge, because the row this
+/// statement just wrote is not in the snapshot the subquery reads. Simultaneous
+/// first attempts from many distinct sources can still each be admitted against a
+/// sum that is a moment stale; what holds unconditionally is the per-pair ceiling,
+/// and a source address is not free to mint.
+///
+/// The sweep runs first, in the same call, so the table is bounded by writes to it
+/// rather than by a timer somebody has to remember: a row whose cooldown has
+/// passed and whose window is stale says nothing the next decision needs, and rows
+/// per token are then at most the distinct recent sources, each of which paid for
+/// its row with a real connection.
+async fn claim_attempt(
     pool: &PgPool,
     token: &[u8],
     source: &[u8],
-    device_hash: &[u8],
     now_ms: i64,
-) -> Result<(), StoreError> {
-    sqlx::query(
-        "insert into relay_invite_attempt (token, source_hash, device_hash, failures) \
-         values ($1, $2, $3, 1) \
-         on conflict (token, source_hash, device_hash) do update \
-         set failures = relay_invite_attempt.failures + 1, \
-             cooldown_until = case when relay_invite_attempt.failures + 1 >= $4 \
-                 then to_timestamp($5::double precision / 1000) + make_interval(secs => $6::double precision) \
-                 else relay_invite_attempt.cooldown_until end",
+) -> Result<bool, StoreError> {
+    sweep_attempts(pool, token, now_ms).await?;
+    let row = sqlx::query(
+        "with charged as ( \
+             insert into relay_invite_attempt (token, source_hash, failures, window_started) \
+             values ($1, $2, 1, to_timestamp($4::double precision / 1000)) \
+             on conflict (token, source_hash) do update \
+             set failures = relay_invite_attempt.failures + 1, \
+                 cooldown_until = case when relay_invite_attempt.failures + 1 >= $3 \
+                     then to_timestamp($4::double precision / 1000) + make_interval(secs => $5::double precision) \
+                     else relay_invite_attempt.cooldown_until end \
+             where relay_invite_attempt.cooldown_until is null \
+                or relay_invite_attempt.cooldown_until <= to_timestamp($4::double precision / 1000) \
+             returning failures) \
+         select charged.failures as failures, \
+                (charged.failures + (select coalesce(sum(a.failures), 0) from relay_invite_attempt a \
+                  where a.token = $1 and a.source_hash <> $2 \
+                    and (a.window_started > to_timestamp($4::double precision / 1000) - make_interval(secs => $5::double precision) \
+                         or a.cooldown_until > to_timestamp($4::double precision / 1000))))::bigint as total \
+           from charged",
     )
     .bind(token)
     .bind(source)
-    .bind(device_hash)
     .bind(code::MAX_FAILURES)
+    .bind(now_ms)
+    .bind(code::COOLDOWN_SECONDS as f64)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    // No row means the pair was already cooled down and nothing was charged.
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    // The slot that reaches the ceiling is spent, not refused: five wrong codes are
+    // five verifications, and the sixth is what the cooldown answers. The sum is
+    // read after the charge, so the same rule applies to the token-wide ceiling.
+    Ok(row.get::<i32, _>("failures") <= code::MAX_FAILURES
+        && row.get::<i64, _>("total") <= code::MAX_TOKEN_FAILURES)
+}
+
+/// Give back the slot a correct code took.
+///
+/// Only reachable past `code::verify`, so it cannot be used to reset a budget
+/// without the code the budget protects. Clearing the cooldown when the count falls
+/// back under the ceiling matters for the pair whose last slot was the one that
+/// succeeded: the joiner who typed it correctly must not leave the office address
+/// cooled down behind them.
+async fn refund_attempt(pool: &PgPool, token: &[u8], source: &[u8]) -> Result<(), StoreError> {
+    sqlx::query(
+        "update relay_invite_attempt \
+         set failures = greatest(failures - 1, 0), \
+             cooldown_until = case when greatest(failures - 1, 0) >= $3 \
+                 then cooldown_until else null end \
+         where token = $1 and source_hash = $2",
+    )
+    .bind(token)
+    .bind(source)
+    .bind(code::MAX_FAILURES)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Remove attempt rows that no longer inform any decision: the cooldown, if one
+/// was ever set, has passed, and the window is older than a cooldown interval.
+/// Both the per-pair check and the token-wide sum then read only live rows.
+async fn sweep_attempts(pool: &PgPool, token: &[u8], now_ms: i64) -> Result<(), StoreError> {
+    sqlx::query(
+        "delete from relay_invite_attempt \
+         where token = $1 \
+           and (cooldown_until is null or cooldown_until <= to_timestamp($2::double precision / 1000)) \
+           and window_started <= to_timestamp($2::double precision / 1000) - make_interval(secs => $3::double precision)",
+    )
+    .bind(token)
     .bind(now_ms)
     .bind(code::COOLDOWN_SECONDS as f64)
     .execute(pool)

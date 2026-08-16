@@ -58,6 +58,16 @@ const SYNC_PUSH_LIMIT: usize = crate::session::SEND_QUEUE_BOUND - 1;
 /// was serving.
 const SYNC_PUSH_BYTES: usize = crate::ws::SEND_QUEUE_BYTE_BUDGET - crate::frame::MAX_FRAME_BYTES;
 
+/// Rows of handshake log read per query during a subscription replay.
+///
+/// Not a truncation and not a batch the client can see: the replay still sends every
+/// message in the group's history, this only says how much of it is in memory at
+/// once. Sized against `SEND_QUEUE_BOUND` rather than a round number, because a page
+/// that could not fit in the outbound queue would spend the whole page awaiting the
+/// writer and hold the rows resident while it waited, which is the residency this
+/// exists to bound.
+const HANDSHAKE_REPLAY_PAGE: u32 = crate::session::SEND_QUEUE_BOUND as u32;
+
 /// How many of these frames fit in one response's byte allowance.
 ///
 /// At least one, always: a single envelope larger than the allowance still has to be
@@ -130,15 +140,17 @@ fn reopen_omitted(
     // in memory. One pass per span against a hash lookup says the same thing.
     let omitted: std::collections::HashSet<negentropy::Id> = omitted.iter().copied().collect();
     for (lower, upper, _) in incoming.spans() {
-        if items
-            .iter()
-            .any(|item| item.seq >= lower && item.seq < upper && omitted.contains(&item.id))
-        {
-            let mine: Vec<_> = items
-                .iter()
-                .copied()
-                .filter(|item| item.seq >= lower && item.seq < upper)
-                .collect();
+        // Binary search rather than a filter, and this is the second half of the
+        // same complexity: dropping `omitted` from the inner loop still left every
+        // span scanning the whole group twice, so 1024 spans against a 100k window
+        // was 100M comparisons on the executor thread for one frame. `log::items`
+        // returns the window ascending by `seq` precisely so slices like this are
+        // available, and the spans of one message partition the range, so the total
+        // work here is now one pass over the window plus a search per span.
+        let start = items.partition_point(|item| item.seq < lower);
+        let end = items.partition_point(|item| item.seq < upper);
+        let mine = &items[start..end];
+        if mine.iter().any(|item| omitted.contains(&item.id)) {
             // Every arm of `negentropy::respond` emits a range ending at its
             // span's upper bound, so this always matches exactly once. Written
             // as a filtered loop rather than as `find` and an `if let` for that
@@ -150,7 +162,7 @@ fn reopen_omitted(
             for range in reply.ranges.iter_mut().filter(|range| range.upper == upper) {
                 *range = Range::new(
                     upper,
-                    Mode::Fingerprint(crate::negentropy::fingerprint(&mine)),
+                    Mode::Fingerprint(crate::negentropy::fingerprint(mine)),
                 );
             }
         }
@@ -231,7 +243,15 @@ pub async fn reconcile(
         }
         .queued_bytes()
             + bytes.len()
-    });
+    })
+    // The slot count is re-read here and not reused from before the await. The
+    // first cut was measured against the queue as it stood then, and this
+    // connection is already in the hub, so another connection's accepted envelope
+    // can be fanned out into this sender while the read is in flight. A batch
+    // still sized to the earlier free count then fills the queue and `queue_all`
+    // reads the last `Full` as a client that has stopped reading, closing a
+    // healthy socket. The byte side is re-read for the same reason.
+    .min(push_frame_allowance(sender));
     omitted.extend(envelopes.split_off(sendable).into_iter().map(|(id, _)| id));
     reopen_omitted(&mut response.reply, &incoming, &items, &omitted);
 
@@ -255,7 +275,17 @@ pub async fn subscribe(
     from_seq: u64,
     protocol_version: u16,
 ) -> bool {
-    let head = crate::ws::head_seq(state, &group).await;
+    // Refused rather than acknowledged with a head this relay did not read. The
+    // subscription is worth less than the lie: an ack naming a head the client has
+    // already passed tells it there is nothing to fetch, and it believes that
+    // permanently. `retry/backpressure` is the same answer the backfill below
+    // gives, and a client that retries gets a real head.
+    let Some(head) = crate::ws::head_seq(state, &group).await else {
+        return queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        );
+    };
 
     if !queue_all(
         sender,
@@ -313,29 +343,61 @@ pub async fn subscribe(
     // reconciliation for MLS state and a member missing one commit cannot decrypt
     // anything published after it. So the replay waits for the writer to make room and
     // the queue bound still holds across it.
-    match crate::handshake::store::since(database.pool(), &group, 0).await {
-        Ok(messages) => {
-            if !crate::ws::queue_all_awaiting(
-                sender,
-                messages
-                    .into_iter()
-                    .map(|stored| Frame::Handshake {
-                        group: group.clone(),
-                        seq: stored.seq,
-                        message: stored.message,
-                    })
-                    .collect(),
-            )
-            .await
-            {
-                return false;
+    //
+    // Read a page at a time, not the whole log. Every message still goes out, in the
+    // same order, so this changes nothing a client sees; what it changes is peak
+    // memory, because a page drains to the socket before the next one is read.
+    // Reading it whole put the group's entire commit history in the heap twice, once
+    // as rows and once as frames, at up to `MAX_FRAME_BYTES` each, for as long as
+    // the slowest member's socket took to drain it.
+    let mut cursor = 0u64;
+    loop {
+        let messages = match crate::handshake::store::page(
+            database.pool(),
+            &group,
+            cursor,
+            Some(HANDSHAKE_REPLAY_PAGE),
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(_) => {
+                return queue_all(
+                    sender,
+                    vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+                )
             }
+        };
+        if messages.is_empty() {
+            break;
         }
-        Err(_) => {
-            return queue_all(
-                sender,
-                vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
-            )
+        let short = messages.len() < HANDSHAKE_REPLAY_PAGE as usize;
+        // Past the last row of this page, so the next read cannot repeat it. Taken
+        // before the frames are consumed because the sequence is the cursor.
+        cursor = messages
+            .last()
+            .map(|stored| stored.seq.saturating_add(1))
+            .unwrap_or(cursor);
+        if !crate::ws::queue_all_awaiting(
+            sender,
+            messages
+                .into_iter()
+                .map(|stored| Frame::Handshake {
+                    group: group.clone(),
+                    seq: stored.seq,
+                    message: stored.message,
+                })
+                .collect(),
+        )
+        .await
+        {
+            return false;
+        }
+        // A short page is the end of the log. Stopping here rather than on the next
+        // empty read saves one query per subscription, which is the common case: most
+        // groups have fewer commits than one page holds.
+        if short {
+            break;
         }
     }
 
@@ -343,19 +405,38 @@ pub async fn subscribe(
     // `SYNC_PUSH_BYTES` gives. Truncating here is safe in a way it is not for the
     // handshake replay above: the acknowledgement already sent carries a head beyond
     // what arrives, and the client reconciles for the rest.
-    match log::since(database.pool(), &group, from_seq).await {
+    //
+    // Both allowances are passed down to the read itself, so the rows that will be
+    // discarded are never materialised: peak residency for one `SUB` is the byte
+    // allowance plus the one envelope that crosses it, rather than `MAX_BACKFILL`
+    // rows of ciphertext. The filters below still run and still decide the batch;
+    // the read simply stops as soon as it cannot change their answer.
+    let frame_allowance = push_frame_allowance(sender);
+    let byte_allowance = push_byte_allowance(sender);
+    match log::since(
+        database.pool(),
+        &group,
+        from_seq,
+        frame_allowance,
+        byte_allowance,
+    )
+    .await
+    {
         Ok(envelopes) => {
-            let mut envelopes: Vec<Vec<u8>> = envelopes
-                .into_iter()
-                .take(push_frame_allowance(sender))
-                .collect();
+            let mut envelopes: Vec<Vec<u8>> = envelopes.into_iter().take(frame_allowance).collect();
+            // Both allowances are re-read against the queue as it stands now rather
+            // than as it stood before the read: this connection is subscribed, so a
+            // concurrent fanout can have taken slots and bytes in between, and a
+            // batch sized to the earlier counts would make `queue_all` close a
+            // socket whose peer is reading normally.
             let sendable = fits_in_budget(&envelopes, push_byte_allowance(sender), |bytes| {
                 Frame::Push {
                     envelope: Vec::new(),
                 }
                 .queued_bytes()
                     + bytes.len()
-            });
+            })
+            .min(push_frame_allowance(sender));
             envelopes.truncate(sendable);
             queue_all(
                 sender,

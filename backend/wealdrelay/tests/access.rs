@@ -80,6 +80,7 @@ fn sign(mut set: AccessSet, signer: &SigningKey) -> AccessSet {
 /// The prior state a published set becomes once it is accepted.
 fn prior_of(set: &AccessSet) -> Prior {
     Prior {
+        workspace: set.workspace.clone(),
         version: set.version,
         digest: set.digest().to_vec(),
         entries: set.entries.clone(),
@@ -530,6 +531,21 @@ fn a_publication_must_follow_the_accepted_head() {
     assert_eq!(
         judged(&candidate, &prior).expect_err("must refuse"),
         AccessError::PrevHashMismatch
+    );
+}
+
+/// A well formed, correctly chained, correctly signed successor that names
+/// another workspace is refused. Without this the same authorizer key in two
+/// workspaces on one relay could move a set from one chain into the other.
+#[test]
+fn a_correctly_chained_set_naming_another_workspace_is_refused() {
+    let prior = prior_of(&genesis());
+    let mut candidate = build(1, prior.digest.clone(), &[], &[&key(1)], &[&key(0x3f)]);
+    candidate.workspace = vec![0x88; 32];
+    let candidate = sign(candidate, &key(1));
+    assert_eq!(
+        judged(&candidate, &prior).expect_err("must refuse"),
+        AccessError::WorkspaceMismatch
     );
 }
 
@@ -1068,6 +1084,117 @@ fn a_probationary_authorizer_may_remove_only_what_its_rotation_pinned() {
         .expect_err("must refuse"),
         AccessError::ProbationExceeded
     );
+}
+
+/// WEALD-296. Dropping an authorizer from the authorizer list while keeping its
+/// entry leaves `removed` empty, so the entry-based probation licence is
+/// vacuously satisfied and the liveness guard is met by the probationary device
+/// itself. That path made a stolen recovery phrase a permanent takeover.
+#[test]
+fn a_probationary_authorizer_may_not_shed_an_authority_that_predates_it() {
+    let (_, prior, probations) = after_rotation();
+
+    // Every entry carried, so nothing is removed; only the authorizer list shrinks
+    // to the probationary device alone.
+    let mut self_only = build(2, prior.digest.clone(), &[], &[&key(7)], &[&key(0x4f)]);
+    self_only.entries = sorted(prior.entries.clone());
+    let self_only = sign(self_only, &key(7));
+    assert_eq!(
+        judge(&self_only, Some(&prior), SALT, &probations, false).expect_err("must refuse"),
+        AccessError::ProbationExceeded,
+        "a probationary signer that keeps every entry but names only itself as an \
+         authorizer would leave no key able to clear the probation, ever"
+    );
+
+    // And the honest shape, carrying both, still passes: the new rule refuses
+    // shedding, not publishing.
+    let carries = sign(
+        build(
+            2,
+            prior.digest.clone(),
+            &[],
+            &[&key(1), &key(7)],
+            &[&key(0x4f)],
+        ),
+        &key(7),
+    );
+    judge(&carries, Some(&prior), SALT, &probations, false).expect("carrying both is permitted");
+}
+
+/// WEALD-311. The two-hop escape, and the reason it worked: probation restricted
+/// removals, so a probationary device could freely *add* an authorizer, and the
+/// clearing loop treats any signer absent from `probations` as one that predates
+/// every rotation. R adds R2, R2 publishes carrying R's entry, R is cleared, and a
+/// stolen recovery phrase is again a permanent takeover. It needs no secret beyond
+/// the phrase probation exists to contain.
+///
+/// The fix refuses hop one, which is what makes the clearing loop's assumption
+/// true rather than patching the loop: no authorizer can come into existence while
+/// a probation is open.
+#[test]
+fn a_probationary_authorizer_may_not_add_a_second_authorizer() {
+    let (_, prior, probations) = after_rotation();
+
+    // Hop one. Nothing is removed and every prior authorizer is carried, so both
+    // existing probation rules are vacuously satisfied; only the authorizer list
+    // grows, by a key of the probationary device's own choosing.
+    let recruits = sign(
+        build(
+            2,
+            prior.digest.clone(),
+            &[],
+            &[&key(1), &key(7), &key(9)],
+            &[&key(0x4f)],
+        ),
+        &key(7),
+    );
+    assert_eq!(
+        judge(&recruits, Some(&prior), SALT, &probations, false).expect_err("must refuse"),
+        AccessError::ProbationExceeded,
+        "a probationary signer that can name a new authorizer can have that \
+         authorizer clear its probation on the next version"
+    );
+
+    // The rule is about authority, not about publishing. An ordinary member added
+    // by the same signer in the same shape is still permitted, because a member's
+    // entry can never clear anything.
+    let adds_member = sign(
+        build(
+            2,
+            prior.digest.clone(),
+            // `key(5)` is carried so this transition removes nothing at all: the
+            // point being made is about the addition, and the rotation pinned
+            // `key(5)`'s entry, so dropping it would be permitted and would make
+            // `removed` non-empty for a reason that has nothing to do with the rule
+            // under test.
+            &[&key(5), &key(0x11)],
+            &[&key(1), &key(7)],
+            &[&key(0x4f)],
+        ),
+        &key(7),
+    );
+    let (_, effects) = judge(&adds_member, Some(&prior), SALT, &probations, false)
+        .expect("adding a member is fine");
+    assert!(effects.removed.is_empty());
+    assert!(
+        effects.clears_probation.is_empty(),
+        "and it still does not clear its own probation"
+    );
+
+    // A non-probationary authorizer adding one is untouched by the rule: the
+    // restriction is on the probationary signer, not on the set.
+    let by_predecessor = sign(
+        build(
+            2,
+            prior.digest.clone(),
+            &[],
+            &[&key(1), &key(7), &key(9)],
+            &[&key(0x4f)],
+        ),
+        &key(1),
+    );
+    judge(&by_predecessor, Some(&prior), SALT, &probations, false)
+        .expect("an authorizer that predates the probation may still grow the set");
 }
 
 #[test]

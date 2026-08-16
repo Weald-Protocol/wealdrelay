@@ -160,6 +160,20 @@ impl Hub {
         });
     }
 
+    /// Whether one connection already holds a live entry for a group.
+    ///
+    /// Asked on the refusal path of a repeated `SUB`, where the difference between
+    /// "this frame created nothing" and "this connection was already subscribed"
+    /// decides whether the session's own record of the group may be dropped.
+    /// Dropping it while the entry is live is how a connection's group count falls
+    /// below the number of groups it is actually fanned out to.
+    pub async fn holds(&self, group: &[u8], id: ConnectionId) -> bool {
+        self.lock()
+            .await
+            .get(group)
+            .is_some_and(|subscribers| subscribers.iter().any(|subscriber| subscriber.id == id))
+    }
+
     /// Record that a connection authenticated as one principal.
     ///
     /// Called once per connection, after `AUTH` succeeds. Idempotent, because a
@@ -189,7 +203,7 @@ impl Hub {
             // Best effort, deliberately. A sender whose receiver has gone is a
             // connection that is already closed, and treating that as a failure
             // would make revocation look unreliable when it had already succeeded.
-            let _ = sender.close().await;
+            let _ = sender.close();
             self.disconnect(id).await;
         }
         count
@@ -290,6 +304,18 @@ impl Hub {
         // at a call's participants by `calls::CallRegistry::route`, not at a
         // group's subscribers, and it sheds there on the same terms.
         let ephemeral = matches!(frame, Frame::Live { .. } | Frame::Call { .. });
+        // And the opposite property, for the one frame a downgrade cannot describe.
+        //
+        // A downgrade tells a subscriber to reconcile, and reconciliation is over the
+        // envelope log only. There is no reconciliation for MLS state: a member that
+        // missed the commit advancing an epoch cannot ask for it back and cannot
+        // decrypt anything published after it, so a subscriber told to reconcile
+        // instead of disconnected is a subscriber that is quietly done reading this
+        // group for ever. `wire.md` is explicit that such a subscriber has its
+        // connection ended rather than downgraded, which is the honest failure: the
+        // client reconnects and takes the replay from zero. Before WEALD-476 a
+        // handshake shared the envelope path and set `downgrade_owed`.
+        let undowngradable = matches!(frame, Frame::Handshake { .. });
         let mut outcomes = Vec::new();
         let mut gone = Vec::new();
         {
@@ -320,6 +346,15 @@ impl Hub {
                 if subscriber.downgrade_owed {
                     match try_queue(&subscriber.sender, downgrade_frame(group)) {
                         Queued::Sent => subscriber.downgrade_owed = false,
+                        Queued::Full if undowngradable => {
+                            // Owed a downgrade it cannot be sent, and now a handshake
+                            // it cannot be sent either. Waiting would leave it live and
+                            // missing a commit, which is the state `undowngradable`
+                            // exists to refuse, so end it here too.
+                            gone.push(subscriber.id);
+                            outcomes.push((subscriber.id, Delivery::Gone));
+                            continue;
+                        }
                         Queued::Full => {
                             outcomes.push((subscriber.id, Delivery::Downgraded));
                             continue;
@@ -351,6 +386,11 @@ impl Hub {
                 }
                 let delivery = match try_queue(&subscriber.sender, frame.clone()) {
                     Queued::Sent => Delivery::Sent,
+                    Queued::Full if undowngradable => {
+                        // See `undowngradable` above: ended, not told to reconcile.
+                        gone.push(subscriber.id);
+                        Delivery::Gone
+                    }
                     Queued::Full => {
                         // Told, not dropped. The queue is full, so the frame that
                         // says so cannot go out now either; it is owed and goes out

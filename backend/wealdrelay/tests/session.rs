@@ -1441,3 +1441,38 @@ fn a_hand_built_call_frame_with_a_wrong_width_id_is_refused_rather_than_panickin
         assert_eq!(session.state(), State::Ready, "{what}");
     }
 }
+
+/// `JOIN` is the one frame an unauthenticated peer may send, so it is the one
+/// budget that bounds a peer which has proved nothing. Without it, a pipelined
+/// flood inside the handshake deadline reaches `invite::reserve` once per frame,
+/// which is at least a cooldown query and a salt read before any code is verified.
+#[test]
+fn the_join_budget_refuses_a_pre_auth_flood_without_closing_the_connection() {
+    use wealdrelay::session::JOIN_FRAMES_PER_MINUTE;
+    let config = config(&[]);
+    for state in [State::Fresh, State::Challenged] {
+        let mut session = session_in(state, &config);
+        for _ in 0..JOIN_FRAMES_PER_MINUTE {
+            assert!(
+                matches!(
+                    session.handle(sample(FrameTag::Join), NOW),
+                    Reaction::Defer(Work::Redeem { .. })
+                ),
+                "{state:?}: the allowance itself must be reachable"
+            );
+        }
+        let reaction = session.handle(sample(FrameTag::Join), NOW);
+        assert_eq!(
+            reaction,
+            Reaction::Reply(vec![Frame::Error(
+                FrameError::new(ErrorCode::RateLimited)
+                    .retry_after(60)
+                    .detail(u64::from(JOIN_FRAMES_PER_MINUTE).to_be_bytes()),
+            )]),
+            "{state:?}: expected the frame to be refused"
+        );
+        // The frame, not the connection: a person mistyping a code stays on the
+        // socket they are already on.
+        assert_eq!(session.state(), state, "{state:?}");
+    }
+}

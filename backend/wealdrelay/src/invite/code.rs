@@ -41,11 +41,20 @@ pub const CODE_BITS: u32 = 60;
 /// Symbols per group in the displayed form, `ABCD-EFGH-JKLM`.
 pub const GROUP_SYMBOLS: usize = 4;
 
-/// Failed attempts from one token, source and device tuple before that tuple cools
-/// down.
+/// Failed attempts from one token and source pair before that pair cools down.
+///
+/// The pair deliberately excludes the joiner's device: the device is an arbitrary
+/// byte string supplied pre-authentication, so a key that included it was a key the
+/// guesser chose, and the five-guess bound was unbounded from one address.
 pub const MAX_FAILURES: i32 = 5;
 
-/// How long that tuple stays cooled down, in seconds.
+/// Failed attempts against one token, across every source, before the whole token
+/// cools down. This is what bounds a distributed guesser: sources are cheap in
+/// aggregate even though each one is not attacker-chosen, and the 60-bit code's
+/// guarantee has to hold against all of them together.
+pub const MAX_TOKEN_FAILURES: i64 = 25;
+
+/// How long a cooled-down pair or token stays cooled down, in seconds.
 pub const COOLDOWN_SECONDS: i64 = 15 * 60;
 
 /// Argon2id parameters.

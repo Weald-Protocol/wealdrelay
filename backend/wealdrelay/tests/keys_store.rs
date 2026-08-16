@@ -209,3 +209,96 @@ async fn an_empty_shelf_is_an_answer_and_not_an_error() {
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// WEALD-314. The cap was a count followed by a loop of inserts on the pool, so
+/// two `KEYS/Publish` frames for one device both read the same shelf depth, both
+/// found room, and both stored: the hundred-outstanding bound in `wire.md` held
+/// only for a publisher that never used two connections. The publication is now
+/// one transaction under an advisory lock on the shelf, so one of the two racers
+/// is `OverCap` and the shelf never exceeds the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_publications_cannot_take_one_shelf_over_the_cap() {
+    let scratch = Scratch::new("keys_cap_race").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    // Two publications that each fit on their own and cannot both fit.
+    let half = usize::try_from(MAX_OUTSTANDING).unwrap() / 2 + 1;
+    let batch = |offset: u8| -> Vec<Vec<u8>> {
+        (0..half)
+            .map(|index| vec![offset.wrapping_add(u8::try_from(index % 251).unwrap_or(0)); 48])
+            .collect()
+    };
+
+    let (one, two) = (batch(0), batch(128));
+    let (first, second) = tokio::join!(
+        store::publish(pool, WORKSPACE, &device, &one),
+        store::publish(pool, WORKSPACE, &device, &two),
+    );
+    let outcomes = [first.expect("publish"), second.expect("publish")];
+    assert!(
+        outcomes.contains(&store::Published::OverCap),
+        "one of two racing publications must be refused, got {outcomes:?}"
+    );
+
+    // And the shelf itself is within the cap, which is the claim the wire bound
+    // makes and the one a count-then-insert could not keep.
+    let depth: i64 = sqlx::query_scalar(
+        "select count(*) from relay_key_package \
+         where workspace_id = $1 and consumed_at is null and expires_at > now()",
+    )
+    .bind(WORKSPACE)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert!(
+        depth <= MAX_OUTSTANDING,
+        "the shelf holds {depth}, over the {MAX_OUTSTANDING} cap"
+    );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// WEALD-L150. The fetch consumes in the statement that selects, so a package
+/// whose answer never reaches the socket is destroyed. The shelf is finite and a
+/// peer can repeat the fetch, so an undelivered answer must be put back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undelivered_fetch_is_restored_to_the_shelf() {
+    let scratch = Scratch::new("keys_restore").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    store::publish(pool, WORKSPACE, &device, &[package(1), package(2)])
+        .await
+        .expect("publish");
+
+    let served = store::fetch_served(pool, WORKSPACE, &device, 2)
+        .await
+        .expect("fetch");
+    assert_eq!(served.len(), 2);
+    let ids: Vec<i64> = served.iter().map(|s| s.id).collect();
+    assert!(store::fetch(pool, WORKSPACE, &device, 2)
+        .await
+        .expect("fetch")
+        .is_empty());
+
+    store::restore(pool, &ids).await.expect("restore");
+    let again = store::fetch_served(pool, WORKSPACE, &device, 2)
+        .await
+        .expect("fetch");
+    assert_eq!(again.len(), 2, "a restored shelf is servable again");
+    let recovered: HashSet<Vec<u8>> = again.into_iter().map(|s| s.package).collect();
+    assert_eq!(
+        recovered,
+        HashSet::from([package(1), package(2)]),
+        "the same packages come back, not new ones"
+    );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

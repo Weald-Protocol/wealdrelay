@@ -384,6 +384,11 @@ pub fn verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 /// The prior state a transition is judged against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prior {
+    /// The workspace the accepted chain names, taken from the prior set's own
+    /// bytes. A successor that names a different workspace is refused, which is
+    /// what stops a correctly chained set signed for one workspace from being
+    /// admitted into another that shares an authorizer key.
+    pub workspace: Vec<u8>,
     pub version: u64,
     pub digest: Vec<u8>,
     pub entries: Vec<Vec<u8>>,
@@ -462,6 +467,12 @@ pub fn judge(
     if candidate.prev_hash != prior.digest {
         return Err(AccessError::PrevHashMismatch);
     }
+    // The chain is one workspace's. Checked before the signature so a set aimed at
+    // the wrong workspace never reaches the semantic rules, and after the chain
+    // position so the error a client sees names the narrowest thing that is wrong.
+    if candidate.workspace != prior.workspace {
+        return Err(AccessError::WorkspaceMismatch);
+    }
 
     let as_authorizer = prior.authorizers.contains(&candidate.signer);
     let as_recovery = prior.recovery.contains(&candidate.signer);
@@ -525,6 +536,48 @@ fn judge_ordinary(
         {
             return Err(AccessError::ProbationExceeded);
         }
+        // A probationary signer may not shed the authorities that predate it.
+        // The entry rule above is not enough on its own: an authorizer can be
+        // dropped from `authorizers` while its entry stays, which leaves
+        // `removed` empty and satisfies the liveness guard with the
+        // probationary device itself. That is a stolen phrase turning into a
+        // permanent takeover, which is the one thing probation exists to stop.
+        if !prior
+            .authorizers
+            .iter()
+            .all(|key| candidate.authorizers.contains(key))
+        {
+            return Err(AccessError::ProbationExceeded);
+        }
+        // Nor may it grow the authorizer set. This is the other half of the same
+        // escape and it needs no secret beyond the phrase probation exists to
+        // contain: a probationary device R adds R2 to `authorizers`, removing
+        // nothing, so neither the entry rule nor the rule above fires; R2 then
+        // publishes a set carrying R's entry, and because R2 is not itself listed
+        // in `probations` the clearing loop below treats it as a signer that
+        // predates the rotation and clears R. Two hops and probation is gone.
+        //
+        // Refusing the addition is what makes the loop's assumption true rather
+        // than patching the loop: with this rule, no authorizer can come into
+        // existence while a probation is open, so a signer absent from
+        // `probations` really does predate every rotation. The honest path out of
+        // probation is unaffected, because it never runs through the probationary
+        // device: a prior authorizer publishes a set carrying its entry, or the
+        // configured quorum confirms that entry. A recovery rotation is unaffected
+        // too, since the device it introduces is recorded in `probations` by the
+        // same transition that adds it.
+        if !candidate
+            .authorizers
+            .iter()
+            .all(|key| prior.authorizers.contains(key))
+        {
+            return Err(AccessError::ProbationExceeded);
+        }
+        // The recovery list is deliberately not constrained here. A recovery
+        // rotation retires the phrase it was signed with, so the set that
+        // follows one legitimately carries fewer recovery principals than its
+        // prior; refusing that would make an honest second rotation
+        // unpublishable. Recovery liveness is the guard above.
     }
 
     // Who this publication clears. A publication by an authorizer that predates a

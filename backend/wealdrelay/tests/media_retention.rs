@@ -292,6 +292,97 @@ async fn a_second_differently_signed_control_freezes_the_group_rather_than_gover
     scratch.drop_database().await;
 }
 
+/// The race the freeze exists for. Before `apply_control` used `on conflict do
+/// nothing` and re-read the winner, two distinct valid successors could both pass
+/// the pre-insert read seeing no row for the epoch; one insert won on the bare
+/// `(group_id, epoch)` primary key and the other failed with a database error
+/// that never reached the conflict-and-freeze path. Run it enough times, with a
+/// fresh group each time, that a fix which only wins the race by luck would show
+/// its seams.
+#[tokio::test]
+async fn racing_two_valid_successors_always_leaves_one_control_one_conflict_and_a_frozen_group() {
+    let (scratch, _blobs, state) = prepared("retention_race").await;
+    let pool = pool_of(&state);
+
+    for round in 0u8..20 {
+        let group = workspace_with(
+            &state,
+            &format!("ws-race-{round}"),
+            0x70 + round,
+            &[device_from(0x71)],
+        )
+        .await;
+        let epoch0 = verifier_key(0x21);
+        let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+        retention::apply_control(pool, &genesis).await.unwrap();
+
+        let a = signed_control(
+            &group,
+            1,
+            &verifier_key(0x81 + round),
+            Some(genesis.digest()),
+            &epoch0,
+        );
+        let b = signed_control(
+            &group,
+            1,
+            &verifier_key(0x91 + round),
+            Some(genesis.digest()),
+            &epoch0,
+        );
+
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let (outcome_a, outcome_b) = tokio::join!(
+            tokio::spawn(async move { retention::apply_control(&pool_a, &a).await.unwrap() }),
+            tokio::spawn(async move { retention::apply_control(&pool_b, &b).await.unwrap() }),
+        );
+        let (outcome_a, outcome_b) = (outcome_a.unwrap(), outcome_b.unwrap());
+
+        // Exactly one side is the winner and the other the loser: never both
+        // Accepted (that would mean the primary key did not hold) and never
+        // neither (that would mean the race dropped a control on the floor).
+        let winners = [&outcome_a, &outcome_b]
+            .into_iter()
+            .filter(|o| **o == ControlOutcome::Accepted)
+            .count();
+        let losers = [&outcome_a, &outcome_b]
+            .into_iter()
+            .filter(|o| **o == ControlOutcome::ConflictFroze)
+            .count();
+        assert_eq!(
+            (winners, losers),
+            (1, 1),
+            "round {round}: {outcome_a:?} / {outcome_b:?}"
+        );
+
+        let controls: i64 = sqlx::query_scalar(
+            "select count(*) from relay_retention_control where group_id = $1 and epoch = 1",
+        )
+        .bind(&group)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(controls, 1, "round {round}: exactly one settled control");
+
+        let conflicts: i64 = sqlx::query_scalar(
+            "select count(*) from relay_retention_control_conflict where group_id = $1",
+        )
+        .bind(&group)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(conflicts, 1, "round {round}: exactly one conflict artifact");
+
+        assert!(
+            retention::is_frozen(pool, &group).await.unwrap(),
+            "round {round}: the group is frozen"
+        );
+    }
+
+    scratch.drop_database().await;
+}
+
 // MARK: The manifest chain
 
 #[tokio::test]
@@ -409,7 +500,7 @@ async fn a_manifest_that_fails_verification_is_evidence_and_never_the_latest() {
         retention::apply_manifest(pool, "ws-badman", &orphan)
             .await
             .unwrap(),
-        ManifestOutcome::Invalid("no retention control for this epoch".to_string())
+        ManifestOutcome::Invalid("no retention control for this group".to_string())
     );
 
     retention::apply_control(pool, &signed_control(&group, 0, &epoch0, None, &epoch0))
@@ -507,6 +598,110 @@ async fn a_manifest_that_fails_verification_is_evidence_and_never_the_latest() {
         .unwrap();
     assert_eq!(latest.sequence, 1);
     assert_eq!(latest.digest, digest);
+
+    scratch.drop_database().await;
+}
+
+/// The removed member's manifest. Once the group rotates, the key the departing
+/// device still holds signs for an epoch that is no longer the latest, and an
+/// omission from the newest manifest is exactly what `gc::eligible` reads as
+/// permission to delete. The epoch transition check `latest_control` delegates is
+/// therefore made for manifests too, not only for `drop_before`.
+#[tokio::test]
+async fn a_manifest_signed_by_a_superseded_epoch_is_refused_and_never_the_latest() {
+    let (scratch, _blobs, state) = prepared("retention_manifest_stale_epoch").await;
+    let pool = pool_of(&state);
+    let group = workspace_with(&state, "ws-staleman", 0x6d, &[device_from(0x71)]).await;
+    let epoch0 = verifier_key(0x21);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    retention::apply_control(pool, &genesis).await.unwrap();
+
+    store::ensure_quota_row(pool, "ws-staleman", None)
+        .await
+        .unwrap();
+    for seed in [0xa1u8, 0xa2] {
+        store::reserve(
+            pool,
+            "ws-staleman",
+            &group,
+            &blob_hash(seed),
+            100,
+            false,
+            900,
+        )
+        .await
+        .unwrap();
+    }
+    let real = signed_manifest(
+        &group,
+        0,
+        1,
+        None,
+        vec![blob_hash(0xa1), blob_hash(0xa2)],
+        &epoch0,
+    );
+    let digest = match retention::apply_manifest(pool, "ws-staleman", &real)
+        .await
+        .unwrap()
+    {
+        ManifestOutcome::Accepted { digest } => digest,
+        other => panic!("expected an accepted manifest, got {other:?}"),
+    };
+
+    // The rotation that removed the device: epoch one is now the group's latest.
+    let epoch1 = verifier_key(0x22);
+    retention::apply_control(
+        pool,
+        &signed_control(&group, 1, &epoch1, Some(genesis.digest()), &epoch0),
+    )
+    .await
+    .unwrap();
+
+    // Correctly signed for epoch zero, correctly sequenced, correctly anchored,
+    // and dropping a blob the remaining members still hold.
+    let stale = signed_manifest(
+        &group,
+        0,
+        2,
+        Some(digest.clone()),
+        vec![blob_hash(0xa1)],
+        &epoch0,
+    );
+    assert_eq!(
+        retention::apply_manifest(pool, "ws-staleman", &stale)
+            .await
+            .unwrap(),
+        ManifestOutcome::Invalid("manifest epoch is not the group's latest epoch".to_string())
+    );
+
+    // The chain is where it was, and the omitted blob is still named by it, so
+    // nothing it holds has become a collection candidate.
+    let latest = retention::latest_manifest(pool, &group)
+        .await
+        .unwrap()
+        .expect("the honest manifest is still the latest");
+    assert_eq!(latest.sequence, 1);
+    assert_eq!(latest.digest, digest);
+    assert_eq!(latest.blobs, vec![blob_hash(0xa1), blob_hash(0xa2)]);
+
+    let rejected: i64 = sqlx::query_scalar(
+        "select count(*) from relay_retention_manifest_rejected where group_id = $1",
+    )
+    .bind(&group)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected, 1);
+
+    // A manifest at the current epoch, signed by the key that survived the
+    // rotation, still advances the chain.
+    let fresh = signed_manifest(&group, 1, 2, Some(digest), vec![blob_hash(0xa1)], &epoch1);
+    assert!(matches!(
+        retention::apply_manifest(pool, "ws-staleman", &fresh)
+            .await
+            .unwrap(),
+        ManifestOutcome::Accepted { .. }
+    ));
 
     scratch.drop_database().await;
 }

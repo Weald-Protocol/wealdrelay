@@ -1,7 +1,7 @@
 # The Weald relay, self-hosted, one file.
 #
 # specs/backend/relay/server.md distribution channel 2, and
-# specs/backend/relay/deployment.md path 2. Postgres, MinIO, Redis and Caddy,
+# specs/backend/relay/deployment.md path 2. Postgres, MinIO and Caddy,
 # with one hostname to edit in .env and a working default for everything else.
 #
 # The relay is blind (specs/backend/relay/groups.md). It holds no key and there
@@ -72,19 +72,16 @@ services:
     restart: "no"
     networks: [weald]
 
-  # Fanout across relay processes, presence, ephemeral kinds. Optional: a
-  # single-process install can delete this service and unset WEALD_RELAY_REDIS_URL,
-  # and the binary uses in-process channels instead.
-  redis:
-    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
-    restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-    networks: [weald]
+  # No redis service, deliberately. It used to be here for fanout across relay
+  # processes, and this bundle could not boot with it: the binary refuses a
+  # configuration that has `live` on, which is its default, together with a redis
+  # url (`config.rs: enforce_live_fanout`), and it refuses `LIVE_FANOUT=shared` as
+  # unimplemented in the same function. So the only two states redis can produce
+  # here are a relay that exits 78 on start, or live fanout switched off to buy a
+  # dependency nothing reads. In-process channels are what a single relay process
+  # uses, and this bundle is a single relay process. When shared fanout exists,
+  # the service and `WEALD_RELAY_REDIS_URL` come back together with the
+  # `WEALD_RELAY_LIVE_FANOUT` value that makes them legal.
 
   relay:
     # Pinned by digest in a real deployment. The tag is here so that
@@ -110,17 +107,19 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
-      redis:
-        condition: service_healthy
     environment:
       WEALD_RELAY_HOSTNAME: ${WEALD_RELAY_HOSTNAME:?set WEALD_RELAY_HOSTNAME in .env}
       WEALD_RELAY_DATABASE_URL: postgres://wealdrelay:${POSTGRES_PASSWORD}@postgres:5432/wealdrelay
       WEALD_RELAY_STORAGE_URL: s3://${MINIO_BUCKET:-weald-blobs}
-      WEALD_RELAY_REDIS_URL: redis://redis:6379
       # Caddy terminates TLS in front. The relay speaks plaintext only on the
       # private compose network and is never published to the host.
       WEALD_RELAY_TLS: "off"
       WEALD_RELAY_LISTEN: 0.0.0.0:8443
+      # One proxy in front, the Caddy above, which appends the client address to
+      # X-Forwarded-For. Without this the relay would see every public client as
+      # the Caddy container, so one per-IP bucket would cover the whole internet
+      # (specs/backend/relay/operations.md, "Which address per-IP means").
+      WEALD_RELAY_TRUSTED_PROXY_HOPS: "1"
       # Readiness and metrics are private. Bound to the compose network so Caddy
       # can health check, never published (specs/backend/relay/server.md).
       WEALD_RELAY_OBSERVABILITY_LISTEN: 0.0.0.0:9090

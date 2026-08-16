@@ -166,7 +166,9 @@ async fn the_backfill_starts_where_it_is_told_and_is_bounded() {
         store(pool, &group, &seq.to_be_bytes(), seq).await;
     }
 
-    let from_start = log::since(pool, &group, 0).await.expect("read");
+    let from_start = log::since(pool, &group, 0, usize::MAX, usize::MAX)
+        .await
+        .expect("read");
     assert_eq!(from_start.len(), 20);
     // Ascending, because a client applying a backfill checks author chains and those
     // are cheaper in the order they were written.
@@ -176,17 +178,68 @@ async fn the_backfill_starts_where_it_is_told_and_is_bounded() {
         .collect();
     assert_eq!(seqs, (1..=20).collect::<Vec<u64>>());
 
-    let from_cursor = log::since(pool, &group, 18).await.expect("read");
+    let from_cursor = log::since(pool, &group, 18, usize::MAX, usize::MAX)
+        .await
+        .expect("read");
     assert_eq!(from_cursor.len(), 3, "at or after the cursor, inclusive");
 
     // Past the head is empty rather than an error.
-    assert!(log::since(pool, &group, 99).await.unwrap().is_empty());
+    assert!(log::since(pool, &group, 99, usize::MAX, usize::MAX)
+        .await
+        .unwrap()
+        .is_empty());
     // The bound is a bound, not a suggestion: a cursor of zero on a group larger
     // than it would return exactly the bound's worth. Asserted against the constant
     // rather than by storing five thousand rows, which would make this a slow test
     // proving the same thing.
     const { assert!(log::MAX_BACKFILL >= 1) };
     assert!(from_start.len() as i64 <= log::MAX_BACKFILL);
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_backfill_reads_only_what_the_caller_can_send() {
+    // The residency bound, which is the whole point of passing the outbound
+    // allowance down into the read: a group holding far more than one batch must
+    // not put the rest of it in the heap on the way to discarding it. Before the
+    // read took the allowance it returned `MAX_BACKFILL` rows whatever the caller
+    // could accept, so both assertions below failed by exactly the ratio between
+    // the group's size and the batch's.
+    let scratch = Scratch::new("logallowance").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = make_group(&relay.state, 0x66).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+
+    let body = vec![0x5au8; 4096];
+    for seq in 1..=40i64 {
+        store(pool, &group, &body, seq).await;
+    }
+
+    // A caller with room for four frames reads four rows, not forty.
+    let by_frames = log::since(pool, &group, 0, 4, usize::MAX)
+        .await
+        .expect("read");
+    assert_eq!(by_frames.len(), 4);
+
+    // A caller with room for roughly two envelopes' bytes reads three: the two that
+    // fit and the one that crosses the line, which is kept so the caller's own byte
+    // filter sees the same batch it would have seen from an unbounded read.
+    let one = by_frames.first().expect("at least one envelope").len();
+    let by_bytes = log::since(pool, &group, 0, usize::MAX, one * 2)
+        .await
+        .expect("read");
+    assert_eq!(by_bytes.len(), 3);
+    assert!(by_bytes.iter().map(Vec::len).sum::<usize>() <= one * 2 + one);
+
+    // No room at all is no read at all, and not an error: the acknowledgement the
+    // client already holds names a head beyond what arrived and it reconciles.
+    assert!(log::since(pool, &group, 0, 0, usize::MAX)
+        .await
+        .expect("read")
+        .is_empty());
 
     relay.shutdown().await;
     scratch.drop_database().await;
@@ -215,7 +268,7 @@ async fn every_read_reports_a_database_that_has_gone() {
     let items = log::items(&pool, &group).await;
     let one = log::envelope_bytes(&pool, &group, &stored.hash).await;
     let several = log::envelopes_for(&pool, &group, &[id_of(&stored)]).await;
-    let backfill = log::since(&pool, &group, 0).await;
+    let backfill = log::since(&pool, &group, 0, usize::MAX, usize::MAX).await;
     for failure in [
         items.err().map(|error| error.reason),
         one.err().map(|error| error.reason),

@@ -345,8 +345,15 @@ admin was already sending. Both are covered in `specs/backend/relay/invites.md`.
    The replacement device is a **probationary** authorizer until an established,
    pre-existing authorizer publishes a set containing it
    (`specs/backend/relay/wire.md`). During probation it may remove only what was
-   pinned in (a); it never self-promotes on a timer. This costs ordinary recovery
-   nothing, because the pinned set is precisely what the user asked to remove.
+   pinned in (a); it never self-promotes on a timer. It may not shed an
+   authority that predates it, and it may not add one: a probationary device that
+   could name a new authorizer would escape in two hops, since the new key is
+   absent from the probation record and would therefore be read as a signer that
+   predates the rotation, clearing the probation on the next version. No
+   authorizer comes into existence while a probation is open. Adding ordinary
+   members is unaffected, because a member's entry can clear nothing. This costs
+   ordinary recovery nothing, because the pinned set is precisely what the user
+   asked to remove.
    A phrase cannot distinguish its owner from a thief, so a phrase-only solo
    recovery restores the owner's work but not unrestricted administrative power;
    that requires a previously configured recovery quorum or another admin.

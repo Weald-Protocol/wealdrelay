@@ -478,6 +478,17 @@ pub struct CallRegistry {
     shed: AtomicU64,
     /// Media frames refused because the sender was not in the call it named.
     denied: AtomicU64,
+    /// Calls refused because one connection was already holding its share of the
+    /// table.
+    ///
+    /// Separate from any process-wide refusal count for the reason
+    /// `connections_closed_handshake_deadline` is separate from
+    /// `connections_refused` in `health.rs`: a relay genuinely at its ceiling is
+    /// answered by raising the ceiling or adding an instance, and one connection
+    /// taking the table is answered at the edge and never by raising anything.
+    /// Without the counter both look identical from outside, which is a call
+    /// refusal.
+    share_refused: AtomicU64,
 }
 
 impl CallRegistry {
@@ -487,7 +498,26 @@ impl CallRegistry {
             max_concurrent,
             shed: AtomicU64::new(0),
             denied: AtomicU64::new(0),
+            share_refused: AtomicU64::new(0),
         }
+    }
+
+    /// The most calls one connection may hold at once.
+    ///
+    /// A quarter of the table, and never less than one. The number and the
+    /// reasoning are `health::admit_connection`'s, deliberately: a finite table
+    /// with no per-source share is a table one source takes, and the connection
+    /// table already learned that lesson. A call table is the same finite table
+    /// carried by the same process, and on the hosted tier that process carries
+    /// many workspaces, so a ceiling with no per-tenant share is every other
+    /// customer's calls refused by one socket (WEALD-340).
+    ///
+    /// A quarter is far above any honest client. A person is in one call; five
+    /// participants is the ceiling on a single call and this is a ceiling on
+    /// distinct calls. A connection that reaches it is a loop or an attack, and
+    /// both are answered the same way.
+    fn share(&self) -> usize {
+        (self.max_concurrent / 4).max(1)
     }
 
     /// How many calls are open. For `/readyz` and the tests; never per group and
@@ -504,6 +534,12 @@ impl CallRegistry {
     /// How many media frames this process has refused as unadmitted.
     pub fn denied(&self) -> u64 {
         self.denied.load(Ordering::Relaxed)
+    }
+
+    /// How many calls this process has refused because one connection was already
+    /// at its share of the table.
+    pub fn share_refused(&self) -> u64 {
+        self.share_refused.load(Ordering::Relaxed)
     }
 
     /// The configured ceiling, so a refusal can name it.
@@ -548,6 +584,36 @@ impl CallRegistry {
             }
             None => {
                 if calls.len() >= self.max_concurrent {
+                    return Err(JoinRefusal::TooManyCalls);
+                }
+                // Opening a call is where the share is spent, and only here: an
+                // existing call is entered above and a re-offer returns before this
+                // arm, so a callee joining a room nobody opened for it is never
+                // refused by this rule and the idempotent path stays idempotent.
+                //
+                // Counted by walking the table rather than by a per-connection
+                // tally, because `leave` and `forget` already keep participation
+                // exact through every ending a socket has, including the bad ones,
+                // and a second structure to keep in step with them is a second
+                // structure to leak a slot in. The table is bounded by
+                // `max_concurrent`, so the walk is bounded by the number the
+                // operator sized this relay for and runs under the lock this arm
+                // already holds.
+                let held = calls
+                    .values()
+                    .filter(|call| {
+                        call.participants
+                            .iter()
+                            .any(|(existing, _)| *existing == connection)
+                    })
+                    .count();
+                if held >= self.share() {
+                    self.share_refused.fetch_add(1, Ordering::Relaxed);
+                    // `TooManyCalls`, not a new refusal: the client's correct next
+                    // move is identical (wait and retry), and a distinct code would
+                    // tell an attacker which of the two ceilings it found. The
+                    // operator gets the distinction through `share_refused`, which
+                    // is where it is actionable.
                     return Err(JoinRefusal::TooManyCalls);
                 }
                 calls.insert(

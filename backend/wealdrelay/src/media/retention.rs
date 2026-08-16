@@ -97,34 +97,22 @@ pub async fn apply_control(
         ) {
             return Ok(ControlOutcome::Accepted);
         }
-        // A genuine conflict. Recorded as evidence and never allowed to replace
-        // the settled row, which is what "first valid wins" means in practice:
-        // the winner was decided by the insert below, the first time this epoch
-        // was ever seen, and nothing here reopens that.
-        sqlx::query(
-            "insert into relay_retention_control_conflict \
-             (group_id, epoch, verifier, prev_control_hash, sig) values ($1, $2, $3, $4, $5)",
-        )
-        .bind(&record.group)
-        .bind(record.epoch as i64)
-        .bind(&record.verifier)
-        .bind(record.prev_control_hash.as_deref())
-        .bind(&record.sig)
-        .execute(pool)
-        .await
-        .map_err(db)?;
-        let already_frozen = freeze(pool, &record.group, "retention control conflict").await?;
-        return Ok(if already_frozen {
-            ControlOutcome::ConflictAlreadyFrozen
-        } else {
-            ControlOutcome::ConflictFroze
-        });
+        return record_conflict_and_freeze(pool, record).await;
     }
 
-    sqlx::query(
+    // `on conflict do nothing` rather than the plain insert this used to be, because
+    // the read above and this insert are not one atomic step: two distinct valid
+    // successors can both pass the read seeing no row, and without this clause the
+    // loser's insert would fail on the `(group_id, epoch)` primary key with a bare
+    // database error, never reaching the freeze path that exists exactly for this
+    // race. `returning group_id` tells the two callers apart: a row back means this
+    // insert was the one that won.
+    let inserted = sqlx::query(
         "insert into relay_retention_control \
          (group_id, epoch, verifier, prev_control_hash, sig, signer_note) \
-         values ($1, $2, $3, $4, $5, $6)",
+         values ($1, $2, $3, $4, $5, $6) \
+         on conflict (group_id, epoch) do nothing \
+         returning group_id",
     )
     .bind(&record.group)
     .bind(record.epoch as i64)
@@ -136,10 +124,59 @@ pub async fn apply_control(
     } else {
         "rotation"
     })
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    if inserted.is_some() {
+        return Ok(ControlOutcome::Accepted);
+    }
+
+    // Lost the race: some other insert landed between the read above and this
+    // statement. Re-read the row that actually won and judge this record against
+    // it exactly as the pre-existing-row branch above does, so the loser of a race
+    // is frozen and recorded rather than silently refused.
+    let Some(winner) = control_at(pool, &record.group, record.epoch).await? else {
+        return Err(StoreError::Database(
+            "on conflict do nothing left no row to read back".to_string(),
+        ));
+    };
+    if is_the_same_control(
+        &winner.verifier,
+        winner.prev_control_hash.as_deref(),
+        &winner.sig,
+        record,
+    ) {
+        return Ok(ControlOutcome::Accepted);
+    }
+    record_conflict_and_freeze(pool, record).await
+}
+
+/// A genuine conflict for an epoch some other control already settled. Recorded
+/// as evidence and never allowed to replace the settled row, which is what
+/// "first valid wins" means in practice: the winner was decided by whichever
+/// insert landed first, and nothing here reopens that.
+async fn record_conflict_and_freeze(
+    pool: &PgPool,
+    record: &RetentionControl,
+) -> Result<ControlOutcome, StoreError> {
+    sqlx::query(
+        "insert into relay_retention_control_conflict \
+         (group_id, epoch, verifier, prev_control_hash, sig) values ($1, $2, $3, $4, $5)",
+    )
+    .bind(&record.group)
+    .bind(record.epoch as i64)
+    .bind(&record.verifier)
+    .bind(record.prev_control_hash.as_deref())
+    .bind(&record.sig)
     .execute(pool)
     .await
     .map_err(db)?;
-    Ok(ControlOutcome::Accepted)
+    let already_frozen = freeze(pool, &record.group, "retention control conflict").await?;
+    Ok(if already_frozen {
+        ControlOutcome::ConflictAlreadyFrozen
+    } else {
+        ControlOutcome::ConflictFroze
+    })
 }
 
 struct Control {
@@ -329,12 +366,21 @@ pub async fn apply_manifest(
     record: &RetentionManifest,
 ) -> Result<ManifestOutcome, StoreError> {
     let reject = |reason: &str| reason.to_string();
-    let Some(control) = control_at(pool, &record.group, record.epoch).await? else {
-        let reason = reject("no retention control for this epoch");
+    // The transition check `latest_control` delegates to its callers, made here
+    // for the same reason `lifecycle::drop_before` makes it: a manifest signed by
+    // an older epoch is a member removed at that rotation, and an omission from
+    // the newest manifest is what `gc::eligible` reads as permission to delete.
+    let Some((latest_epoch, verifier)) = latest_control(pool, &record.group).await? else {
+        let reason = reject("no retention control for this group");
         reject_manifest(pool, record, &reason).await?;
         return Ok(ManifestOutcome::Invalid(reason));
     };
-    if !access::verify(&control.verifier, &record.signing_bytes(), &record.sig) {
+    if record.epoch != latest_epoch {
+        let reason = reject("manifest epoch is not the group's latest epoch");
+        reject_manifest(pool, record, &reason).await?;
+        return Ok(ManifestOutcome::Invalid(reason));
+    }
+    if !access::verify(&verifier, &record.signing_bytes(), &record.sig) {
         let reason = reject("signature does not verify against the epoch verifier");
         reject_manifest(pool, record, &reason).await?;
         return Ok(ManifestOutcome::Invalid(reason));

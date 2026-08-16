@@ -172,6 +172,16 @@ set, with the genesis fingerprint alongside it:
     GET /handoff/<derived>  ->  200 {"blob": "...", "sealed_code": "...",
                                      "genesis_fingerprint": "..."}
                                 404 before anything has been sealed
+                                404 once the bootstrap invite has expired or
+                                    been redeemed
+
+Reading is not consuming, but it is not forever either. The row carries the
+bootstrap invite's own `expires_at` and the read filters on it, so past the
+bootstrap window the route answers 404; and redeeming the invite deletes the row
+in the same transaction that retires the genesis secret. Both halves of the
+two-channel split stop existing once neither can be used, rather than sitting on
+the instance for its lifetime where a leaked operator bearer plus the control
+plane's handoff private key would reassemble them.
 
 An earlier draft of this section pinned the route to the private observability
 listener, "never on the public one". That was right about the port and wrong about
@@ -325,8 +335,15 @@ declines to retain, they are something it is not offered
 (`specs/backend/cloud/billing.md`). Full behaviour in
 `specs/backend/relay/operations.md`.
 
-**Health.** Public `/healthz` is liveness only. Private `/readyz` is readiness,
-including database and storage reachability.
+**Health.** Public `/healthz` is liveness only. Private `/readyz` answers a bare
+readiness verdict (`{"ok":..,"ready":..}` and the status code) to any caller on
+the port; the detailed document, including database and storage reachability,
+security posture, connection counters and frozen-group prefixes, is served only
+to a request carrying the operator bearer, exactly like `/admitted` and for the
+same reason: provider-private networking is a network boundary, not an
+authentication boundary, and frozen-group prefixes are correlation handles the
+public/private split exists to withhold (WEALD-295). A deployment with no
+operator token configured serves only the verdict.
 
 ## Sizing
 

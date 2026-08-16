@@ -54,39 +54,89 @@ pub const MAX_OUTSTANDING: i64 = 100;
 /// comment in `migrations/0001_relay_schema.sql`.
 pub const LIFETIME_DAYS: i64 = 90;
 
+/// The most one key package may weigh, checked at publish.
+///
+/// The count cap alone does not bound a fetch: a shelf of packages that are each
+/// individually legal answers a maximum `count` fetch with a frame the codec
+/// refuses, and the packages are consumed by then. So the ceiling is derived from
+/// the two numbers that decide it, one hundred and twenty eight kibibytes, which
+/// leaves `MAX_FRAME_BYTES - 8 * MAX_PACKAGE_BYTES` bytes of headroom for the
+/// frame header and the array framing around the packages.
+pub const MAX_PACKAGE_BYTES: usize = 128 * 1024;
+
+const _: () = assert!(
+    MAX_PACKAGE_BYTES * (crate::session::MAX_KEY_PACKAGE_FETCH as usize)
+        < crate::frame::MAX_FRAME_BYTES,
+    "a full fetch of maximum-size packages must still encode inside one frame"
+);
+
+/// One answer to a `KEYS` frame, and the packages it consumed to build it.
+///
+/// `restore` is empty for every answer except a served fetch. The caller owns the
+/// delivery, so the caller is the only party that knows whether the bytes reached
+/// the socket, and it puts the rows back when they did not.
+pub struct Answer {
+    pub frame: Frame,
+    pub restore: Vec<i64>,
+}
+
+impl Answer {
+    fn plain(frame: Frame) -> Self {
+        Self {
+            frame,
+            restore: Vec::new(),
+        }
+    }
+}
+
 /// Serve one `KEYS` frame.
 ///
 /// The session is `Ready` and its budget has already been charged by
 /// `session.rs`; what is decided here is everything that needs the database.
-pub async fn handle(state: &Arc<RelayState>, session: &Session, body: KeysBody) -> Frame {
+pub async fn handle(state: &Arc<RelayState>, session: &Session, body: KeysBody) -> Answer {
     let Some(database) = &state.database else {
-        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+        return Answer::plain(Frame::Error(FrameError::new(ErrorCode::Backpressure)));
     };
     let Some(workspace) = session.authorized_workspace() else {
         // The same refusal a stranger gets. Reachable with
         // `WEALD_RELAY_ACCESS_SET=off`, the one mode that admits a session with no
         // workspace claim, and a shelf belongs to a workspace.
-        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+        return Answer::plain(Frame::Error(FrameError::new(
+            ErrorCode::WriterNotInAccessSet,
+        )));
     };
     let Some(device_key) = session.device_key() else {
-        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+        return Answer::plain(Frame::Error(FrameError::new(
+            ErrorCode::WriterNotInAccessSet,
+        )));
     };
     let pool = database.pool();
 
     match body {
         KeysBody::Publish { packages } => {
-            match store::publish(pool, workspace, device_key, &packages).await {
-                Ok(store::Published::Stored { remaining }) => {
-                    Frame::Keys(KeysBody::Published { remaining })
-                }
-                // Over the cap. `quota`, because the lever that clears it is time
-                // and consumption rather than a change to the request.
-                Ok(store::Published::OverCap) => Frame::Error(
-                    FrameError::new(ErrorCode::SeatsExhausted)
-                        .detail((MAX_OUTSTANDING as u64).to_be_bytes()),
-                ),
-                Err(_) => Frame::Error(FrameError::new(ErrorCode::Backpressure)),
+            // Size is refused at publish rather than at fetch, because at fetch
+            // the packages are already consumed and the refusal is indistinguishable
+            // from destroying them.
+            if packages.iter().any(|p| p.len() > MAX_PACKAGE_BYTES) {
+                return Answer::plain(Frame::Error(
+                    FrameError::new(ErrorCode::EnvelopeTooLarge)
+                        .detail((MAX_PACKAGE_BYTES as u64).to_be_bytes()),
+                ));
             }
+            Answer::plain(
+                match store::publish(pool, workspace, device_key, &packages).await {
+                    Ok(store::Published::Stored { remaining }) => {
+                        Frame::Keys(KeysBody::Published { remaining })
+                    }
+                    // Over the cap. `quota`, because the lever that clears it is time
+                    // and consumption rather than a change to the request.
+                    Ok(store::Published::OverCap) => Frame::Error(
+                        FrameError::new(ErrorCode::SeatsExhausted)
+                            .detail((MAX_OUTSTANDING as u64).to_be_bytes()),
+                    ),
+                    Err(_) => Frame::Error(FrameError::new(ErrorCode::Backpressure)),
+                },
+            )
         }
         KeysBody::Fetch { device, count } => {
             // Both devices in the access set of the same workspace, checked
@@ -96,18 +146,29 @@ pub async fn handle(state: &Arc<RelayState>, session: &Session, body: KeysBody) 
             // one-time keys.
             match crate::access::store::admits(pool, workspace, &device).await {
                 Ok(crate::access::store::Admission::Refused) => {
-                    return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet))
+                    return Answer::plain(Frame::Error(FrameError::new(
+                        ErrorCode::WriterNotInAccessSet,
+                    )))
                 }
                 Ok(_) => {}
-                Err(_) => return Frame::Error(FrameError::new(ErrorCode::Backpressure)),
+                Err(_) => {
+                    return Answer::plain(Frame::Error(FrameError::new(ErrorCode::Backpressure)))
+                }
             }
-            match store::fetch(pool, workspace, &device, count).await {
+            match store::fetch_served(pool, workspace, &device, count).await {
                 // An empty shelf is not an error. The correct client behaviour is
                 // to wait for the peer to top up rather than to retry, and an error
                 // would invite exactly the retry loop that drains a shelf.
-                Ok(packages) if packages.is_empty() => Frame::Keys(KeysBody::None),
-                Ok(packages) => Frame::Keys(KeysBody::Bundles { packages }),
-                Err(_) => Frame::Error(FrameError::new(ErrorCode::Backpressure)),
+                Ok(served) if served.is_empty() => Answer::plain(Frame::Keys(KeysBody::None)),
+                Ok(served) => {
+                    let restore = served.iter().map(|s| s.id).collect();
+                    let packages = served.into_iter().map(|s| s.package).collect();
+                    Answer {
+                        frame: Frame::Keys(KeysBody::Bundles { packages }),
+                        restore,
+                    }
+                }
+                Err(_) => Answer::plain(Frame::Error(FrameError::new(ErrorCode::Backpressure))),
             }
         }
         // `session.rs` refuses the relay-to-client forms before they reach here,
@@ -115,7 +176,7 @@ pub async fn handle(state: &Arc<RelayState>, session: &Session, body: KeysBody) 
         // type is one enum in both directions; it is the same answer the session
         // table gives, so the two cannot disagree.
         KeysBody::Published { .. } | KeysBody::Bundles { .. } | KeysBody::None => {
-            Frame::Error(FrameError::new(ErrorCode::MalformedHeader))
+            Answer::plain(Frame::Error(FrameError::new(ErrorCode::MalformedHeader)))
         }
     }
 }

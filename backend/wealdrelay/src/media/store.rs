@@ -119,6 +119,32 @@ pub async fn usage(pool: &PgPool, workspace: &str) -> Result<Usage, StoreError> 
 /// reservation at all, which is what makes a retry after a dropped upload free. A
 /// second `reserve` for an object already reserved (an in-flight retry) refreshes
 /// the existing reservation's expiry instead of taking a second helping of quota.
+///
+/// ## A finalized row whose object is gone
+///
+/// `already_stored` false with a *finalized* row present is a contradiction: the row
+/// attests that the relay confirmed the object, and the store says the object is not
+/// there. It is reachable, and by ordinary means rather than only by corruption. The
+/// retention sweep deletes the object before the row on purpose (`gc.rs`), so a crash
+/// or a `finish_deletion` that fails leaves exactly this state, and so does an
+/// operator removing a bucket object.
+///
+/// The unique index on the triple is partial, `where finalized_at is null`, so before
+/// this the re-upload inserted a *second* row, charged quota again, and `claim`
+/// finalized it and added the same object's bytes to `stored_bytes` a second time.
+/// One object, charged twice, for ever: the eventual delete removes one row and
+/// subtracts one helping, and the other charge has no path that ever reclaims it
+/// (WEALD-318).
+///
+/// So a stale finalized row is retired here, inside the transaction that already
+/// holds the quota row locked: its charge is returned to the workspace and the row is
+/// removed, which is precisely what `finish_deletion` would have done had it
+/// succeeded, and then the upload proceeds as a first upload. Every stale row for the
+/// triple is retired rather than one, because nothing constrains finalized rows to be
+/// unique, so this also reconciles a workspace that was already double-charged for
+/// the object it is re-uploading. What is deliberately *not* done is answering
+/// `AlreadyStored`: the object is absent, and telling the client its upload is
+/// unnecessary would turn a billing error into missing media.
 pub async fn reserve(
     pool: &PgPool,
     workspace: &str,
@@ -140,7 +166,7 @@ pub async fn reserve(
     .fetch_one(&mut *tx)
     .await
     .map_err(db)?;
-    let stored: i64 = quota_row.try_get("stored_bytes").map_err(db)?;
+    let mut stored: i64 = quota_row.try_get("stored_bytes").map_err(db)?;
     let reserved: i64 = quota_row.try_get("reserved_bytes").map_err(db)?;
     let limit: Option<i64> = quota_row.try_get("limit_bytes").map_err(db)?;
 
@@ -173,6 +199,49 @@ pub async fn reserve(
         .map_err(db)?;
         tx.commit().await.map_err(db)?;
         return Ok(Reserved::Active { reservation_id });
+    }
+
+    // No reservation is in flight, so any finalized row for this triple is stale:
+    // `already_stored` is false, which means the object it attested to is not in the
+    // store. Retire it and give its bytes back, or the insert below charges the same
+    // object a second time and nothing ever reclaims the first charge. All of them,
+    // because only unfinalized rows are unique on the triple.
+    //
+    // Before the quota comparison deliberately: the reclaimed bytes are part of what
+    // this upload is allowed to spend, and a workspace already double-charged for
+    // this object would otherwise be refused against its own phantom bytes.
+    let stale = sqlx::query(
+        "delete from relay_blob_reservation \
+         where workspace_id = $1 and group_id = $2 and blob_hash = $3 \
+           and finalized_at is not null \
+         returning bytes",
+    )
+    .bind(workspace)
+    .bind(group)
+    .bind(hash)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db)?;
+    if !stale.is_empty() {
+        let mut reclaimed: i64 = 0;
+        for row in &stale {
+            reclaimed = reclaimed.saturating_add(row.try_get::<i64, _>("bytes").map_err(db)?);
+        }
+        sqlx::query(
+            "update relay_quota set stored_bytes = greatest(stored_bytes - $2, 0), \
+             updated_at = now() where workspace_id = $1",
+        )
+        .bind(workspace)
+        .bind(reclaimed)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        stored = (stored - reclaimed).max(0);
+        tracing::warn!(
+            rows = stale.len(),
+            reclaimed,
+            "media: retired a finalized reservation whose object is not in the store"
+        );
     }
 
     if let Some(limit) = limit {
@@ -419,6 +488,31 @@ pub async fn finalized_reservations(
         .collect()
 }
 
+/// Every (workspace, group) pair that has ever taken a blob reservation.
+///
+/// The collector's work list. Both per-group passes start from a database row
+/// rather than from a bucket listing, so a group that never reserved anything has
+/// nothing either pass could delete and is correctly absent here; and a group whose
+/// rows were all released still appears until the last row goes, which costs one
+/// empty pass and never a missed one.
+pub async fn active_scopes(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+    let rows = sqlx::query(
+        "select distinct workspace_id, group_id from relay_blob_reservation \
+         order by workspace_id, group_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("workspace_id").map_err(db)?,
+                row.try_get("group_id").map_err(db)?,
+            ))
+        })
+        .collect()
+}
+
 /// Every reservation older than `older_than_seconds` that was never finalized:
 /// the 24-hour unclaimed-upload collector's candidate list.
 pub async fn stale_unclaimed(
@@ -580,6 +674,26 @@ pub async fn expected_len_of(
     .map_err(db)?;
     row.map(|row| row.try_get("expected_len").map_err(db))
         .transpose()
+}
+
+/// Every part number this relay has issued a URL for, ascending.
+///
+/// The completion path reconciles the client's submitted list against this, and
+/// the abort path deletes exactly these keys: the client's own list is not
+/// trustworthy for either job, and the bucket has no other record of which
+/// objects a session owns.
+pub async fn recorded_parts(pool: &PgPool, session_id: Uuid) -> Result<Vec<i32>, StoreError> {
+    let rows = sqlx::query(
+        "select part_number from relay_blob_multipart_part \
+         where session_id = $1 order by part_number",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    rows.into_iter()
+        .map(|row| row.try_get("part_number").map_err(db))
+        .collect()
 }
 
 pub async fn complete_multipart(pool: &PgPool, session_id: Uuid) -> Result<(), StoreError> {

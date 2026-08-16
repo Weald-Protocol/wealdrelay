@@ -21,13 +21,18 @@ use sqlx::{PgPool, Row};
 
 use super::{code, EncBundle, Invite, InviteError};
 
-/// Newest candidates retained per `(token, group)`.
+/// Newest *refreshed* candidates retained per `(token, group)`.
 ///
 /// invites.md, "GroupInfo freshness": the relay cannot verify group membership, so
-/// it treats an update as an availability hint rather than as truth. Retaining three
-/// is what stops a bogus high-epoch upload from masking the last valid update, and
-/// the invitee accepts only an MLS-valid GroupInfo for the invited group, so it can
-/// find the real one among them.
+/// it treats an update as an availability hint rather than as truth. The invitee
+/// accepts only an MLS-valid GroupInfo for the invited group, so it can find the
+/// real one among the retained candidates.
+///
+/// Retaining N newest is not on its own what stops a bogus upload from masking the
+/// last valid one: N+1 bogus uploads at distinct epochs evict every older row.
+/// What stops it is the pinned row, the candidate carried in the signed invite
+/// record, which pruning never touches (WEALD-338). This constant bounds only the
+/// unpinned rows, so a scope holds at most `RETAINED_BUNDLES + 1`.
 pub const RETAINED_BUNDLES: i64 = 3;
 
 /// Why a database call could not answer.
@@ -166,7 +171,7 @@ pub(super) async fn insert(
     // relay that cannot open one says so before it has written a workspace row for a
     // record it is then going to fail to store.
     let mut tx = pool.begin().await.map_err(db)?;
-    insert_within(&mut tx, pool, workspace_id, invite, bootstrap, now_ms).await?;
+    insert_within(&mut tx, workspace_id, invite, bootstrap, now_ms).await?;
     tx.commit().await.map_err(db)?;
     Ok(())
 }
@@ -182,7 +187,6 @@ pub(super) async fn insert(
 /// opposite of what "the single-use genesis key" means.
 pub(super) async fn insert_within(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pool: &PgPool,
     workspace_id: &str,
     invite: &Invite,
     bootstrap: bool,
@@ -190,8 +194,11 @@ pub(super) async fn insert_within(
 ) -> Result<(), StoreError> {
     super::judge(invite, bootstrap, now_ms.max(0) as u64)?;
     // Ensures the workspace row the foreign keys need, and is the same call the
-    // access set makes for the same reason.
-    crate::access::store::salt(pool, workspace_id)
+    // access set makes for the same reason. On the caller's transaction, never on
+    // the pool: a second checkout while this transaction holds the first is how
+    // issuance starved every authenticated session of connections. The parameter
+    // is gone rather than merely unused, so the shape cannot come back.
+    crate::access::store::salt_within(&mut *tx, workspace_id)
         .await
         .map_err(|error| StoreError::Database(error.to_string()))?;
 
@@ -230,8 +237,10 @@ pub(super) async fn insert_within(
 
     for bundle in &invite.bundles {
         sqlx::query(
-            "insert into relay_invite_bundle (token, group_id, epoch, ct) \
-             values ($1, $2, $3, $4)",
+            // `issued`: this row came in on the signed record over the authenticated
+            // issue path, so it is the one candidate pruning may never evict.
+            "insert into relay_invite_bundle (token, group_id, epoch, ct, issued) \
+             values ($1, $2, $3, $4, true)",
         )
         .bind(&invite.token)
         .bind(&bundle.group)
@@ -350,17 +359,23 @@ async fn terminate(pool: &PgPool, token: &[u8], terminal: &str) -> Result<bool, 
     .await
     .map_err(db)?;
 
-    // The redeemable ciphertext goes; the reservations and their scope commits go
-    // with it by cascade, because a reservation against a record that no longer
-    // exists cannot be completed and keeping it would only make the seat
-    // unaccountable. The tombstone above is what survives, and it is what the grant
-    // rules read.
+    // This is an update, not a delete, so `on delete cascade` never fires: a live
+    // reservation survives the state change unless released explicitly here. The
+    // tombstone above is what survives, and it is what the grant rules read.
     sqlx::query("update relay_invite set state = $2 where token = $1")
         .bind(token)
         .bind(terminal)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+    sqlx::query(
+        "update relay_invite_reservation set released_at = now() \
+         where token = $1 and consumed_at is null and released_at is null",
+    )
+    .bind(token)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
     sqlx::query("delete from relay_invite_bundle where token = $1")
         .bind(token)
         .execute(&mut *tx)
@@ -396,9 +411,15 @@ pub async fn tombstoned_hashes(
 ///
 /// The relay accepts this from an authenticated current access-set principal and
 /// never decrypts it, and it cannot verify that the uploader is in the group. So it
-/// keeps the newest ``RETAINED_BUNDLES`` candidates per `(token, group)` and lets the
-/// invitee choose: a bogus high-epoch upload cannot mask the last valid update
-/// because the last valid update is still there.
+/// keeps the newest ``RETAINED_BUNDLES`` refreshed candidates per `(token, group)`
+/// and lets the invitee choose.
+///
+/// The candidate sealed into the signed invite record is pinned and never pruned or
+/// overwritten by this path, because retaining N opaque newest values cannot prove
+/// one of them is valid: N+1 bogus uploads at distinct epochs would otherwise evict
+/// the last valid candidate and park every outstanding invite (WEALD-338). With the
+/// pin, the worst a flood achieves is that the joiner falls back to the seal the
+/// issuer gave it.
 ///
 /// An upload for a group the invite does not scope is refused, because a record has
 /// no authority to carry material for a group it does not name.
@@ -429,9 +450,16 @@ pub async fn refresh_bundle(
     // nothing a joiner can observe. A transaction here would buy that nothing at the
     // price of a failure path with no correct handling.
     sqlx::query(
+        // The `where` on the conflict update is the same pin seen from the other
+        // side: an upload that collides with the issued row's epoch must not be able
+        // to replace its ciphertext, which would evict the valid candidate by
+        // overwrite rather than by pruning. The statement still reports success,
+        // because a refusal here would tell an uploader which epoch the issuer
+        // sealed, and there is nothing the honest uploader would do differently.
         "insert into relay_invite_bundle (token, group_id, epoch, ct) values ($1, $2, $3, $4) \
          on conflict (token, group_id, epoch) do update \
-         set ct = excluded.ct, uploaded_at = now()",
+         set ct = excluded.ct, uploaded_at = now() \
+         where relay_invite_bundle.issued = false",
     )
     .bind(token)
     .bind(&bundle.group)
@@ -442,9 +470,10 @@ pub async fn refresh_bundle(
     .map_err(db)?;
     sqlx::query(
         "delete from relay_invite_bundle where token = $1 and group_id = $2 \
+         and issued = false \
          and (uploaded_at, epoch) not in ( \
              select uploaded_at, epoch from relay_invite_bundle \
-             where token = $1 and group_id = $2 \
+             where token = $1 and group_id = $2 and issued = false \
              order by uploaded_at desc, epoch desc limit $3)",
     )
     .bind(token)

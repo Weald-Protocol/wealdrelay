@@ -199,8 +199,21 @@ covering both, is the entire mitigation and it is not optional.
 
 ## Build and distribution
 
-- Static library, `aarch64-apple-darwin` and `x86_64-apple-darwin`, built into
-  an XCFramework and vendored at a pinned revision with a checksum.
+- Static library, built into one XCFramework and vendored at a pinned revision
+  with a checksum. Three platform slices, because an XCFramework slice is
+  identified by platform and variant: macOS from `aarch64-apple-darwin` and
+  `x86_64-apple-darwin`, iOS device from `aarch64-apple-ios`, iOS simulator from
+  `aarch64-apple-ios-sim` and `x86_64-apple-ios`. The list is
+  `scripts/build-mls-xcframework.sh` and it is not a loop over whatever is
+  installed, because a build that quietly produced a single-arch framework would
+  ship a client that does not run on half the fleet.
+- The two iOS platforms are not a second binding. The iOS Companion redeems an
+  invite and enters groups through this same seam and the same Swift wrapper
+  (`specs/companion-invite-redemption.md`), the way Android reaches it through a
+  JNI shim (`specs/android-mls.md`). Three clients, one crate.
+- The simulator platform is in the list for the reason `x86_64` is in the
+  Android list: without it the suites that prove this binding cannot run in CI
+  at all.
 - Built by CI from a pinned OpenMLS version and a pinned Rust toolchain, and the
   resulting checksum is published, because the client's whole claim rests on
   what this component does.

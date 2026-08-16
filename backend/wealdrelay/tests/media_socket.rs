@@ -589,6 +589,137 @@ async fn a_multipart_part_travels_through_its_own_presigned_route() {
     scratch.drop_database().await;
 }
 
+/// A database blip on the last write of `COMPLETE` must not strand the session.
+///
+/// The order the completion path writes in is the whole of this test.
+/// `Backpressure` is an instruction to retry, and the retry re-enters at the top
+/// and heads the parts. When the parts were deleted before `completed_at` was
+/// written, that retry headed objects that were already gone, answered
+/// `MalformedHeader`, and never reached the exactly-once short circuit: the
+/// assembled object sat in the bucket and the client could never be told it was
+/// there. Recording completion first means the retry either short circuits or
+/// re-assembles from parts that are still present. Both are `MultipartCompleted`;
+/// neither is a permanent client error.
+///
+/// The blip is a real one: a check constraint that refuses the update, so the
+/// failure is Postgres refusing a write rather than an injected error value.
+#[tokio::test]
+async fn a_failed_completion_write_leaves_a_session_a_retry_can_still_finish() {
+    let (scratch, _blobs, running) = relay("socket_complete_blip", []).await;
+    let group = group_in(&running.state, 0x67).await;
+    let mut client = Client::connect(running.address).await;
+    client.handshake(vec![group.clone()], NOW).await;
+
+    let first: Vec<u8> = vec![0x11; media::MULTIPART_PART_SIZE as usize];
+    let second: Vec<u8> = vec![0x22; 16];
+    let total = (first.len() + second.len()) as u64;
+    let hash = blake3::hash(&[first.clone(), second.clone()].concat())
+        .as_bytes()
+        .to_vec();
+
+    let session_id = match blob_answer(
+        &ask(
+            &mut client,
+            &Request::Put {
+                workspace: WS.as_bytes().to_vec(),
+                group: group.clone(),
+                hash: hash.clone(),
+                ciphertext_len: total,
+            },
+        )
+        .await,
+    ) {
+        Response::Multipart { session_id, .. } => session_id,
+        other => panic!("expected a multipart session, got {other:?}"),
+    };
+    for (number, bytes) in [(1u32, &first), (2, &second)] {
+        let url = match blob_answer(
+            &ask(
+                &mut client,
+                &Request::MultipartPart {
+                    session_id: session_id.clone(),
+                    part_number: number,
+                    expected_len: bytes.len() as u64,
+                },
+            )
+            .await,
+        ) {
+            Response::MultipartPartUpload { url, .. } => url,
+            other => panic!("{other:?}"),
+        };
+        let (status, _) = http_request(running.address, "PUT", &path_of(&url), bytes).await;
+        assert_eq!(status, 200);
+    }
+
+    // The blip. Every write of `completed_at` is refused for as long as this
+    // constraint stands, and nothing else about the session changes.
+    sqlx::query(
+        "alter table relay_blob_multipart \
+         add constraint weald_injected_no_completion check (completed_at is null)",
+    )
+    .execute(pool_of(&running.state))
+    .await
+    .unwrap();
+
+    let parts = vec![(1u32, b"e1".to_vec()), (2u32, b"e2".to_vec())];
+    match ask(
+        &mut client,
+        &Request::MultipartComplete {
+            session_id: session_id.clone(),
+            parts: parts.clone(),
+        },
+    )
+    .await
+    {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::Backpressure),
+        other => panic!("expected the completion write to be refused, got {other:?}"),
+    }
+
+    // The parts are still there. This is the assertion that fails against the old
+    // order, where they had already been deleted by the time the write was tried.
+    let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
+    let storage = running.state.storage.as_ref().unwrap();
+    for number in [1u32, 2] {
+        assert!(
+            storage
+                .head(&media::part_key_for(uuid, number as i32))
+                .await
+                .unwrap()
+                .is_some(),
+            "part {number} must survive a completion the database refused"
+        );
+    }
+
+    sqlx::query("alter table relay_blob_multipart drop constraint weald_injected_no_completion")
+        .execute(pool_of(&running.state))
+        .await
+        .unwrap();
+
+    // The retry the `Backpressure` asked for, and it is answered.
+    assert_eq!(
+        blob_answer(
+            &ask(
+                &mut client,
+                &Request::MultipartComplete {
+                    session_id: session_id.clone(),
+                    parts,
+                }
+            )
+            .await
+        ),
+        Response::MultipartCompleted
+    );
+    let stored = storage
+        .get(&BlobKey::new(WS, media::hex(&group), media::hex(&hash)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored.len() as u64, total);
+    assert_eq!(blake3::hash(&stored).as_bytes().to_vec(), hash);
+
+    running.shutdown().await;
+    scratch.drop_database().await;
+}
+
 /// The two answers the route gives when the relay itself, rather than the token,
 /// is the problem: no store configured at all, and a store that cannot be
 /// reached.

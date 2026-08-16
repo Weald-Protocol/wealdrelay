@@ -320,8 +320,15 @@ async fn an_unreferenced_object_planted_directly_in_storage_is_collected() {
         .await
         .unwrap();
 
-    let report =
-        gc::sweep_unreferenced_storage(pool, harness.storage(), "ws-gc3", &group, NOW).await;
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        harness.storage(),
+        "ws-gc3",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert_eq!(report.examined, 2);
     assert_eq!(report.deleted, 1);
     assert_eq!(report.deleted_bytes, 15);
@@ -337,8 +344,15 @@ async fn an_unreferenced_object_planted_directly_in_storage_is_collected() {
     );
 
     // A second pass finds nothing left to do and still records that it ran.
-    let again =
-        gc::sweep_unreferenced_storage(pool, harness.storage(), "ws-gc3", &group, NOW).await;
+    let again = gc::sweep_unreferenced_storage(
+        pool,
+        harness.storage(),
+        "ws-gc3",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert_eq!(again.examined, 1);
     assert_eq!(again.deleted, 0);
     let runs: i64 = sqlx::query_scalar(
@@ -766,7 +780,15 @@ async fn an_object_storage_outage_deletes_nothing_from_any_mechanism() {
 
     // The storage sweep cannot even list, so it says so rather than concluding
     // the bucket is empty and collecting everything in it.
-    let report = gc::sweep_unreferenced_storage(pool, &down, "ws-gc7", &group, NOW).await;
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        &down,
+        "ws-gc7",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert_eq!(report.examined, 0);
     assert_eq!(report.deleted, 0);
     assert!(
@@ -844,7 +866,15 @@ async fn a_refused_delete_is_never_recorded_as_a_deletion() {
             .is_some()
     );
 
-    let report = gc::sweep_unreferenced_storage(pool, &store, "ws-gc8", &group, NOW).await;
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        &store,
+        "ws-gc8",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert_eq!(report.examined, 2);
     assert_eq!(report.deleted, 0);
     assert_eq!(report.deleted_bytes, 0);
@@ -898,8 +928,15 @@ async fn a_pass_that_cannot_read_its_candidates_deletes_nothing_and_says_why() {
     assert_eq!(report.deleted, 0);
     assert!(report.note.starts_with("could not list stale reservations"));
 
-    let report =
-        gc::sweep_unreferenced_storage(pool, harness.storage(), "ws-gc9", &group, NOW).await;
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        harness.storage(),
+        "ws-gc9",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert_eq!(report.deleted, 0);
     assert!(
         report.note.starts_with("could not list known reservations"),
@@ -1186,6 +1223,245 @@ async fn eligibility_propagates_a_database_that_cannot_answer() {
             "{table}: a read that failed must never read as permission to delete"
         );
     }
+
+    harness.finish().await;
+}
+
+// MARK: The restore guard: the age floor, and the marker
+//
+// `specs/backend/cloud/backup-dr.md` promises a recovery point no older than
+// twelve hours, and a restore is how that promise is kept. The storage-listing
+// sweep decides liveness by asking the database, so the instant the database is
+// older than the bucket, every object uploaded in between looks like garbage to
+// it: the recovery mechanism and the janitor would combine into permanent data
+// loss on a live bucket with no versioning and no object lock. Two proofs here,
+// one per mechanism that stops it.
+
+/// Real wall-clock milliseconds. These two tests are the only ones in the file
+/// that cannot use the fixed `NOW`: the age floor compares against the object's
+/// own modification time, which a filesystem stamps with the real clock, and a
+/// fixed clock five months in the future makes every object ancient.
+fn real_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as u64
+}
+
+#[tokio::test]
+async fn an_object_younger_than_the_age_floor_survives_a_sweep_with_no_row_for_it() {
+    let harness = Harness::new("gc_age_floor").await;
+    let pool = harness.pool();
+    let group = make_group_in(
+        &harness.state,
+        "ws-gcage",
+        0x51,
+        &[device_from(0x71)],
+        &[device_from(0x71)],
+    )
+    .await;
+
+    // An ordinary upload: reservation, then object, exactly as `BLOB put` leaves
+    // it.
+    let hash = blob_hash(0xd1);
+    live_blob(
+        &harness,
+        "ws-gcage",
+        &group,
+        &hash,
+        b"uploaded after the snapshot",
+    )
+    .await;
+    let uploaded = key("ws-gcage", &group, &hash);
+
+    // Now the restore. The database goes back to a point before this upload, which
+    // is what `pg_restore` of a twelve-hour-old snapshot does to every row written
+    // since: the object is in the bucket and nothing in the database knows it.
+    sqlx::query("delete from relay_blob_reservation")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let now = real_now_ms();
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        harness.storage(),
+        "ws-gcage",
+        &group,
+        now,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
+    assert_eq!(report.examined, 1);
+    assert_eq!(
+        report.deleted, 0,
+        "a restore must never hand the janitor the objects it was too old to know about"
+    );
+    assert!(
+        report.note.contains("age floor"),
+        "the pass must say why it kept the object: {}",
+        report.note
+    );
+    assert!(
+        harness.storage().head(&uploaded).await.unwrap().is_some(),
+        "the object uploaded after the restore point survives"
+    );
+
+    // And the floor is what saved it, rather than the sweep being broken: the same
+    // pass with no floor at all deletes the same object.
+    let report =
+        gc::sweep_unreferenced_storage(pool, harness.storage(), "ws-gcage", &group, now, 0).await;
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.deleted, 1);
+    assert!(harness.storage().head(&uploaded).await.unwrap().is_none());
+
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn a_restore_marker_suppresses_the_sweep_for_the_stated_passes_and_then_clears() {
+    let harness = Harness::new("gc_restore_marker").await;
+    let pool = harness.pool();
+    let group = make_group_in(
+        &harness.state,
+        "ws-gcmark",
+        0x52,
+        &[device_from(0x71)],
+        &[device_from(0x71)],
+    )
+    .await;
+
+    // An object old enough that the age floor would not save it. Written directly,
+    // with no reservation, which is exactly the shape an object takes on after a
+    // restore to a point older than any floor worth having.
+    let planted = key("ws-gcmark", &group, &blob_hash(0xd2));
+    harness
+        .storage()
+        .put(&planted, b"older than any floor")
+        .await
+        .unwrap();
+
+    let passes = wealdrelay::media::restore::DEFAULT_SUPPRESSED_PASSES;
+    assert_eq!(passes, 4);
+    let set = wealdrelay::media::restore::set(pool, passes, "database restore")
+        .await
+        .unwrap();
+    assert_eq!(set, 4);
+
+    // While the marker is set the sweep deletes nothing, whatever the age of what
+    // it finds, and says so rather than reporting a quiet pass with nothing to do.
+    for expected in [4, 3, 2, 1] {
+        assert_eq!(
+            wealdrelay::media::restore::remaining(pool).await.unwrap(),
+            Some(expected)
+        );
+        let report = gc::sweep_unreferenced_storage(
+            pool,
+            harness.storage(),
+            "ws-gcmark",
+            &group,
+            NOW,
+            gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+        )
+        .await;
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.examined, 0);
+        assert_eq!(report.note, "suppressed: a restore marker is set");
+        assert!(harness.storage().head(&planted).await.unwrap().is_some());
+        // The countdown belongs to the collector pass, never to the sweep, so a
+        // twenty-group workspace spends one pass of protection per interval rather
+        // than twenty.
+        assert_eq!(
+            wealdrelay::media::restore::consume_one(pool).await,
+            Some(expected)
+        );
+    }
+
+    // The fifth pass finds no marker and behaves exactly as it did before there was
+    // one.
+    assert_eq!(
+        wealdrelay::media::restore::remaining(pool).await.unwrap(),
+        None
+    );
+    assert_eq!(wealdrelay::media::restore::consume_one(pool).await, None);
+    let report = gc::sweep_unreferenced_storage(
+        pool,
+        harness.storage(),
+        "ws-gcmark",
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.deleted, 1);
+    assert!(harness.storage().head(&planted).await.unwrap().is_none());
+
+    // Every suppressed pass is in the run log, so an operator reading the artifact
+    // sees four passes that ran and deleted nothing on purpose.
+    let suppressed: i64 = sqlx::query_scalar(
+        "select count(*) from relay_gc_run where mechanism = 'unreferenced_storage' \
+         and note = 'suppressed: a restore marker is set'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(suppressed, 4);
+
+    // And an operator who finished sooner can clear it outright.
+    wealdrelay::media::restore::set(pool, 4, "another restore")
+        .await
+        .unwrap();
+    wealdrelay::media::restore::clear(pool).await.unwrap();
+    assert_eq!(
+        wealdrelay::media::restore::remaining(pool).await.unwrap(),
+        None
+    );
+
+    harness.finish().await;
+}
+
+#[tokio::test]
+async fn a_listing_carries_the_age_a_name_cannot() {
+    let harness = Harness::new("gc_listing_age").await;
+    let group = make_group_in(
+        &harness.state,
+        "ws-gclist",
+        0x53,
+        &[device_from(0x71)],
+        &[device_from(0x71)],
+    )
+    .await;
+    let hash = blob_hash(0xd3);
+    harness
+        .storage()
+        .put(&key("ws-gclist", &group, &hash), b"dated")
+        .await
+        .unwrap();
+
+    let entries = harness
+        .storage()
+        .list_entries("ws-gclist", &wealdrelay::media::hex(&group))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, wealdrelay::media::hex(&hash));
+    let modified = entries[0]
+        .modified_ms
+        .expect("a filesystem states a modification time");
+    let now = real_now_ms();
+    assert!(
+        modified <= now && now - modified < 60_000,
+        "an object written just now is dated just now: {modified} against {now}"
+    );
+    // The name listing is the same listing without the times, so no caller can see
+    // the two disagree.
+    let names = harness
+        .storage()
+        .list("ws-gclist", &wealdrelay::media::hex(&group))
+        .await
+        .unwrap();
+    assert_eq!(names, vec![wealdrelay::media::hex(&hash)]);
 
     harness.finish().await;
 }

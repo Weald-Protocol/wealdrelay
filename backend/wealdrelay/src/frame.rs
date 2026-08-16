@@ -1147,10 +1147,16 @@ impl Frame {
             FrameTag::Connect => {
                 reader.array(3)?;
                 let version = reader.u16()?;
-                // A range rather than an equality, so a version 1 client's
-                // `CONNECT` still decodes on a version 2 build. Contradiction 1 in
-                // `specs/backend/build/presence-buildout-prompt.md`.
-                if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
+                // A floor and no ceiling. The field is the client's maximum offer,
+                // not an assertion about this build, so a client that speaks more
+                // than this relay does has to reach the session to be clamped and
+                // told what it got: `Session::handle` owns that rule and is the one
+                // place it is stated. Refusing the offer here instead made the
+                // clamp unreachable and hard-broke every future client release
+                // against every deployed relay, which is the failure one-field
+                // negotiation exists to prevent. Below the floor is different: that
+                // is a client this build genuinely cannot serve.
+                if version < MIN_PROTOCOL_VERSION {
                     return Err(FrameDecodeError::UnsupportedVersion(version));
                 }
                 let count = reader.array_header()?;

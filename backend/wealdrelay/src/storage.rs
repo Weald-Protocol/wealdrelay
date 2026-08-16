@@ -114,6 +114,27 @@ pub struct BlobInfo {
     pub len: u64,
 }
 
+/// One object as a listing saw it: its name inside the group, and when the
+/// backend says it was last written.
+///
+/// The modification time is the reason this type exists at all. `list` answers
+/// names, and a name cannot say whether an object is older than a deletion floor,
+/// so the unreferenced-object sweep had no way to tell a planted object from one
+/// uploaded ten minutes ago after a database restore rolled its reservation away.
+/// It is read from the listing rather than from one `head` per object because a
+/// listing already carries it: S3's `ListObjectsV2` returns `LastModified` on
+/// every entry, so the age costs no extra request and no extra billed operation.
+///
+/// `None` where the backend answered without one. Absent is never treated as old:
+/// a caller enforcing a floor keeps an object whose age it could not learn, since
+/// the failure mode of the other choice is a permanent deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobEntry {
+    pub name: String,
+    /// Unix milliseconds, as the backend reports them.
+    pub modified_ms: Option<u64>,
+}
+
 /// The contract. Both backends implement exactly this, and the contract suite in
 /// `tests/storage_contract.rs` runs the same assertions against both.
 ///
@@ -172,6 +193,17 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug {
         workspace: &str,
         group: &str,
     ) -> impl std::future::Future<Output = Result<Vec<String>, StorageError>> + Send;
+
+    /// The same listing, with each object's last-modified time beside its name.
+    ///
+    /// `list` is this without the times, and both exist because most callers want
+    /// a set of names while the unreferenced-object sweep needs an age floor it
+    /// can enforce without a `head` per object.
+    fn list_entries(
+        &self,
+        workspace: &str,
+        group: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<BlobEntry>, StorageError>> + Send;
 
     /// Concatenate `parts`, in the order given, into one object at `target`, and
     /// answer how many bytes it holds.
@@ -324,6 +356,24 @@ impl BlobStore for FilesystemStore {
         object_names(entries)
     }
 
+    async fn list_entries(
+        &self,
+        workspace: &str,
+        group: &str,
+    ) -> Result<Vec<BlobEntry>, StorageError> {
+        let directory = self.group_path(workspace, group);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(StorageError::ReadFailed {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        object_entries(entries)
+    }
+
     async fn assemble(&self, parts: &[BlobKey], target: &BlobKey) -> Result<u64, StorageError> {
         if parts.is_empty() {
             return Err(StorageError::InvalidKey {
@@ -468,6 +518,17 @@ impl Store {
         }
     }
 
+    pub async fn list_entries(
+        &self,
+        workspace: &str,
+        group: &str,
+    ) -> Result<Vec<BlobEntry>, StorageError> {
+        match self {
+            Self::Filesystem(store) => store.list_entries(workspace, group).await,
+            Self::S3(store) => store.list_entries(workspace, group).await,
+        }
+    }
+
     pub async fn assemble(&self, parts: &[BlobKey], target: &BlobKey) -> Result<u64, StorageError> {
         match self {
             Self::Filesystem(store) => store.assemble(parts, target).await,
@@ -510,6 +571,25 @@ pub async fn open(target: &crate::config::StorageTarget) -> Result<Store, Storag
     }
 }
 
+/// Put one local file into a bucket at a literal key.
+///
+/// Deliberately not a `Store` method and deliberately not routed through the
+/// configured target: the backup's `--out s3://bucket/key` may name a bucket
+/// that is not the storage bucket, and it is always an object key rather than a
+/// blob. What it does reuse is the only credential and endpoint chain the relay
+/// has, the ambient AWS one `S3Store::connect` reads, so no second credential
+/// path exists to configure or to get wrong.
+pub async fn put_object_file(
+    bucket: &str,
+    key: &str,
+    path: &std::path::Path,
+) -> Result<(), StorageError> {
+    S3Store::connect(bucket.to_string(), String::new())
+        .await
+        .put_file(key, path)
+        .await
+}
+
 /// Every object name in a directory listing, sorted, or the first read failure.
 ///
 /// Written over the iterator rather than inside ``FilesystemStore::list`` for the
@@ -530,6 +610,34 @@ pub fn object_names(
     // Sorted here rather than by the caller, because both backends promise a
     // sorted listing and `read_dir` order is whatever the filesystem felt like.
     out.sort();
+    Ok(out)
+}
+
+/// The same directory, as entries carrying each object's modification time.
+///
+/// A metadata call that fails leaves `modified_ms` at `None` rather than dropping
+/// the object from the listing: a caller enforcing an age floor keeps what it
+/// cannot date, and a caller that only wanted the name still gets it.
+pub fn object_entries(
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Result<Vec<BlobEntry>, StorageError> {
+    let mut out: Vec<BlobEntry> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| StorageError::ReadFailed {
+            reason: error.to_string(),
+        })?;
+        let modified_ms = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as u64);
+        let Some(name) = object_name(Ok(entry))? else {
+            continue;
+        };
+        out.push(BlobEntry { name, modified_ms });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 

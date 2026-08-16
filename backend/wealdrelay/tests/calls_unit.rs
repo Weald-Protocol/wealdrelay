@@ -596,6 +596,64 @@ async fn the_instance_refuses_a_call_past_its_configured_ceiling() {
         .expect("joining a call that is already open is not opening a call");
 }
 
+/// The negative proof for WEALD-340. The process-wide ceiling was the only bound in
+/// the module, so one admitted device sending `Offer` frames with fresh call ids
+/// held every slot on the instance for the life of its socket and every other
+/// workspace's calls were refused `TooManyCalls`. A quarter of the table is the
+/// share, the number and the reasoning being `health::admit_connection`'s.
+#[tokio::test]
+async fn one_connection_cannot_take_more_than_its_share_of_the_call_table() {
+    let registry = CallRegistry::new(8);
+    let (greedy, _s, _r) = peer(1);
+    let mut held = Vec::new();
+
+    // A quarter of eight is two, and both are honest calls.
+    for index in 0..2u8 {
+        let (_, sender, receiver) = peer(1);
+        registry
+            .join(&[index; CALL_ID_BYTES], &group(1), greedy, sender)
+            .await
+            .expect("inside the share");
+        held.push(receiver);
+    }
+
+    let (_, sender, _r) = peer(1);
+    let refusal = registry
+        .join(&[0x33; CALL_ID_BYTES], &group(1), greedy, sender)
+        .await
+        .expect_err("the third call from one connection is refused");
+    assert_eq!(refusal, JoinRefusal::TooManyCalls);
+    assert_eq!(registry.share_refused(), 1);
+
+    // The table is not full: six slots remain and another connection takes one, so
+    // the refusal above bounded one connection rather than the instance.
+    assert_eq!(registry.open_calls().await, 2);
+    let (other, other_send, _r) = peer(2);
+    registry
+        .join(&[0x44; CALL_ID_BYTES], &group(1), other, other_send)
+        .await
+        .expect("another connection is unaffected");
+
+    // A callee entering a call somebody else opened never spends the share, so a
+    // connection at its share can still be rung.
+    let (_, answer, _r) = peer(1);
+    registry
+        .join(&[0x44; CALL_ID_BYTES], &group(1), greedy, answer)
+        .await
+        .expect("joining an open call is not opening a call");
+    assert_eq!(registry.share_refused(), 1);
+
+    // And the share is released as calls end, not held for the life of the socket.
+    // Two are given up, because the answered call above counts against it too.
+    registry.leave(&[0u8; CALL_ID_BYTES], greedy).await;
+    registry.leave(&[1u8; CALL_ID_BYTES], greedy).await;
+    let (_, again, _r) = peer(1);
+    registry
+        .join(&[0x55; CALL_ID_BYTES], &group(1), greedy, again)
+        .await
+        .expect("a slot freed by leaving is spendable again");
+}
+
 #[tokio::test]
 async fn media_reaches_every_other_participant_and_never_the_sender() {
     let registry = CallRegistry::new(3);
@@ -748,7 +806,13 @@ async fn forgetting_a_connection_takes_it_out_of_every_call_at_once() {
     // What a dropped socket does. A registry that leaked a participant per lost
     // connection would fan media at senders nobody is reading, fifty times a
     // second, for the life of the process.
-    let registry = CallRegistry::new(4);
+    // Twelve rather than four, because one connection opens all three calls here
+    // and `CallRegistry::share` caps a single connection at a quarter of the
+    // table (WEALD-340): at four the share is one and this fixture refuses its
+    // own second call before it can prove anything about `forget`. The subject is
+    // what a dropped socket does, not the share, so the table is sized to let the
+    // fixture happen.
+    let registry = CallRegistry::new(12);
     let (ada, ada_send, _a) = peer(1);
     let (bo, bo_send, _b) = peer(2);
     for seed in 0..3u8 {

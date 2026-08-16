@@ -40,6 +40,11 @@ proptest! {
             Invocation::Version | Invocation::Help => {
                 prop_assert!(matches!(args[0].as_str(), "--version" | "-V" | "--help" | "-h"));
             }
+            // The one subcommand with arguments of its own. Either it read an
+            // `--out` or it refused with a message; it never guesses a path.
+            Invocation::Backup(_) | Invocation::BackupUsage(_) => {
+                prop_assert_eq!(args[0].as_str(), "backup");
+            }
         }
     }
 
@@ -95,6 +100,12 @@ proptest! {
                 // Every refusal names something. An empty message would leave the
                 // operator with an exit code and no next action.
                 prop_assert!(!outcome.stdout.is_empty() || !outcome.stderr.is_empty());
+            }
+            Startup::Backup { .. } => {
+                // Same configuration bar as serving: a backup reads the database
+                // and the store, so it cannot be reached on a partial one either.
+                prop_assert_eq!(args.first().map(String::as_str), Some("backup"));
+                prop_assert!(hostname.is_some() && database.is_some() && storage.is_some());
             }
         }
     }

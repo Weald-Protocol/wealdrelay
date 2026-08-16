@@ -325,6 +325,7 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0091` | `agent.invoke` | An explicit request that exactly one published agent act, emitted by the composer alongside the human-readable `chat.message` and never inferred from message text by a receiving client. A text mention is not execution authority. |
 | `0x0092` | `agent.lifecycle` | Convergent state for one `invocationID`: accepted, running, or one terminal record, signed by the executing host. Only terminal prose becomes a `chat.message`; progress is bounded metadata. |
 | `0x0093` | `agent.lease` | Manual host handoff and duplicate defence for a user-hosted agent. Never published by an organization agent, which has no second device and claims in its gateway's database instead. |
+| `0x00A0` | `ask` | One person asking one other person to look at one thing: a file, a ticket, a message, or an action awaiting sign-off. A request and its resolution are both this kind, distinguished by `replyTo` and a terminal `state`, so there is one codec and one authorization rule rather than two. Addressed to a single principal inside the group; the relay learns nothing from it that it does not already learn from any accepted envelope, and wakes an absent device with the `message` category. See `specs/asks.md`. |
 | `0x00F0` | `ephemeral` | **Reserved and never used.** Retired to the `LIVE` frame; see below. |
 
 Kind numbers are permanent. Unknown kinds are stored and ignored, so an old
@@ -363,6 +364,8 @@ The map, which was warned about for six steps and never written until step 31:
 | `agentInvoke` | 11 | `agent.invoke` | `0x0091` |
 | `agentLifecycle` | 12 | `agent.lifecycle` | `0x0092` |
 | `agentLease` | 13 | `agent.lease` | `0x0093` |
+| `mediaRef` | 14 | `media.ref` | `0x0030` |
+| `ask` | 15 | `ask` | `0x00A0` |
 
 `EnvelopeKind.protocolKind` is the same map in code, so a case added on the client
 without a decision about its protocol number does not compile. Where the two
@@ -517,6 +520,15 @@ would have to buffer and reprocess. A subscriber that cannot take its replay has
 its connection ended rather than downgraded: a downgraded client is told to
 reconcile, and there is no reconciliation for MLS state.
 
+The replay is read from the table a page at a time and drained to the socket before
+the next page is read. This is invisible on the wire, because every message is still
+sent in the same order, and it is not a truncation: what it bounds is how much of a
+group's commit history the relay holds in memory at once. Reading the log whole put
+all of it in the heap twice, once as rows and once as frames, at up to the frame
+ceiling each, for as long as the slowest member's socket took to drain it, which
+made one subscription on a long-lived group a memory lever. A commit appended while
+a replay is in flight lands in a later page.
+
 A resend after a dropped connection is answered with the sequence number the
 message already has, exactly as a duplicate `SEND` is answered with its existing
 `seq`. The relay stores and forwards these and can open none of them, which is the
@@ -558,6 +570,12 @@ the tables on every request rather than remembered from the handshake, because a
 session that answered from memory would be a relay serving one workspace's salt
 after that workspace stopped being its. Both the state query and the publication use
 it, and `genesis::consume` checks the same fact again before it destroys the key.
+
+For every other session the state query answers from the workspace the session was
+admitted to, never from the first requested group that resolves. Admission binds a
+session to the first named group that actually admits the device, so a client
+naming groups from two workspaces would otherwise be handed the salt and set head
+of one it is not in, and the salt is what every entry hash is keyed on.
 
 A `WRAP` is accepted only in `Ready`, only for a group the session's device is
 admitted to, and only when its epoch strictly advances the stored wrap in that
@@ -883,6 +901,13 @@ disconnects. An `ACCESS` frame that drops an entry causes the relay to close
 that device's open connections immediately and refuse new ones. Combined with
 the MLS epoch change that removes their read access to future content, offboarding
 becomes a single action with both halves enforced (`specs/backend/relay/lifecycle.md`).
+That guarantee holds against a rotation racing an admission: the relay reads the
+set, registers the socket with the eviction registry, and then reads the set
+again before acknowledging `AUTH`, so a publication that lands before the second
+read refuses the socket and one that lands after it finds the socket registered
+and closes it. Without the second read, a rotation committing between the first
+read and the registration evicted nothing and the revoked device kept a live
+authorized socket (WEALD-290).
 
 The stale-set failure mode is bounded on purpose: if no admit-holding device has
 published for 30 days the relay keeps serving the last valid set rather than
@@ -902,10 +927,16 @@ off is not the default.
 | `SEND` frames per device per minute | 6000, or `WEALD_RELAY_SEND_FRAMES_PER_MINUTE` | Abuse control without impeding agents. Per authenticated device key, which is the only identity the relay has, and not per connection, so reconnecting does not clear the allowance. Per-agent budgets are enforced in the app, since the relay cannot see an author (`specs/backend/relay/agents.md`). This row read 600 while nothing enforced it; the number rose when it became real, because 600 was written against a steady interactive stream and the traffic that actually arrives is a backlog flush. See "Sizing the `SEND` budget" below. Refused with `quota/rate_limited` on a socket that stays up. |
 | `SEND` bytes per device per minute | 64 MiB, or `WEALD_RELAY_SEND_BYTES_PER_MINUTE` | The workspace ingress figure below, applied per device, because the attack is one device rather than one workspace. At the 1 MiB `ct` ceiling it admits sixty-four maximum-size frames a minute and refuses a device writing 1 MiB frames at line rate. Far above the frame budget at realistic record sizes, so the frame count is what a legitimate client meets first. |
 | Groups per connection | 256 | Bounded server-side subscription state. |
+| `relay_group` rows per workspace | 8192 | An abuse ceiling, and deliberately not the product's policy bound. The policy figure is the 512 in `specs/backend/relay/channels.md`, it is sized against client MLS state, and it is enforced in the app where a channel can be told from a dm. The relay is blind: it sees opaque 32-byte ids, and `specs/backend/relay/private-messaging.md` allows 512 dm groups per workspace per device while calling that the per-device share of the same 512, so the two documented figures cannot both be a workspace total and a relay picking one would be arbitrating a policy question with no information. What this refuses is the case that has no legitimate reading: a device naming 256 fresh derived ids on every handshake, which grew the table without limit, with no expiry and no sweep. Enforced inside the insert rather than read and then trusted, so racing connections cannot both pass a check. A workspace at the ceiling stops gaining group rows, and keeps every row it has; the session is never refused, because an abuse ceiling that disconnects is an outage. |
 | Key packages per device | 100 outstanding | Prevents exhaustion. Published and fetched over `KEYS`, one-time delivery (`specs/backend/relay/private-messaging.md`). |
+| One key package | 128 KiB | Refused at publish, where a refusal costs nothing. The count cap alone does not bound a fetch: a shelf of individually legal packages would answer a maximum-count fetch with a frame over the frame ceiling, and by then the packages are consumed. The number is the frame ceiling divided by the 8-package fetch maximum, with the remainder left as headroom for framing. A fetch whose answer is never queued restores the rows it consumed, so an undelivered answer costs no packages either. |
 | `LIVE` `ct` | 4 KiB | A beat is tens of bytes. The cap stops the ephemeral path becoming an unlogged bulk channel. |
 | `LIVE` frames per connection per minute | 60 | Budgeted separately from the 600 envelope allowance, so presence can never starve a durable write. |
 | `KEYS` frames per connection per minute | 30 | A roster prefetch is a startup burst, not a stream. |
+| `JOIN` frames per connection per minute | 20 | The only budget charged before authentication, because `JOIN` is the only frame an unauthenticated peer may send. Every redemption costs at least a cooldown query and a salt read before the code is verified, so an unbudgeted `JOIN` is unauthenticated database amplification inside the handshake deadline. A real client sends one and waits for its reservation. Refused with `quota/rate_limited` on a socket that stays up. |
+| `HANDSHAKE` frames per connection per minute | 120 | The most expensive durable write in the protocol per frame, and the one nothing bounded: the arm deferred straight to the publish work, and the `SEND` device allowance is charged in the accept path only, so it never applied here. Each frame takes the group row for update, appends up to 512 KiB to a log nothing compacts and no retention sweep touches, and fans the whole message out to every subscriber, so an unbudgeted flood serialises every real committer in the group behind one row lock while growing a table the relay has no operation to shrink. A real client publishes one message per commit it makes, and bursts only when a bulk membership change commits once per group. Refused with `quota/rate_limited` before the work is deferred, so a refused frame takes no lock and writes no row, on a socket that stays up. |
+| `SUB` frames per connection per minute | 300 | Above the 256 groups a connection may hold, deliberately and with room to spare, because a cold start subscribes every group at once and a ceiling at the group limit would present as a network fault on the largest legitimate workspace. What it refuses is the other shape: a loop re-subscribing one group, where every frame costs an authorization query plus a replay of that group's log from `from_seq`. Refused with `quota/rate_limited` on a socket that stays up, before the subscription is recorded, so a refused frame reaches no database and leaves no session state. |
+| `RECON` frames per connection per minute | 600 | The most expensive frame in the protocol per byte, so the one an unbudgeted loop amplifies furthest: each round costs an authorization query, an item scan over the reconciliation window, an envelope read and a span reopen. It cannot be as tight as `LIVE` because reconciliation is iterative by design and a client catching up a large group drives many rounds, each cut to what its outbound queue will take. Ten a second is far above a client that holds one round outstanding per group and waits for the answer, and far below a peer beating on a timer. |
 | `MEDIA` `ct` | 1500 bytes | One Ethernet MTU, which is four hundred times a 20 ms AAC-ELD frame. It bounds an attacker rather than fitting a codec. |
 | `MEDIA` frames per stream per second | 60 | Against a codec producing fifty, so a client that jitters a frame across a window boundary is not punished and one at ten times the rate is. Refused with `quota/group_ingress_limited`, and the refusal is reported at most once a second because answering every frame of a flood is an amplifier (`calls.md`). |
 | `MEDIA` bytes per connection per minute | 1 MiB | A 24 kbps stream is about 190 KiB a minute including overhead, so this admits one stream comfortably and refuses a connection pushing a file down the media path. |

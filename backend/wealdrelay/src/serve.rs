@@ -30,6 +30,19 @@ pub enum ServeError {
     Storage(#[from] crate::storage::StorageError),
     #[error("cannot bind {address}: {reason}")]
     Bind { address: String, reason: String },
+    /// An accept loop ended while the process was meant to be serving.
+    ///
+    /// Distinct from `Bind` because the socket was opened and answering: this is
+    /// the listener dying under a running process, which is the case that used to
+    /// be silent. The private listener is the dangerous one, because nothing else
+    /// answers on the observability address, so `/readyz` stops responding while
+    /// the process stays up and would still exit zero on the next signal. Carried
+    /// out of `run` so `main` exits non-zero and a supervisor restarts.
+    #[error("the {listener} listener stopped while serving: {reason}")]
+    Listener {
+        listener: &'static str,
+        reason: String,
+    },
 }
 
 impl ServeError {
@@ -45,8 +58,7 @@ impl ServeError {
 pub async fn serve(config: Config) -> Result<(), ServeError> {
     let state = Arc::new(prepare(config).await?);
     let (public, private) = bind(&state).await?;
-    run(state, public, private, shutdown()).await;
-    Ok(())
+    run(state, public, private, shutdown()).await
 }
 
 /// Bind both listeners. Separate from ``run`` so a test can bind port zero and
@@ -182,7 +194,7 @@ pub async fn run(
     public: tokio::net::TcpListener,
     private: tokio::net::TcpListener,
     until: impl std::future::Future<Output = ()>,
-) {
+) -> Result<(), ServeError> {
     // Every field is computed into a local before the macro rather than written
     // inside it. This is the line an operator reads to learn which addresses the
     // relay bound and what posture it is enforcing, and as ordinary statements the
@@ -216,7 +228,7 @@ pub async fn run(
     // loses its socket mid-write either sees the acknowledgement or retries and is
     // answered with the same sequence number.
     let public_state = Arc::clone(&state);
-    let public_task = tokio::spawn(
+    let mut public_task = tokio::spawn(
         // With connection info, because the redeem path is rate limited per source
         // (`specs/backend/relay/invites.md`, "Rate limits") and a relay that could
         // not tell two sources apart would apply one budget to the whole internet.
@@ -228,7 +240,7 @@ pub async fn run(
         .into_future(),
     );
     let private_state = Arc::clone(&state);
-    let private_task = tokio::spawn(
+    let mut private_task = tokio::spawn(
         axum::serve(private, private_router(private_state).into_make_service()).into_future(),
     );
 
@@ -238,7 +250,36 @@ pub async fn run(
     // push is off, which is the default and a supported deployment.
     let push_worker = crate::push::spawn(&state);
 
-    until.await;
+    // The collector. Every sweep in the crate was written as a function for a
+    // "caller with a clock" to run, and until this line that caller did not exist:
+    // retention deletions never ran and the bytes behind an abandoned upload were
+    // charged to a workspace forever. Started here for the same reason the wake
+    // worker is, so that `prepare` and `--check-config` do not scan a database
+    // behind the operator's back. `None` without a database, which is what those
+    // paths have.
+    let collector = crate::janitor::spawn(&state);
+
+    // Selected over rather than dropped. Either accept loop can end on its own:
+    // `axum::serve` propagates a non-transient accept error out of its future, and
+    // a task whose result nobody reads ends silently. Before this select the
+    // process stayed up with a dead listener, `until` still pending, and returned
+    // success on the eventual signal, so a supervisor watching the exit code saw a
+    // healthy relay with no readiness endpoint. Now the first of the three to
+    // finish decides, and a listener finishing first is a failure whatever it
+    // carried, because the only legitimate end of an accept loop is the abort
+    // below.
+    let outcome = tokio::select! {
+        () = until => Ok(()),
+        result = &mut public_task => Err(listener_stopped("public", result)),
+        result = &mut private_task => Err(listener_stopped("private", result)),
+    };
+    let outcome = match outcome {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::error!(error = %error, "wealdrelay listener stopped while serving");
+            Err(error)
+        }
+    };
     public_task.abort();
     private_task.abort();
     if let Some(worker) = push_worker {
@@ -247,7 +288,34 @@ pub async fn run(
         // a wake still in the queue is one the client's reconciliation covers.
         worker.abort();
     }
+    if let Some(collector) = collector {
+        // Aborted rather than awaited, like the wake worker. A pass interrupted
+        // mid-flight has deleted whatever it had already confirmed deleted and
+        // recorded exactly that; nothing it holds is uncommitted, because every
+        // sweep commits per object rather than per pass, so the next process picks
+        // the remainder up on its first interval.
+        collector.abort();
+    }
     tracing::info!("wealdrelay stopped");
+    outcome
+}
+
+/// Turn a listener task that ended into the error `run` returns.
+///
+/// Three ways it can end and all three are the same failure to a supervisor: the
+/// accept loop returned an io error, it returned `Ok` (which for an accept loop
+/// means it stopped accepting), or the task itself panicked. What differs is only
+/// what the operator is told.
+fn listener_stopped(
+    listener: &'static str,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> ServeError {
+    let reason = match result {
+        Ok(Ok(())) => "the accept loop ended without an error".to_string(),
+        Ok(Err(error)) => error.to_string(),
+        Err(error) => format!("the accept task ended: {error}"),
+    };
+    ServeError::Listener { listener, reason }
 }
 
 /// Everything that has to work before a socket is opened.

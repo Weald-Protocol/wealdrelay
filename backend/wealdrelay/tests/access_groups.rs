@@ -296,7 +296,11 @@ async fn the_founding_publication_creates_the_workspaces_first_groups() {
                 &run.code.grouped(),
                 &[0x41; 16],
                 &device_hash,
-                b"source",
+                // Salted and hashed, as `ws.rs` does before it ever calls this.
+                // Migration 0012 re-keyed the attempt counter on (token, source)
+                // and constrains the source to 32 bytes, so a raw string here is
+                // refused by the database rather than counted against anyone.
+                &reserve::source_hash("203.0.113.7", &salt),
                 wall_clock_ms(),
             )
             .await
@@ -438,6 +442,87 @@ async fn a_write_that_cannot_run_is_reported_rather_than_counted() {
         .execute(pool)
         .await
         .expect("restore the group table");
+
+    scratch.drop_database().await;
+}
+
+/// A squatted group id does not decide which workspace a connection is judged in.
+///
+/// Group ids are client-derived and travel in invite `scopes`, so a member of one
+/// workspace can name an id another workspace is about to create, and the
+/// conflict-blind insert binds that row to the squatter. Resolving the connection
+/// from the first named group with a row then handed the squatter a second, larger
+/// win: the victim's own device, naming the squatted id alongside its own groups,
+/// resolved into the squatter's workspace, was not in that access set, and was
+/// refused for the entire session rather than for the one group.
+///
+/// So resolution prefers a named workspace that actually carries this device. The
+/// squatted row is still not moved, because an opaque 32-byte id carries no proof
+/// of who derived it and a blind relay cannot adjudicate that; the group stays
+/// refused, and the rest of the session works.
+#[tokio::test]
+async fn a_squatted_group_id_does_not_capture_the_victims_session() {
+    let (scratch, _blobs, state) = prepared("groups_squat").await;
+    let pool = pool_of(&state);
+    let victim_salt = store::salt(pool, WORKSPACE).await.unwrap();
+    store::salt(pool, OTHER).await.unwrap();
+
+    // The victim's own group, and the id the squatter got there first with. The
+    // squatted one is named first, which is the ordering the old resolution lost on.
+    let mine = vec![0x71; 32];
+    let squatted = vec![0x72; 32];
+    register(pool, WORKSPACE, &mine).await;
+    register(pool, OTHER, &squatted).await;
+
+    let member = key(4);
+    let set = sign(build(&victim_salt, &[], &[&member]), &member);
+    store::publish(pool, WORKSPACE, &set, &set.encode())
+        .await
+        .expect("the genesis set");
+
+    let verdict = store::admission(pool, &[squatted.clone(), mine.clone()], &pk(&member))
+        .await
+        .expect("a verdict");
+    match verdict {
+        store::Verdict::Admitted { workspace, .. } => assert_eq!(
+            workspace, WORKSPACE,
+            "a squatted id chose the workspace the victim was judged in"
+        ),
+        other => panic!("the victim was locked out of its own workspace: {other:?}"),
+    }
+
+    // And nothing was taken back either: the squatted row stays where it is, so the
+    // one group remains refused rather than silently rebound.
+    assert_eq!(
+        owner_of(pool, &squatted).await.as_deref(),
+        Some(OTHER),
+        "resolution rebound a group id it cannot prove ownership of"
+    );
+
+    scratch.drop_database().await;
+}
+
+/// WEALD-L161. `relay_group` rows exist before genesis on every provisioned relay,
+/// so a workspace resolved from a group id alone is a workspace anyone who knows
+/// that id can name. A `Bootstrap` verdict is one `ACCESS` frame away from being
+/// the workspace's trust root, so it belongs only to the device holding the live,
+/// unconsumed reservation on that workspace's bootstrap invite.
+#[tokio::test]
+async fn a_provisioned_group_with_no_set_does_not_bootstrap_a_stranger() {
+    let (scratch, _blobs, state) = prepared("groups_bootstrap_stranger").await;
+    let pool = pool_of(&state);
+    let provisioned = vec![0x71; 32];
+    register(pool, WORKSPACE, &provisioned).await;
+
+    // No access set for this workspace and no reservation for this device: the
+    // exact state of a freshly provisioned relay whose founder has not published.
+    assert_eq!(
+        store::admission(pool, std::slice::from_ref(&provisioned), &pk(&key(0x6c)))
+            .await
+            .expect("a verdict"),
+        store::Verdict::Refused,
+        "a stranger naming a provisioned group id was offered the trust root"
+    );
 
     scratch.drop_database().await;
 }

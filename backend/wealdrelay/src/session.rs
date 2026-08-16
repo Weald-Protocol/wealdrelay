@@ -88,7 +88,50 @@ pub const LIVE_FRAMES_PER_MINUTE: u32 = 60;
 /// startup burst rather than a stream.
 pub const KEYS_FRAMES_PER_MINUTE: u32 = 30;
 
-/// The window both per-connection frame budgets are counted over.
+/// `JOIN` frames one connection may send per minute.
+///
+/// The only pre-authentication frame, so the only budget that bounds a peer which
+/// has proved nothing. Every redemption costs at least a cooldown query and a salt
+/// read before `code::verify` is reached (`invite/reserve.rs`), so an unbudgeted
+/// `JOIN` is unauthenticated database amplification inside the handshake deadline.
+/// Well above a real client, which sends one and waits for the reservation, and far
+/// below a pipelined flood.
+pub const JOIN_FRAMES_PER_MINUTE: u32 = 20;
+
+/// `HANDSHAKE` frames one connection may send per minute.
+///
+/// The most expensive durable write in the protocol per frame: each one takes
+/// `relay_group ... for update`, inserts a row up to the 512 KiB handshake ceiling
+/// into a log nothing compacts, and fans the whole message out to every subscriber.
+/// So an unbudgeted `HANDSHAKE` is one admitted device serialising every real
+/// committer in the group behind a row lock while growing a log the relay has no
+/// operation to shrink. Set well above a real client, which publishes one message
+/// per commit it makes and bursts only when a bulk membership change commits once
+/// per group, and far below a peer pipelining maximum-size frames at line rate.
+pub const HANDSHAKE_FRAMES_PER_MINUTE: u32 = 120;
+
+/// `SUB` frames one connection may send per minute.
+///
+/// Above `MAX_GROUPS_PER_CONNECTION`, deliberately and with room to spare: a cold
+/// start subscribes every group it holds, so a ceiling at or below 256 would turn
+/// the largest legitimate workspace's first minute into a rate limit. What it
+/// refuses is the other shape, a loop re-subscribing one group, where every frame
+/// costs an `authorize_group` query plus a replay of the group's log from
+/// `from_seq`.
+pub const SUB_FRAMES_PER_MINUTE: u32 = 300;
+
+/// `RECON` frames one connection may send per minute.
+///
+/// The most expensive frame in the protocol per byte: each round runs
+/// `log::items`, `log::envelopes_for` and `reopen_omitted` over up to the whole
+/// window. It still cannot be as tight as `LIVE`, because reconciliation is
+/// iterative by design and a client catching a large group up drives many rounds,
+/// each cut to what the outbound queue will take (`sync.rs`). Ten a second is far
+/// above a request-and-response client that holds one round outstanding per group
+/// and far below a peer beating on a timer.
+pub const RECON_FRAMES_PER_MINUTE: u32 = 600;
+
+/// The window every per-connection frame budget is counted over.
 pub const FRAME_BUDGET_WINDOW_MS: u64 = 60_000;
 
 /// The most key packages a `KEYS::Fetch` may ask for at once. Higher is
@@ -314,6 +357,19 @@ pub struct Session {
     live: LiveMode,
     live_budget: FrameBudget,
     keys_budget: FrameBudget,
+    /// `HANDSHAKE` frames per minute, budgeted separately from `SEND`'s device
+    /// allowance because the two share no counter: `send_budget::charge` runs in
+    /// the `Work::Accept` arm only, so nothing bounded this path at all.
+    handshake_budget: FrameBudget,
+    /// `SUB` and `RECON` frames per minute, each budgeted separately from the
+    /// others and from each other. They are the two largest amplifiers on the
+    /// socket, a small frame against a query plus a replay, so an unbudgeted one
+    /// lets one admitted device starve every other member of the workspace.
+    sub_budget: FrameBudget,
+    recon_budget: FrameBudget,
+    /// `JOIN` frames per minute. The only budget charged before authentication,
+    /// and the only one an unauthenticated peer can spend.
+    join_budget: FrameBudget,
     /// Whether the call path is on at all, from `WEALD_RELAY_CALLS`.
     calls: CallMode,
     /// `CALL` signalling frames per minute, budgeted separately from `LIVE`,
@@ -351,6 +407,10 @@ impl Session {
             live: config.live,
             live_budget: FrameBudget::default(),
             keys_budget: FrameBudget::default(),
+            handshake_budget: FrameBudget::default(),
+            sub_budget: FrameBudget::default(),
+            recon_budget: FrameBudget::default(),
+            join_budget: FrameBudget::default(),
             calls: config.calls,
             call_budget: FrameBudget::default(),
             media_budget: crate::calls::MediaBudget::default(),
@@ -553,12 +613,29 @@ impl Session {
                             .detail((MAX_GROUPS_PER_CONNECTION as u64).to_be_bytes()),
                     )]);
                 }
+                // Charged before the subscription is recorded, so a refused frame
+                // changes no session state and reaches no database: the whole point
+                // of budgeting the frame is that the work behind it never starts.
+                if !self.sub_budget.charge(now_ms, SUB_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(SUB_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 if !self.subscribed.contains(&group) {
                     self.subscribed.push(group.clone());
                 }
                 Reaction::Defer(Work::Subscribe { group, from_seq })
             }
             (State::Ready, Frame::Recon { group, payload }) => {
+                if !self.recon_budget.charge(now_ms, RECON_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(RECON_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::Reconcile { group, payload })
             }
             // The one frame a bootstrapping session may send, and the reason that
@@ -585,7 +662,21 @@ impl Session {
             (
                 State::Fresh | State::Challenged | State::Ready | State::Bootstrapping,
                 Frame::Join { body },
-            ) => Reaction::Defer(Work::Redeem { body }),
+            ) => {
+                // Charged before the work is deferred, so a refused frame reaches no
+                // database at all. This is the one budget that bounds a peer which
+                // has authenticated nothing, and refusing the frame rather than the
+                // connection keeps a person mistyping a code on the socket they are
+                // already on.
+                if !self.join_budget.charge(now_ms, JOIN_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(JOIN_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
+                Reaction::Defer(Work::Redeem { body })
+            }
             // Ready only, like every other group-addressed frame: a handshake
             // message belongs to a group, and a bootstrapping session has no
             // workspace claim to check a group against.
@@ -598,6 +689,22 @@ impl Session {
                 Reaction::Defer(Work::AdministerInvite { body })
             }
             (State::Ready, Frame::Handshake { group, message, .. }) => {
+                // Charged before the work is deferred, so a refused frame reaches
+                // no database: it takes no row lock, appends no row and fans nothing
+                // out, which is the whole point of budgeting the frame rather than
+                // the write behind it. Refused on the frame only, like every other
+                // frame budget: the connection stays up and the client retries after
+                // the window.
+                if !self
+                    .handshake_budget
+                    .charge(now_ms, HANDSHAKE_FRAMES_PER_MINUTE)
+                {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(HANDSHAKE_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::PublishHandshake { group, message })
             }
             // Ready only. There is no pre-auth case: `JOIN` remains the one frame

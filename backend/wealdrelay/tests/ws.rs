@@ -431,12 +431,17 @@ async fn a_frame_set_from_a_future_version_aborts_the_connection() {
     let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(1)).await;
     let mut client = Client::connect(relay.address).await;
 
-    // Hand built, because `Frame::Connect` cannot carry a version this build does
-    // not speak: the decoder refuses it, which is the same rule from the other side.
+    // Below the floor, which is the only version failure there is. WEALD-300: a
+    // version *above* this build's ceiling is a newer client, not a broken one, and
+    // is served at the ceiling; that half is asserted in
+    // `a_client_from_a_newer_build_is_served_at_this_builds_ceiling` below.
+    //
+    // Hand built, because `Frame::Connect` cannot carry a version below the floor:
+    // the decoder refuses it, which is the same rule from the other side.
     let encoded = wealdrelay::cbor::array(&[
         wealdrelay::cbor::uint(u64::from(FrameTag::Connect as u16)),
         wealdrelay::cbor::array(&[
-            wealdrelay::cbor::uint(99),
+            wealdrelay::cbor::uint(0),
             wealdrelay::cbor::array(&[]),
             wealdrelay::cbor::uint(1),
         ]),
@@ -458,6 +463,38 @@ async fn a_frame_set_from_a_future_version_aborts_the_connection() {
         }
     }
     assert!(closed, "a version failure must abort the connection");
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_from_a_newer_build_is_served_at_this_builds_ceiling() {
+    // WEALD-300, through a real socket. `CONNECT` carries the client's maximum
+    // offer, so a client speaking a version this relay has never heard of is
+    // answered with this build's maximum and decides for itself whether that is
+    // enough. The decoder used to refuse the frame before the session saw it, which
+    // made the clamp unreachable and would have broken every future client release
+    // against every deployed relay.
+    let scratch = Scratch::new("newerversion").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(1)).await;
+    let mut client = Client::connect(relay.address).await;
+
+    client
+        .send_frame(&Frame::Connect {
+            version: PROTOCOL_VERSION + 1,
+            groups: Vec::new(),
+            sent_at: 1,
+        })
+        .await;
+    match client.recv_frame().await {
+        Frame::ConnectAck { version, .. } => assert_eq!(
+            version, PROTOCOL_VERSION,
+            "the relay must state its own ceiling as the selection"
+        ),
+        other => panic!("a newer client was refused: {other:?}"),
+    }
 
     relay.shutdown().await;
     scratch.drop_database().await;

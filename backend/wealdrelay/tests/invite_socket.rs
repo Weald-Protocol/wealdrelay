@@ -338,8 +338,7 @@ async fn five_wrong_codes_cool_the_tuple_down_and_the_right_one_still_answers_th
         other => panic!("expected the generic refusal, got {other:?}"),
     }
 
-    // And the invite is untouched, so a second device behind the same shared code
-    // joins on its first try.
+    // And the invite is untouched: nothing was burnt and no seat moved.
     let pool = relay.state.database.as_ref().unwrap().pool();
     assert_eq!(
         store::fetch(pool, &record.token)
@@ -349,6 +348,10 @@ async fn five_wrong_codes_cool_the_tuple_down_and_the_right_one_still_answers_th
             .remaining,
         8
     );
+    // A second device from the same source is refused too. The cooldown is keyed
+    // on the source precisely because the device value is whatever bytes the
+    // caller typed into its frame: a fresh device string must not buy a fresh
+    // five-guess allowance (WEALD-287).
     let mut other_device = connected(&relay).await;
     other_device
         .send_frame(&Frame::Join {
@@ -361,10 +364,10 @@ async fn five_wrong_codes_cool_the_tuple_down_and_the_right_one_still_answers_th
             .encode(),
         })
         .await;
-    assert!(matches!(
-        other_device.recv_frame().await,
-        Frame::Join { .. }
-    ));
+    match other_device.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, invite::UNAVAILABLE),
+        other => panic!("expected the generic refusal, got {other:?}"),
+    }
 
     relay.shutdown().await;
     scratch.drop_database().await;
@@ -1031,41 +1034,36 @@ async fn a_relay_with_no_database_at_all_says_come_back_rather_than_refusing_the
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_query_whose_genesis_lookup_fails_is_a_retry_and_not_a_refusal() {
     // The state query has two ways to resolve a workspace and this is what happens
-    // when the second one cannot run. A founding device asking for the salt is told
-    // to come back, not told its workspace is unknown: the difference is whether it
-    // waits or gives up on an enrolment that is perfectly valid.
+    // when the second one cannot run. A device asking for the salt is told to come
+    // back, not told its workspace is unknown: the difference is whether it waits
+    // or gives up on an enrolment that is perfectly valid.
+    //
+    // **Which session reaches the genesis lookup changed, and the test moved with
+    // it.** This used to drive a founding device on an enforcing relay, on the
+    // reasoning that a trust root has no groups and so must be resolved from its
+    // bootstrap reservation. Two things have since made that unreachable, both
+    // deliberately. A successful `reserve` now writes a provisional grant in the
+    // same transaction as the seat (`invite/reserve.rs`), so the founder is
+    // admitted as an ordinary member and its session carries a workspace; and
+    // `ws.rs report_access_state` answers from that admitted workspace and from
+    // nothing else, because resolving from the groups a client names is a
+    // cross-tenant oracle (BR-013). `store::state_of` cannot answer `None` for a
+    // workspace, so a bound session never falls through to genesis at all.
+    //
+    // What is left is the session that carries no workspace claim, which is
+    // `WEALD_RELAY_ACCESS_SET=off`, the one ci diagnostic mode `environments.md`
+    // permits. There the group-resolved form is still the first attempt, a group
+    // this relay does not know resolves nothing, and the genesis lookup is the
+    // second. That is the branch under test, and parking the table is still the
+    // only honest way to make it fail rather than answer.
     let scratch = Scratch::new("invite_socket_statefault").await;
     let blobs = tempfile::tempdir().unwrap();
-    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::System).await;
+    let mut config = config_for(&scratch, blobs.path());
+    config.access_set = wealdrelay::config::AccessSetMode::Off;
+    let relay = Running::start(config, Clock::System).await;
     let pool = relay.state.database.as_ref().unwrap().pool();
 
-    let wall = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let run = match wealdrelay::invite::genesis::ensure(pool, WORKSPACE, wall)
-        .await
-        .expect("mints")
-    {
-        wealdrelay::invite::genesis::Ensured::Minted(run) => run,
-        other => panic!("a fresh relay mints, got {other:?}"),
-    };
-
     let trust_root = SigningKey::from_bytes(&[0x31; 32]);
-    let mut joiner = connected(&relay).await;
-    joiner
-        .send_frame(&Frame::Join {
-            body: Request::Reserve {
-                token: run.token.clone(),
-                code: run.code.grouped(),
-                nonce: vec![0x41; 16],
-                device: trust_root.verifying_key().to_bytes().to_vec(),
-            }
-            .encode(),
-        })
-        .await;
-    assert!(matches!(joiner.recv_frame().await, Frame::Join { .. }));
-
     let mut founder = Client::connect(relay.address).await;
     founder
         .handshake_as(&trust_root, vec![vec![0x77; 32]], CLOCK)

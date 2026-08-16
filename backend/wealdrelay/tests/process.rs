@@ -85,17 +85,34 @@ async fn drop_database(name: &str) {
     }
 }
 
+/// The bearer the process suites configure, so the readiness detail is reachable.
+const OPERATOR: &str = "operator-bearer-for-the-process-suite";
+
 fn get(url: &str) -> Option<(u16, String)> {
+    request(url, None)
+}
+
+/// The same request, carrying the operator bearer.
+fn get_with_bearer(url: &str, bearer: &str) -> Option<(u16, String)> {
+    request(url, Some(bearer))
+}
+
+fn request(url: &str, bearer: Option<&str>) -> Option<(u16, String)> {
     use std::io::Write as _;
     let without_scheme = url.strip_prefix("http://")?;
     let (authority, path) = without_scheme.split_once('/')?;
     let mut stream =
         std::net::TcpStream::connect_timeout(&authority.parse().ok()?, Duration::from_millis(500))
             .ok()?;
+    let authorization = bearer.map_or(String::new(), |bearer| {
+        format!("Authorization: Bearer {bearer}\r\n")
+    });
     stream
         .write_all(
-            format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /{path} HTTP/1.1\r\nHost: {authority}\r\n{authorization}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .ok()?;
     let mut text = String::new();
@@ -151,6 +168,7 @@ async fn the_relay_serves_over_real_sockets_and_stops_on_sigterm() {
         )
         .env("WEALD_RELAY_ACCESS_SET", "enforce")
         .env("WEALD_RELAY_RELEASE_CHECK", "off")
+        .env("WEALD_RELAY_OPERATOR_TOKEN", OPERATOR)
         .current_dir(blobs.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -174,9 +192,24 @@ async fn the_relay_serves_over_real_sockets_and_stops_on_sigterm() {
         "the public listener must not serve readiness"
     );
 
-    // The private one answers the whole document, and it is truthful: this relay
-    // really does have a database and a directory.
+    // The private one answers a bare verdict without the operator bearer: the
+    // private listener is a network boundary and not an authentication boundary,
+    // so the detailed document (posture, counters, group id prefixes) is only for
+    // the caller holding the bearer (WEALD-295).
     let (status, body) = get(&format!("http://127.0.0.1:{private}/readyz")).expect("a response");
+    assert_eq!(status, 200, "{body}");
+    let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(verdict["ready"], true, "{body}");
+    assert_eq!(verdict["ok"], true, "{body}");
+    assert!(
+        verdict.get("access_set").is_none() && verdict.get("frozen_groups").is_none(),
+        "the unauthenticated verdict carried detail: {body}"
+    );
+
+    // With the bearer it answers the whole document, and it is truthful: this
+    // relay really does have a database and a directory.
+    let (status, body) = get_with_bearer(&format!("http://127.0.0.1:{private}/readyz"), OPERATOR)
+        .expect("a response");
     assert_eq!(status, 200, "{body}");
     let document: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(document["ready"], true, "{body}");

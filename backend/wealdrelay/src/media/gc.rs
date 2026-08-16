@@ -31,6 +31,28 @@ use crate::storage::{BlobKey, Store};
 /// upload with no accepted manifest claim is collected after 24 hours".
 pub const UNCLAIMED_GRACE_SECONDS: i64 = 24 * 60 * 60;
 
+/// Never delete an unreferenced object younger than this, whatever the database
+/// says about it.
+///
+/// Forty-eight hours, against a stated recovery-point objective of twelve
+/// (`specs/backend/cloud/backup-dr.md`). The sweep below decides that an object is
+/// garbage because this database holds no reservation for it, and a database
+/// restored to an earlier point holds no reservation for anything uploaded since:
+/// without a floor, the mechanism that exists to survive an incident hands the
+/// janitor a list of every object the restore was too old to know about, on a live
+/// bucket with no versioning and no object lock. Four times the RPO rather than
+/// twice, because the objective bounds how much a restore loses and not how long
+/// the restore takes, and the cost of being generous is that an object planted
+/// directly in the bucket survives an extra day.
+///
+/// Configurable, and configured from `WEALD_RELAY_GC_MIN_OBJECT_AGE_SECONDS`
+/// rather than from this constant at the call site: the relay cannot know the
+/// cadence the control plane captures at, so the control plane sets the floor on
+/// the instance's environment when it provisions, and this value is what a relay
+/// with nobody telling it anything uses. Zero is a legal setting and means no
+/// floor, which is the self-hoster who takes no backups at all.
+pub const DEFAULT_MIN_OBJECT_AGE_SECONDS: u64 = 48 * 60 * 60;
+
 /// The floor under every retention-driven deletion, regardless of policy.
 /// `media.md`: "The existing 30-day grace period remains a floor; a policy can
 /// lengthen it but never shorten it."
@@ -112,7 +134,10 @@ pub async fn sweep_unclaimed(
     let stale = match store::stale_unclaimed(pool, UNCLAIMED_GRACE_SECONDS).await {
         Ok(rows) => rows,
         Err(error) => {
-            report.note = format!("could not list stale reservations: {error}");
+            report.note = format!(
+                "could not list stale reservations: {}",
+                crate::logging::scrub(&error.to_string())
+            );
             log_run(pool, "unclaimed", started, started, &report).await;
             return report;
         }
@@ -146,23 +171,52 @@ pub async fn sweep_unclaimed(
 }
 
 /// Objects in storage with no reservation row at all: never went through `BLOB
-/// put`, so neither of the other two mechanisms can see them. Collected
-/// immediately, because a legitimate upload always has a reservation the moment
-/// its presigned URL was issued; an object with none is either a planted object
-/// or a bug, and neither should accumulate.
+/// put`, so neither of the other two mechanisms can see them. An object with no
+/// reservation is either a planted object or a bug, and neither should accumulate.
+///
+/// Two things hold it back, and both exist because "no row" is not only what a
+/// planted object looks like. It is also what every legitimate object uploaded
+/// after a restore point looks like the moment the database is rolled back to it.
+///
+/// - `min_age_seconds`: an object younger than the floor is never deleted here,
+///   and an object whose age the backend would not report is never deleted either.
+///   Absence of an age is not evidence of age.
+/// - The restore marker: while it is set, this sweep deletes nothing at all
+///   (`super::restore`), which covers a recovery point older than any floor.
+///
+/// Neither weakens the guarantee the pass carries, because it carries none: the
+/// two passes that implement product promises are the 24-hour unclaimed grace and
+/// retention, and this one is a reconcile against bookkeeping that is supposed to
+/// already be correct.
 pub async fn sweep_unreferenced_storage(
     pool: &PgPool,
     storage: &Store,
     workspace: &str,
     group: &[u8],
     now_ms: u64,
+    min_age_seconds: u64,
 ) -> Report {
     let started = now_ms;
     let mut report = Report::default();
-    let listed = match storage.list(workspace, &super::hex(group)).await {
+    // Checked, never counted down. `crate::janitor` spends one pass of the marker
+    // per collector pass; this sweep runs once per (workspace, group) inside that
+    // pass, so counting down here would burn the whole marker on one interval of a
+    // twenty-group workspace.
+    if super::restore::suppressed(pool).await {
+        report.note = "suppressed: a restore marker is set".to_string();
+        tracing::info!(
+            "media: the storage-listing sweep is suppressed by the restore marker and deleted nothing"
+        );
+        log_run(pool, "unreferenced_storage", started, started, &report).await;
+        return report;
+    }
+    let listed = match storage.list_entries(workspace, &super::hex(group)).await {
         Ok(names) => names,
         Err(error) => {
-            report.note = format!("could not list storage: {error}");
+            report.note = format!(
+                "could not list storage: {}",
+                crate::logging::scrub(&error.to_string())
+            );
             log_run(pool, "unreferenced_storage", started, started, &report).await;
             return report;
         }
@@ -173,15 +227,37 @@ pub async fn sweep_unreferenced_storage(
             .map(|h| super::hex(&h))
             .collect::<Vec<_>>(),
         Err(error) => {
-            report.note = format!("could not list known reservations: {error}");
+            report.note = format!(
+                "could not list known reservations: {}",
+                crate::logging::scrub(&error.to_string())
+            );
             log_run(pool, "unreferenced_storage", started, started, &report).await;
             return report;
         }
     };
-    for name in listed {
+    let floor_ms = min_age_seconds.saturating_mul(1000);
+    let mut too_young = 0u32;
+    for entry in listed {
+        let name = entry.name;
         report.examined += 1;
         if known.contains(&name) {
             continue;
+        }
+        // Younger than the floor, or of an age the backend would not state. Both
+        // are kept: the object is either a legitimate upload whose row a restore
+        // rolled away, or one whose age nothing here can vouch for, and a
+        // permanent deletion is not a decision to take on either.
+        if floor_ms > 0 {
+            let age_ms = entry
+                .modified_ms
+                .map(|modified| now_ms.saturating_sub(modified));
+            match age_ms {
+                Some(age) if age >= floor_ms => {}
+                _ => {
+                    too_young += 1;
+                    continue;
+                }
+            }
         }
         let Ok(key) = BlobKey::new(workspace, super::hex(group), name.clone()) else {
             continue;
@@ -191,6 +267,12 @@ pub async fn sweep_unreferenced_storage(
             report.deleted += 1;
             report.deleted_bytes += size.unwrap_or(0) as i64;
         }
+    }
+    if too_young > 0 {
+        report.note = format!(
+            "{too_young} unreferenced object(s) kept: younger than the {min_age_seconds}s age floor, \
+             or of an age the backend did not state"
+        );
     }
     let finished = now_ms;
     log_run(pool, "unreferenced_storage", started, finished, &report).await;
@@ -290,11 +372,15 @@ pub async fn sweep_retention(
     let finalized = match store::finalized_reservations(pool, workspace, group).await {
         Ok(rows) => rows,
         Err(error) => {
-            report.note = format!("could not list finalized reservations: {error}");
+            report.note = format!(
+                "could not list finalized reservations: {}",
+                crate::logging::scrub(&error.to_string())
+            );
             log_run(pool, "retention", started, started, &report).await;
             return report;
         }
     };
+    let mut stranded = 0u32;
     for row in finalized {
         report.examined += 1;
         let verdict =
@@ -315,13 +401,38 @@ pub async fn sweep_retention(
         if clear_object(storage, &key).await == Cleared::Kept {
             continue;
         }
-        if store::finish_deletion(pool, workspace, row.reservation_id)
-            .await
-            .is_ok()
-        {
-            report.deleted += 1;
-            report.deleted_bytes += row.bytes;
+        // The object is already gone by here, so a failed row delete is not a
+        // no-op: it leaves a finalized row attesting to an object that no longer
+        // exists, with its bytes still charged to the workspace and no pass that
+        // ever comes back for it. `is_ok()` alone made that invisible, reporting
+        // `deleted: 0` with an empty note and no log line, so the one state an
+        // operator needs to see looked exactly like a sweep with nothing to do
+        // (WEALD-318). `reserve` now retires such a row when the object is
+        // re-uploaded, which is a repair on a path that may never be taken, so the
+        // failure is still worth saying out loud.
+        match store::finish_deletion(pool, workspace, row.reservation_id).await {
+            Ok(()) => {
+                report.deleted += 1;
+                report.deleted_bytes += row.bytes;
+            }
+            Err(error) => {
+                stranded += 1;
+                tracing::warn!(
+                    %error,
+                    bytes = row.bytes,
+                    "media: the object was deleted but its reservation row survives, bytes stay charged"
+                );
+            }
         }
+    }
+    if stranded > 0 {
+        // Appended rather than assigned: every other note in this module is a
+        // whole-pass failure that returns immediately, and this one is a count of
+        // rows inside a pass that otherwise succeeded.
+        report.note = format!(
+            "{stranded} object(s) deleted whose reservation row could not be removed; \
+             their bytes remain charged"
+        );
     }
     let finished = now_ms;
     log_run(pool, "retention", started, finished, &report).await;

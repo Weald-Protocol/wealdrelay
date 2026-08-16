@@ -100,6 +100,51 @@ async fn a_replayed_wrap_cannot_put_a_dead_epoch_back_into_a_live_slot() {
 }
 
 #[tokio::test]
+async fn a_refused_wrap_leaves_both_slots_exactly_as_it_found_them() {
+    let (scratch, _blobs, state) = prepared("recovery_refused_no_write").await;
+    let pool = pool_of(&state);
+    let group = make_group(&state, 0x51).await;
+    let tag = vec![0xB2; 32];
+
+    store::publish(pool, &wrap(&group, 0xB2, 2, b"two"))
+        .await
+        .expect("create");
+    store::publish(pool, &wrap(&group, 0xB2, 3, b"three"))
+        .await
+        .expect("replace");
+
+    // The refusal has to be a whole refusal. `publish` writes the superseded value
+    // into the prior slot before it overwrites the current one, so a refused
+    // replacement that had already reached that write would move the prior slot
+    // without moving the current one, and a recovery reading the overlap window
+    // would be handed a wrap it cannot open. Nothing here asserts the refusal
+    // itself; the two tests above do that. This asserts that neither table moved.
+    let refused = store::publish(pool, &wrap(&group, 0xB2, 3, b"sideways")).await;
+    assert!(matches!(refused, Err(StoreError::Refused(_))));
+    let older = store::publish(pool, &wrap(&group, 0xB2, 1, b"one")).await;
+    assert!(matches!(older, Err(StoreError::Refused(_))));
+
+    let current = store::current(pool, &group, &tag)
+        .await
+        .expect("read")
+        .expect("a wrap");
+    assert_eq!(current.epoch, 3);
+    assert_eq!(current.ct, b"three".to_vec());
+    let prior = store::prior(pool, &group, &tag)
+        .await
+        .expect("read prior")
+        .expect("the superseded wrap");
+    assert_eq!(prior.epoch, 2, "a refused publish moved the prior slot");
+    assert_eq!(prior.ct, b"two".to_vec());
+    let count: i64 = sqlx::query_scalar("select count(*) from relay_recovery_wrap_prior")
+        .fetch_one(pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1, "a refused publish added a prior row");
+    scratch.drop_database().await;
+}
+
+#[tokio::test]
 async fn a_tag_cannot_be_shared_by_two_groups() {
     let (scratch, _blobs, state) = prepared("recovery_cross_group").await;
     let pool = pool_of(&state);

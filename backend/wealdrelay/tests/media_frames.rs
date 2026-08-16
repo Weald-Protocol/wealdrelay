@@ -920,6 +920,98 @@ async fn the_retention_chain_is_driven_entirely_through_blob_frames() {
     harness.finish().await;
 }
 
+/// WEALD-308. The claim is where declared bytes become charged bytes, so it is
+/// where an under-declared upload has to be caught: reserve one byte, write a
+/// megabyte, and without the measurement the workspace is charged one byte for
+/// it forever while `WEALD_RELAY_MAX_STORAGE_GB` never binds.
+#[tokio::test]
+async fn a_manifest_claiming_an_object_larger_than_it_declared_is_refused() {
+    let harness = Harness::new("frames_underdeclared").await;
+    let ada = device_from(0x71);
+    let group = harness.group(0x58, std::slice::from_ref(&ada)).await;
+    let session = harness.session();
+    let epoch = verifier_key(0x22);
+    assert!(matches!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::RetentionControl(signed_control(&group, 0, &epoch, None, &epoch))
+                )
+                .await
+        ),
+        Response::RetentionAck { .. }
+    ));
+
+    let hash = blob_hash(0xc2);
+    assert!(matches!(
+        response(&harness.ask(&session, &put(&group, &hash, 1)).await),
+        Response::Upload { .. }
+    ));
+    // The client uploads a megabyte against its one byte reservation.
+    harness
+        .storage()
+        .put(&key(WS, &group, &hash), &vec![7u8; 1_000_000])
+        .await
+        .unwrap();
+
+    let manifest = signed_manifest(&group, 0, 1, None, vec![hash.clone()], &epoch);
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(&session, &Request::RetentionManifest(manifest.clone()))
+                .await
+        ),
+        ErrorCode::HashMismatch
+    );
+    let usage = store::usage(harness.pool(), WS).await.unwrap();
+    assert_eq!(
+        usage.stored_bytes, 0,
+        "a refused claim charges nothing to stored bytes"
+    );
+    assert_eq!(
+        usage.reserved_bytes, 1,
+        "and leaves the reservation exactly as it was, for the sweep to release"
+    );
+
+    // An honest object of the declared size is claimed as it always was, and the
+    // manifest sequence is undisturbed by the refusal above.
+    let honest = blob_hash(0xc3);
+    assert!(matches!(
+        response(&harness.ask(&session, &put(&group, &honest, 64)).await),
+        Response::Upload { .. }
+    ));
+    harness
+        .storage()
+        .put(&key(WS, &group, &honest), &[9u8; 64])
+        .await
+        .unwrap();
+    assert!(matches!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::RetentionManifest(signed_manifest(
+                        &group,
+                        0,
+                        1,
+                        None,
+                        vec![honest.clone()],
+                        &epoch
+                    ))
+                )
+                .await
+        ),
+        Response::RetentionAck { .. }
+    ));
+    assert_eq!(
+        store::usage(harness.pool(), WS).await.unwrap().stored_bytes,
+        64
+    );
+
+    harness.finish().await;
+}
+
 /// The freeze, over the wire: a conflicting control is answered `group_frozen`
 /// rather than accepted, and the group stops garbage-collecting until a client
 /// resolves it.
@@ -1396,6 +1488,52 @@ async fn a_multipart_session_runs_from_open_to_finalized_over_frames() {
         "finalizing the transfer does not finalize the reservation: only a manifest claim does"
     );
 
+    // WEALD-L148. An abort after a successful completion is refused. The
+    // reservation is still unfinalized at this point, so releasing it would hand
+    // back quota for bytes that are in the bucket and, because the GC's known set
+    // is built from reservation rows, would make the assembled object
+    // unreferenced and sweepable at once.
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartAbort {
+                        session_id: session_id.clone()
+                    }
+                )
+                .await
+        ),
+        ErrorCode::MalformedHeader
+    );
+    assert_eq!(
+        store::usage(harness.pool(), WS)
+            .await
+            .unwrap()
+            .reserved_bytes,
+        total as i64,
+        "an abort after completion must not release the reservation"
+    );
+    let reservations: i64 = sqlx::query_scalar(
+        "select count(*) from relay_blob_reservation where workspace_id = $1 and blob_hash = $2",
+    )
+    .bind(WS)
+    .bind(hash.as_slice())
+    .fetch_one(harness.pool())
+    .await
+    .unwrap();
+    assert_eq!(reservations, 1, "the reservation row survives the abort");
+    assert_eq!(
+        harness
+            .storage()
+            .get(&key(WS, &group, &hash))
+            .await
+            .unwrap()
+            .len() as u64,
+        total,
+        "and the assembled object is still there"
+    );
+
     // And a part cannot be added to a session that is already finished.
     assert_eq!(
         error_code(
@@ -1490,6 +1628,191 @@ async fn an_aborted_session_gives_its_quota_back_and_accepts_nothing_further() {
                 .await
         ),
         ErrorCode::MalformedHeader
+    );
+
+    harness.finish().await;
+}
+
+/// WEALD-293. Four ways one multipart session used to be free storage: a part
+/// number past the session's own part count, a part longer than the part size,
+/// a completion listing a part twice or listing one that was never issued, and
+/// an abort that returned the quota while leaving every part object in the
+/// bucket.
+#[tokio::test]
+async fn a_multipart_session_owns_a_bounded_set_of_parts_and_takes_them_with_it() {
+    let harness = Harness::new("frames_multipart_bounds").await;
+    let group = harness.group(0x56, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let total = media::SINGLE_PART_MAX_BYTES + 16;
+
+    let session_id = match response(
+        &harness
+            .ask(&session, &put(&group, &blob_hash(0xd3), total))
+            .await,
+    ) {
+        Response::Multipart { session_id, .. } => session_id,
+        other => panic!("{other:?}"),
+    };
+    let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
+    let part = |number: u32, expected_len: u64| Request::MultipartPart {
+        session_id: session_id.clone(),
+        part_number: number,
+        expected_len,
+    };
+
+    // The session covers two parts, so the third is not a part of it, and
+    // neither is anything a `u32` can hold. Refused as too large rather than as
+    // malformed: the frame is well formed, the number is out of range.
+    assert_eq!(
+        error_code(&harness.ask(&session, &part(3, 16)).await),
+        ErrorCode::EnvelopeTooLarge
+    );
+    assert_eq!(
+        error_code(&harness.ask(&session, &part(u32::MAX, 16)).await),
+        ErrorCode::EnvelopeTooLarge
+    );
+    // Nor can one in-range part be longer than the part size the session was
+    // opened with.
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(&session, &part(1, media::MULTIPART_PART_SIZE + 1))
+                .await
+        ),
+        ErrorCode::EnvelopeTooLarge
+    );
+    // None of the three left a row behind, so none of them can be completed
+    // against later.
+    assert_eq!(
+        store::recorded_parts(harness.pool(), uuid).await.unwrap(),
+        Vec::<i32>::new()
+    );
+
+    // Two real parts, uploaded through the store the presigned URLs point at.
+    let lengths = [media::MULTIPART_PART_SIZE, 16];
+    for (index, length) in lengths.iter().enumerate() {
+        let number = index as u32 + 1;
+        assert!(matches!(
+            response(&harness.ask(&session, &part(number, *length)).await),
+            Response::MultipartPartUpload { .. }
+        ));
+        harness
+            .storage()
+            .put(
+                &media::part_key_for(uuid, number as i32),
+                &vec![index as u8; *length as usize],
+            )
+            .await
+            .unwrap();
+    }
+
+    // A completion that names part 1 twice would assemble it twice and still add
+    // up to the reserved total, and a completion naming a part never issued
+    // names an object of some other session.
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartComplete {
+                        session_id: session_id.clone(),
+                        parts: vec![(1, b"a".to_vec()), (1, b"b".to_vec())],
+                    }
+                )
+                .await
+        ),
+        ErrorCode::MalformedHeader
+    );
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartComplete {
+                        session_id: session_id.clone(),
+                        parts: vec![(1, b"a".to_vec()), (9, b"b".to_vec())],
+                    }
+                )
+                .await
+        ),
+        ErrorCode::MalformedHeader
+    );
+
+    // The abort returns the bytes and takes the part objects with it, so the
+    // quota and the bucket agree afterwards.
+    assert_eq!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartAbort {
+                        session_id: session_id.clone()
+                    }
+                )
+                .await
+        ),
+        Response::MultipartAborted
+    );
+    assert_eq!(
+        store::usage(harness.pool(), WS)
+            .await
+            .unwrap()
+            .reserved_bytes,
+        0
+    );
+    assert!(
+        harness
+            .storage()
+            .list("_multipart", &uuid.simple().to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "an abort that frees the quota must not leave the parts in the bucket"
+    );
+    // And a second abort is the same answer, against nothing left to delete.
+    assert_eq!(
+        response(
+            &harness
+                .ask(&session, &Request::MultipartAbort { session_id })
+                .await
+        ),
+        Response::MultipartAborted
+    );
+
+    harness.finish().await;
+}
+
+/// WEALD-293. Every other blob frame is charged against the per-device budget;
+/// an uncharged `MULTIPART part` is a free loop that mints one presigned 64 MiB
+/// upload URL per iteration.
+#[tokio::test]
+async fn a_multipart_part_is_charged_against_the_request_budget() {
+    let harness = Harness::new("frames_multipart_rate").await;
+    let group = harness.group(0x57, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let total = media::SINGLE_PART_MAX_BYTES + 16;
+
+    let session_id = match response(
+        &harness
+            .ask(&session, &put(&group, &blob_hash(0xd4), total))
+            .await,
+    ) {
+        Response::Multipart { session_id, .. } => session_id,
+        other => panic!("{other:?}"),
+    };
+    let ask = Request::MultipartPart {
+        session_id,
+        part_number: 1,
+        expected_len: 16,
+    };
+    let rate = RateLimiter::new(1, 5_000_000_000);
+    assert!(matches!(
+        response(&harness.ask_with(&session, &rate, &ask).await),
+        Response::MultipartPartUpload { .. }
+    ));
+    assert_eq!(
+        error_code(&harness.ask_with(&session, &rate, &ask).await),
+        ErrorCode::RateLimited
     );
 
     harness.finish().await;

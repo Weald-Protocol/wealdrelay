@@ -209,29 +209,60 @@ pub async fn envelopes_for(
         .collect())
 }
 
-/// Envelopes at or after a cursor, ascending, bounded by ``MAX_BACKFILL``.
+/// Envelopes at or after a cursor, ascending, bounded by what the caller can
+/// actually send and never by more than ``MAX_BACKFILL`` rows.
 ///
 /// Ascending because a client applying a backfill wants the oldest first: its
 /// author-chain check is cheaper when links arrive in the order they were written,
 /// even though the CRDT layer above does not care.
-pub async fn since(pool: &PgPool, group: &[u8], from_seq: u64) -> Result<Vec<Vec<u8>>, LogError> {
-    let rows = sqlx::query(
+///
+/// `max_rows` and `max_bytes` are the caller's outbound allowance, and they are
+/// the residency bound: peak bytes held here are `max_bytes` plus the one envelope
+/// that crosses it, which for `sync::subscribe` is `ws::SEND_QUEUE_BYTE_BUDGET`
+/// plus one frame. Reading to `MAX_BACKFILL` instead put up to 4096 rows of
+/// ciphertext in the heap twice, once as the driver's rows and once as the encoded
+/// frames, to send at most a few megabytes of it. Streamed for the same reason
+/// `items` is: the driver's own row buffer is not a second copy of the set alive
+/// beside the one being built.
+///
+/// The envelope that crosses `max_bytes` is kept rather than dropped, because the
+/// caller's own byte filter always takes at least one item and counts frame
+/// overhead on top of these bytes: reading one past the line is what makes this
+/// read produce exactly the batch the unbounded read produced.
+pub async fn since(
+    pool: &PgPool,
+    group: &[u8],
+    from_seq: u64,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<u8>>, LogError> {
+    let limit = i64::try_from(max_rows)
+        .unwrap_or(MAX_BACKFILL)
+        .min(MAX_BACKFILL);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut rows = sqlx::query(
         "select v, enc, epoch, seq, ts, ct, hash from relay_envelope \
          where group_id = $1 and seq >= $2 order by seq asc limit $3",
     )
     .bind(group)
     .bind(i64::try_from(from_seq).unwrap_or(i64::MAX))
-    .bind(MAX_BACKFILL)
-    .fetch_all(pool)
-    .await
-    .map_err(log_error)?;
-    Ok(rows
-        .iter()
-        .map(|row| {
-            let hash: Vec<u8> = row.get("hash");
-            encode_row(row, group, &hash)
-        })
-        .collect())
+    .bind(limit)
+    .fetch(pool);
+
+    let mut envelopes: Vec<Vec<u8>> = Vec::new();
+    let mut spent = 0usize;
+    while let Some(row) = rows.try_next().await.map_err(log_error)? {
+        let hash: Vec<u8> = row.get("hash");
+        let encoded = encode_row(&row, group, &hash);
+        spent = spent.saturating_add(encoded.len());
+        envelopes.push(encoded);
+        if spent > max_bytes {
+            break;
+        }
+    }
+    Ok(envelopes)
 }
 
 /// One row, as the envelope bytes the wire carries.

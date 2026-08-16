@@ -126,6 +126,24 @@ a new name.
 so an operator can see the ceiling binding rather than infer it from a support
 ticket.
 
+A slot taken before the upgrade is released on **every** path out of it. The
+ordinary path is the reader loop ending; the other is an upgrade that never
+completes, because the peer reset the TCP connection after its request was
+admitted and before the 101 landed. The upgrade registers a failed-upgrade
+handler that releases the slot and the pre-authentication source share, since
+the connection handler never runs on that path; without it, each aborted
+upgrade leaked a slot permanently and `WEALD_RELAY_MAX_CONNECTIONS` aborts took
+the relay offline with no authentication and no payload bytes (WEALD-291).
+
+The transport also carries its own message ceiling: the upgrade sets
+`max_message_size` and `max_frame_size` to `MAX_FRAME_BYTES` plus a small
+allowance. The frame-length check in the reader runs only after the WebSocket
+layer has reassembled a whole message, so without the transport bound an
+unauthenticated peer could hold 64 MiB (the library default) per connection on
+the read side, eight times the send-queue byte budget the sizing table assumes.
+An oversized message is refused before it is allocated, and a maximal legal
+frame still fits under the ceiling (WEALD-292).
+
 ### Connection deadlines
 
 A slot is taken at the upgrade and given back when the reader loop ends, so
@@ -184,6 +202,48 @@ Everything else requires a key in the access set. An attacker who holds one can
 consume bandwidth and quota and can read nothing, which is stated in
 `specs/backend/relay/auth.md` and is why the limits above are sized for cost
 control rather than for confidentiality.
+
+### Which address "per-IP" means
+
+Every bound in the table above is per source, and the source is a deployment
+fact rather than a transport fact. The relay is reached through a reverse proxy
+in the supported Compose bundle (Caddy terminates TLS in front of it) and in
+every provider deployment (the provider's edge does), so the transport peer the
+socket reports is the proxy's address and is the same for every public client.
+Read that way, one bucket covers the whole internet: an attacker's real address
+isolates it from nothing, and an ordinary morning of concurrent onboarding
+behind one edge cools down and caps unrelated users. That is what
+`WEALD_RELAY_TRUSTED_PROXY_HOPS` exists to fix, and it is the only input to the
+question.
+
+The key is a count of proxies, each of which appends the address it received the
+request from to `X-Forwarded-For`. Zero, the default, means the relay is reached
+directly: the transport peer is the client and forwarding headers are not read
+at all. A number `n` means `n` proxies this operator runs each appended one
+entry on the way in, the innermost naming the client rather than itself, so the
+client sits at index `len - n` and a chain of exactly `n` entries is the well
+formed case. `X-Forwarded-For` only; no supported deployment emits RFC 7239
+`Forwarded`, and a second parser covering nothing is a second parser to get
+wrong.
+
+Two rules carry the whole property, and both are about counting from the right:
+
+- **The leftmost entry is never the client when the chain runs long.** A proxy appends what it saw
+  without deleting what arrived, so in every deployment the left of the chain is
+  attacker-controlled. Reading position zero would let any client behind the
+  edge mint itself unlimited buckets by prepending addresses, which is strictly
+  worse than the shared bucket it replaced.
+- **A chain shorter than the declared hops is refused**, with `400`, rather than
+  resolved. The two available fallbacks are both failures: the transport peer
+  restores the shared bucket, and the leftmost entry trusts a value the client
+  wrote. A relay told it has proxies in front of it and reached without them has
+  been reached in a way the operator did not describe, and the honest answer is
+  to say so.
+
+A direct relay ignoring the header is the same rule seen from the other side. It
+is why the default is safe on a laptop and why the key is required in
+production: the value is a statement about the network, and the relay cannot
+discover it.
 
 ### The inbound budget on `SEND`
 

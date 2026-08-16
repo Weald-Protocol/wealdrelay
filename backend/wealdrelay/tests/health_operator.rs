@@ -70,8 +70,17 @@ async fn ask(
     state: &Arc<RelayState>,
     authorization: Option<&str>,
 ) -> (axum::http::StatusCode, String) {
+    ask_at(state, "/admitted", authorization).await
+}
+
+/// The same, at a path of the caller's choosing.
+async fn ask_at(
+    state: &Arc<RelayState>,
+    uri: &str,
+    authorization: Option<&str>,
+) -> (axum::http::StatusCode, String) {
     use tower::ServiceExt as _;
-    let mut request = axum::http::Request::builder().uri("/admitted");
+    let mut request = axum::http::Request::builder().uri(uri);
     if let Some(value) = authorization {
         request = request.header(axum::http::header::AUTHORIZATION, value);
     }
@@ -153,6 +162,97 @@ async fn a_relay_with_the_bearer_and_no_database_answers_unavailable_and_not_zer
     assert!(
         !body.contains('0'),
         "an unavailable answer carried a count: {body}"
+    );
+}
+
+// MARK: `/readyz` and what each caller is allowed to see (WEALD-295)
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unauthenticated_readyz_carries_the_verdict_and_nothing_derived_from_a_group() {
+    use sqlx::Executor as _;
+
+    let scratch = Scratch::new("readyz_bare").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(
+        config_with_operator(&scratch, blobs.path()),
+        Clock::Fixed(1),
+    )
+    .await;
+    let pool = relay
+        .state
+        .database
+        .as_ref()
+        .expect("a database")
+        .pool()
+        .clone();
+
+    // A frozen group, which is the one value on the full document that is derived
+    // from a group id and is exactly what the unauthenticated body must not carry.
+    // The workspace is minted the way the access path mints one.
+    let group: Vec<u8> = vec![0xab; 32];
+    wealdrelay::access::store::salt(&pool, "ws-readyz")
+        .await
+        .expect("mint the workspace");
+    pool.execute(
+        sqlx::query(
+            "insert into relay_group (group_id, workspace_id, frozen_reason) \
+             values ($1, 'ws-readyz', 'contested')",
+        )
+        .bind(&group),
+    )
+    .await
+    .expect("freeze a group");
+    let prefix = &wealdrelay::logging::hex_prefix(&group);
+
+    // Unauthenticated: the verdict, truthfully 503 (a frozen group is not ready),
+    // and no value derived from a group id anywhere in the body.
+    let (status, body) = ask_at(&relay.state, "/readyz", None).await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !body.contains(prefix) && !body.contains("frozen"),
+        "the unauthenticated body leaked a group handle: {body}"
+    );
+    let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(verdict["ready"], false);
+    assert_eq!(verdict["ok"], false);
+    assert_eq!(
+        verdict.as_object().map(|fields| fields.len()),
+        Some(2),
+        "the unauthenticated verdict grew a field: {body}"
+    );
+
+    // A wrong bearer is the same caller as no bearer.
+    let (_, wrong) = ask_at(&relay.state, "/readyz", Some("Bearer nope")).await;
+    assert!(!wrong.contains(prefix), "{wrong}");
+
+    // The operator sees the document the control plane polls, frozen group named.
+    let (status, body) = ask_at(&relay.state, "/readyz", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body.contains(prefix),
+        "the operator document lost the frozen group: {body}"
+    );
+    let document: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(document["access_set"], "enforce");
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_relay_with_no_operator_bearer_serves_only_the_verdict_to_anybody() {
+    // The self-hosted shape: with no bearer configured there is no caller the
+    // detailed document can be authenticated for, so nobody gets it, whatever
+    // they put in the header.
+    let state = Arc::new(RelayState::new(bare(&[]), None, None));
+    let (status, body) = ask_at(&state, "/readyz", Some("Bearer anything")).await;
+    // No database and no storage on this state: honestly not ready.
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(verdict["ready"], false);
+    assert!(
+        verdict.get("database").is_none() && verdict.get("frozen_groups").is_none(),
+        "the verdict carried detail: {body}"
     );
 }
 

@@ -23,6 +23,7 @@ use sqlx::{Connection as _, Executor as _};
 use wealdrelay::access::{self, store, AccessSet};
 use wealdrelay::frame::{ErrorCode, Frame, PROTOCOL_VERSION};
 use wealdrelay::health::{Clock, RelayState};
+use wealdrelay::invite::{genesis, reserve};
 
 use support::{
     config_for, default_device, device_from, envelope_for, other_device, Client, Running, Scratch,
@@ -39,6 +40,66 @@ fn sorted(mut items: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     items.sort();
     items.dedup();
     items
+}
+
+/// Hold this workspace's one bootstrap seat for `device`, as a real joiner does.
+///
+/// The bootstrap hole is one frame wide and it is also one *device* wide. A
+/// workspace with no access set is not an open door: `relay_group` rows exist
+/// before genesis on every provisioned relay, so resolving a workspace from a
+/// group id alone would let anyone who learned that id become its trust root.
+/// `access::store::admission` therefore answers `Bootstrap` only to the device
+/// holding the live, unconsumed reservation on the genesis invite
+/// (`invite::genesis::founding_workspace`).
+///
+/// These tests predate that narrowing and used to reach the hole by knowing a
+/// group id, which is exactly what it now refuses, so each of them mints genesis
+/// and takes the seat first. That is not a workaround: it is the sequence a real
+/// first client performs, and going through it is what makes the rest of the
+/// assertion about the socket rather than about an admission nobody could get.
+/// The reservation's expiry is written against the database's own `now()`
+/// (`genesis::founding_workspace` filters on `r.expires_at > now()`), so the
+/// mint and the reservation take the real clock and not this suite's fixed
+/// `CLOCK`. `CLOCK` is 2023 and every reservation stamped with it is already
+/// expired before it is read, which is a fixture that grants no seat at all.
+/// Nothing timing-sensitive rests on it: the expiry is ten minutes out.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_millis() as i64
+}
+
+async fn hold_bootstrap_seat(state: &std::sync::Arc<RelayState>, device: &SigningKey) {
+    let pool = state.database.as_ref().expect("a database").pool();
+    let salt = store::salt(pool, WORKSPACE)
+        .await
+        .expect("a workspace salt");
+    let run = match genesis::ensure(pool, WORKSPACE, wall_clock_ms())
+        .await
+        .expect("mints the genesis invite")
+    {
+        genesis::Ensured::Minted(run) => run,
+        other => panic!("a fresh relay mints, got {other:?}"),
+    };
+    let reserved = reserve::reserve(
+        pool,
+        &run.token,
+        &run.code.grouped(),
+        &[0x41; 16],
+        &access::entry_hash(&pk(device), &salt),
+        // Salted and hashed, as `ws.rs` does before it ever calls this: migration
+        // 0012 re-keyed the attempt counter on the source and constrains it to 32
+        // bytes, so a raw string is refused by the database.
+        &reserve::source_hash("203.0.113.7", &salt),
+        wall_clock_ms(),
+    )
+    .await
+    .expect("a reservation");
+    assert!(
+        matches!(reserved, reserve::Verdict::Reserved { .. }),
+        "the fixture must hold the bootstrap seat, got {reserved:?}"
+    );
 }
 
 /// A group in a workspace with no access set: the state every workspace starts in.
@@ -112,27 +173,37 @@ async fn a_workspace_publishes_its_genesis_set_over_the_one_socket_it_can_open()
     let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
     let group = bare_group(&relay.state, 0x81).await;
     let salt = salt_of(&relay.state).await;
+    hold_bootstrap_seat(&relay.state, &default_device()).await;
 
-    let mut client = Client::connect(relay.address).await;
-    client.handshake(vec![group.clone()], CLOCK).await;
-
-    // Any other frame is refused with the code a stranger gets, and the session ends
-    // on it: a frame in a state that does not accept it is a client that is wrong
-    // about the protocol. So the hole is one frame wide, and not "authentication is
-    // optional until a set exists".
-    client
-        .send_frame(&Frame::Send {
-            envelope: envelope_for(&group, b"before any set").encode(),
+    // Knowing a group id is not a way in, and this is the assertion that says so.
+    //
+    // The hole this test is named for used to be exactly one frame wide and open
+    // to anyone who could name a group of a workspace with no set. That was too
+    // wide: `relay_group` rows exist before genesis on every provisioned relay, so
+    // a stranger who learned an id could have become the workspace's trust root.
+    // `access::store::admission` now answers a device that holds no seat on the
+    // genesis invite with the refusal a stranger gets, and the session ends there
+    // rather than being admitted to a frame.
+    let mut stranger = Client::connect(relay.address).await;
+    let challenge = stranger
+        .handshake_to_challenge(vec![group.clone()], CLOCK)
+        .await;
+    let outsider = device_from(0x5c);
+    stranger
+        .send_frame(&Frame::Auth {
+            device_key: pk(&outsider),
+            signature: outsider.sign(&challenge).to_bytes().to_vec(),
         })
         .await;
-    match client.recv_frame().await {
-        Frame::Error(error) => assert_eq!(error.code, ErrorCode::MalformedHeader),
+    match stranger.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::WriterNotInAccessSet),
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert!(
-        client.recv().await.is_none(),
-        "a frame the state does not accept must end the session"
+        stranger.recv().await.is_none(),
+        "a device that cannot be admitted must not keep the socket"
     );
+
     let mut client = Client::connect(relay.address).await;
     client.handshake(vec![group.clone()], CLOCK).await;
 
@@ -547,6 +618,131 @@ async fn a_device_that_joined_on_a_live_invite_is_cut_off_by_the_same_publicatio
     scratch.drop_database().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn no_admitted_socket_survives_a_rotation_driven_concurrently_with_admissions() {
+    // WEALD-290. `admit()` used to read the access set and only afterwards
+    // register the socket with the hub, so a rotation that committed between the
+    // two found an empty `principals` entry, closed zero connections, and the
+    // just-revoked device kept a live authorized socket indefinitely. The fix
+    // brackets the registration with a second membership read; this drives a
+    // burst of admissions concurrently with the rotation that drops them, round
+    // after round, and asserts no admitted socket outlives the set that dropped
+    // its device.
+    let scratch = Scratch::new("rotation_race").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = bare_group(&relay.state, 0x8c).await;
+    let salt = salt_of(&relay.state).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+    let bo_entry = access::entry_hash(&pk(&other_device()), &salt);
+
+    let genesis = set_for(
+        &salt,
+        0,
+        vec![0u8; 32],
+        &[&default_device(), &other_device()],
+        &default_device(),
+    );
+    store::publish(pool, WORKSPACE, &genesis, &genesis.encode())
+        .await
+        .expect("the genesis set");
+    let mut prev = genesis.digest().to_vec();
+    let mut version = 1;
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake(vec![group.clone()], CLOCK).await;
+
+    for round in 0..10u32 {
+        // A burst of Bo sockets racing towards `Ready`, spawned first so their
+        // admissions interleave with the publication below.
+        let mut racers = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let address = relay.address;
+            let group = group.clone();
+            racers.spawn(async move {
+                let mut bo = Client::connect(address).await;
+                let challenge = bo.handshake_to_challenge(vec![group], CLOCK).await;
+                bo.send_frame(&Frame::Auth {
+                    device_key: pk(&other_device()),
+                    signature: other_device().sign(&challenge).to_bytes().to_vec(),
+                })
+                .await;
+                // Whatever the race decided (an ack, a refusal, or a close), the
+                // socket is held open so a survivor would be visible below.
+                let _ = tokio::time::timeout(Duration::from_secs(5), bo.recv()).await;
+                bo
+            });
+        }
+
+        // The rotation, concurrent with the burst: Bo is dropped.
+        let removal = set_for(
+            &salt,
+            version,
+            prev,
+            &[&default_device()],
+            &default_device(),
+        );
+        ada.send_frame(&Frame::Access {
+            body: removal.encode(),
+        })
+        .await;
+        match ada.recv_frame().await {
+            Frame::Access { body } => assert_eq!(body, removal.digest().to_vec()),
+            other => panic!("round {round}: expected an Access answer, got {other:?}"),
+        }
+
+        let clients: Vec<Client> = {
+            let mut clients = Vec::new();
+            while let Some(joined) = racers.join_next().await {
+                clients.push(joined.expect("a racer finishes"));
+            }
+            clients
+        };
+
+        // The invariant: once the set that drops Bo is published and the burst
+        // has settled, no admitted socket for Bo survives. The hub is the ground
+        // truth revocation acts on, so it is what is asserted.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let held = relay.state.hub.connections_for(&bo_entry).await;
+            if held == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: {held} revoked socket(s) survived the rotation"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(clients);
+
+        // Bo is re-admitted for the next round, so every round races a fresh
+        // removal rather than re-asserting the last one.
+        prev = removal.digest().to_vec();
+        version += 1;
+        let restore = set_for(
+            &salt,
+            version,
+            prev,
+            &[&default_device(), &other_device()],
+            &default_device(),
+        );
+        ada.send_frame(&Frame::Access {
+            body: restore.encode(),
+        })
+        .await;
+        match ada.recv_frame().await {
+            Frame::Access { body } => assert_eq!(body, restore.digest().to_vec()),
+            other => panic!("round {round}: expected the restore ack, got {other:?}"),
+        }
+        prev = restore.digest().to_vec();
+        version += 1;
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
 // MARK: Probation, and that time is not a promotion
 
 #[tokio::test(flavor = "multi_thread")]
@@ -932,6 +1128,7 @@ async fn a_read_only_relay_says_so_to_a_bootstrapping_session_too() {
     config.write_mode = wealdrelay::config::WriteMode::ReadOnly;
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
     let group = bare_group(&relay.state, 0x88).await;
+    hold_bootstrap_seat(&relay.state, &default_device()).await;
 
     let mut client = Client::connect(relay.address).await;
     client
@@ -976,6 +1173,7 @@ async fn the_state_query_answers_the_salt_and_the_head_and_nothing_about_members
     let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
     let group = bare_group(&relay.state, 0x91).await;
     let salt = salt_of(&relay.state).await;
+    hold_bootstrap_seat(&relay.state, &default_device()).await;
 
     // Before genesis, asked by the one connection the workspace can open.
     let mut client = Client::connect(relay.address).await;
@@ -1033,30 +1231,76 @@ async fn the_state_query_answers_the_salt_and_the_head_and_nothing_about_members
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_state_query_for_a_group_this_relay_no_longer_knows_is_refused() {
-    // The workspace is resolved from the connection's groups on every query, never
-    // remembered from the handshake, so a group that stops being this relay's is a
-    // query it can no longer answer. Answering from the session's memory would be a
-    // relay handing out one workspace's salt after that workspace left it.
+async fn a_state_query_answers_the_admitted_workspace_and_never_a_named_group() {
+    // This test used to assert the opposite, and the rule it asserted was the
+    // weaker one. The state query resolved a workspace from the groups the
+    // connection named, on every query, so deleting the group made the query
+    // unanswerable and the relay said so.
+    //
+    // Resolving from the named groups is a cross-tenant oracle (BR-013). The salt
+    // is the value every entry hash is keyed on, and `store::state_for` answers
+    // the first named group that resolves to any workspace, while `store::admission`
+    // binds the session to the first group that actually *admits* the device. Those
+    // disagree exactly when a client names groups from two workspaces: a member of
+    // B naming one of A's ids first was handed A's salt and A's set head.
+    //
+    // So `report_access_state` now answers from the workspace this session was
+    // admitted to and from nothing else, and that is what is asserted here: the
+    // named groups cannot move the answer, whether they vanish or belong to
+    // somebody else.
     let scratch = Scratch::new("accessstatenogroup").await;
     let blobs = tempfile::tempdir().unwrap();
     let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
     let group = bare_group(&relay.state, 0x92).await;
+    let salt = salt_of(&relay.state).await;
+    hold_bootstrap_seat(&relay.state, &default_device()).await;
     let pool = relay.state.database.as_ref().unwrap().pool();
 
-    let mut client = Client::connect(relay.address).await;
-    client.handshake(vec![group.clone()], CLOCK).await;
+    // Another tenant on the same relay, with a group id this client will name.
+    let foreign_group = vec![0x93; 32];
+    sqlx::query("insert into relay_workspace (workspace_id, salt) values ($1, $2)")
+        .bind("ws-someone-else")
+        .bind(vec![0xABu8; 32])
+        .execute(pool)
+        .await
+        .expect("the other workspace");
+    sqlx::query("insert into relay_group (group_id, workspace_id) values ($1, $2)")
+        .bind(&foreign_group)
+        .bind("ws-someone-else")
+        .execute(pool)
+        .await
+        .expect("the other workspace's group");
 
+    let mut client = Client::connect(relay.address).await;
+    client
+        .handshake(vec![foreign_group.clone(), group.clone()], CLOCK)
+        .await;
+
+    // Named first, and it still does not decide the answer.
+    client.send_frame(&Frame::Access { body: Vec::new() }).await;
+    match client.recv_frame().await {
+        Frame::Access { body } => {
+            let (answered, _) = decode_state(&body);
+            assert_eq!(
+                answered, salt,
+                "the salt answered must be the admitted workspace's, never a named group's"
+            );
+            assert_ne!(answered, vec![0xABu8; 32]);
+        }
+        other => panic!("expected an Access answer, got {other:?}"),
+    }
+
+    // And the group going away does not change it either, because it was never
+    // what the answer was resolved from.
     sqlx::query("delete from relay_group where group_id = $1")
         .bind(&group)
         .execute(pool)
         .await
         .expect("unregister the group");
-
     client.send_frame(&Frame::Access { body: Vec::new() }).await;
     match client.recv_frame().await {
-        Frame::Error(error) => assert_eq!(error.code, ErrorCode::GroupUnknown),
-        other => panic!("expected an unknown-group refusal, got {other:?}"),
+        Frame::Access { body } => assert_eq!(decode_state(&body).0, salt),
+        other => panic!("expected an Access answer, got {other:?}"),
     }
 
     relay.shutdown().await;
@@ -1123,4 +1367,68 @@ fn decode_state(body: &[u8]) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
     let digest = reader.bytes().expect("the digest");
     reader.finish().expect("nothing after the answer");
     (salt, Some((version, digest)))
+}
+
+/// WEALD-L159. The state query resolved the first requested group that named any
+/// workspace, while admission binds the session to the first group that actually
+/// admits the device. The two disagree exactly when a client names groups from two
+/// workspaces, and the disagreement handed out another tenant's salt, which is the
+/// value every entry hash is keyed on, plus the head a rotation has to name.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_state_query_answers_from_the_admitted_workspace_and_not_a_named_stranger() {
+    let scratch = Scratch::new("accessstate_cross").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = relay.state.database.as_ref().expect("a database").pool();
+
+    // The victim's workspace, which the attacker is not in and only knows one
+    // group id of.
+    let victim_group = bare_group(&relay.state, 0x9c).await;
+    let victim_salt = salt_of(&relay.state).await;
+
+    // The attacker's own workspace, where they are a genuine member.
+    let attacker_key = device_from(0xa7);
+    let attacker_group = support::make_group_in(
+        &relay.state,
+        "ws-stranger",
+        0x9d,
+        std::slice::from_ref(&attacker_key),
+        std::slice::from_ref(&attacker_key),
+    )
+    .await;
+    let attacker_salt = store::salt(pool, "ws-stranger")
+        .await
+        .expect("the stranger workspace salt");
+    assert_ne!(victim_salt, attacker_salt);
+
+    // The victim's group is named first, so first-found resolution reaches it.
+    let mut attacker = Client::connect(relay.address).await;
+    attacker
+        .handshake_as(
+            &attacker_key,
+            vec![victim_group.clone(), attacker_group.clone()],
+            CLOCK,
+        )
+        .await;
+    attacker
+        .send_frame(&Frame::Access { body: Vec::new() })
+        .await;
+    match attacker.recv_frame().await {
+        Frame::Access { body } => {
+            let (answered, _head) = decode_state(&body);
+            assert_ne!(
+                answered, victim_salt,
+                "the state query handed out another workspace's salt"
+            );
+            assert_eq!(
+                answered, attacker_salt,
+                "the answer is the admitted workspace's own state"
+            );
+        }
+        Frame::Error(_) => {}
+        other => panic!("expected a state answer or a refusal, got {other:?}"),
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
 }

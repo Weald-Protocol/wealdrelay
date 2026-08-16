@@ -531,8 +531,24 @@ async fn a_provisional_grant_dies_by_expiry_by_revocation_and_by_being_supersede
         Admission::Refused
     );
 
+    // A void is terminal. Granting again reports that it issued nothing and leaves
+    // the refusal standing, because the party a revocation is aimed at is exactly
+    // the party that drives the rest of a join. WEALD-286.
+    assert!(
+        !store::grant(pool, WORKSPACE, &hash(&joiner), hour_ahead)
+            .await
+            .unwrap(),
+        "a voided grant was resurrected by granting again"
+    );
+    assert_eq!(
+        store::admits(pool, WORKSPACE, &pk(&joiner)).await.unwrap(),
+        Admission::Refused
+    );
+
     // Superseded, implicitly, and only after having been seen. A set that has not
-    // caught up with the joiner must not void the grant.
+    // caught up with the joiner must not void the grant. A second device, because
+    // the first one's grant is voided for good by now.
+    let joiner = key(0x22);
     store::grant(pool, WORKSPACE, &hash(&joiner), hour_ahead)
         .await
         .unwrap();
@@ -655,6 +671,10 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
     let mut in_set: Vec<u8> = Vec::new();
     let mut granted: Vec<u8> = Vec::new();
     let mut seen: Vec<u8> = Vec::new();
+    // Voiding is terminal: a device whose grant was revoked or superseded does not
+    // get a live one back by being granted again, because the party a revocation is
+    // aimed at is the party that would otherwise call grant. WEALD-286.
+    let mut voided: Vec<u8> = Vec::new();
     let mut head = genesis.clone();
     let mut publications = 0usize;
     let mut grants = 0usize;
@@ -692,6 +712,14 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
                         seen.push(*device);
                     }
                 }
+                for device in granted.iter() {
+                    if seen.contains(device)
+                        && !members.contains(device)
+                        && !voided.contains(device)
+                    {
+                        voided.push(*device);
+                    }
+                }
                 granted.retain(|device| !(seen.contains(device) && !members.contains(device)));
                 publications += 1;
             }
@@ -707,11 +735,15 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
                 )
                 .await
                 .unwrap();
-                if !granted.contains(&device) {
-                    granted.push(device);
+                // A void is terminal, so this issues nothing for a device that has
+                // been revoked or superseded.
+                if !voided.contains(&device) {
+                    if !granted.contains(&device) {
+                        granted.push(device);
+                    }
+                    // A re-granted device that was never voided starts over.
+                    seen.retain(|held| held != &device);
                 }
-                // A re-granted device starts over: `grant` clears the void.
-                seen.retain(|held| held != &device);
                 grants += 1;
             }
             // Revoke one.
@@ -721,6 +753,12 @@ async fn exactly_the_currently_authorised_principals_are_admitted() {
                 store::revoke_grant(pool, WORKSPACE, &hash(&key(device)))
                     .await
                     .unwrap();
+                // Only a device that actually holds a row is voided by this: revoking
+                // a device that was never granted writes nothing, so a later grant to
+                // it still issues.
+                if granted.contains(&device) && !voided.contains(&device) {
+                    voided.push(device);
+                }
                 granted.retain(|held| held != &device);
                 seen.retain(|held| held != &device);
                 revocations += 1;

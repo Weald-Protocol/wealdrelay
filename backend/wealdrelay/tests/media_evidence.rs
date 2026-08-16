@@ -262,7 +262,15 @@ async fn the_gc_run_log_and_the_storage_accounting_are_left_behind_for_the_gate(
     assert_eq!(unclaimed.deleted, 1);
     assert_eq!(unclaimed.deleted_bytes, 2_048);
 
-    let unreferenced = gc::sweep_unreferenced_storage(pool, storage, WS, &group, NOW).await;
+    let unreferenced = gc::sweep_unreferenced_storage(
+        pool,
+        storage,
+        WS,
+        &group,
+        NOW,
+        gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
+    )
+    .await;
     assert!(
         unreferenced.deleted >= 1,
         "the planted object has to be collected: {unreferenced:?}"

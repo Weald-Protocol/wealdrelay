@@ -203,9 +203,17 @@ enum Authorized {
 
 /// A policy version or a destruction record, and either way it has to be due.
 ///
-/// "The steward ... issues the matching `drop_before` only for material older
-/// than the group's already-authorized retention policy. It cannot turn a new
-/// checkpoint into an unsupervised deletion authority."
+/// Due means the authorization exists, matches and its `not_before` has passed.
+/// It deliberately does not mean the material below the barrier is older than
+/// `text_after_days`: that sentence in `specs/backend/relay/lifecycle.md`
+/// ("issues the matching `drop_before` only for material older than the group's
+/// already-authorized retention policy") is a bullet about what the epoch
+/// steward emits, not a check the relay performs. The relay's own duties for a
+/// drop are enumerated in the same spec, one paragraph up, and they are the
+/// retention-key chain, the authorization and the presence of every named
+/// snapshot. An age floor here would need a settled meaning for
+/// `text_after_days == 0`, which the spec calls unlimited for text, so read
+/// WEALD-322 before adding one.
 async fn authorization(
     pool: &sqlx::PgPool,
     _workspace: &str,

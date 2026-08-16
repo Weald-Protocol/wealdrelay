@@ -484,6 +484,28 @@ impl Model {
                 if self.calls.len() >= MAX_CONCURRENT {
                     return Err(JoinRefusal::TooManyCalls);
                 }
+                // The second ceiling, and the model has to carry it or the two
+                // disagree on every trace where one connection opens more than
+                // its share. `CallRegistry::share` is a quarter of the table and
+                // never less than one: a finite table with no per-source share is
+                // a table one source takes, and on the hosted tier that process
+                // carries many workspaces, so one socket could refuse every other
+                // customer's calls (WEALD-340). Written out longhand here, like
+                // every other rule in this model, rather than calling the
+                // registry's own `share`: a model that borrowed the
+                // implementation would agree with it about a bug too.
+                let share = (MAX_CONCURRENT / 4).max(1);
+                let held = self
+                    .calls
+                    .values()
+                    .filter(|(_, participants)| participants.contains(&connection))
+                    .count();
+                if held >= share {
+                    // The same refusal the table ceiling gives, deliberately: the
+                    // client's next move is identical and a distinct code would
+                    // tell an attacker which of the two ceilings it found.
+                    return Err(JoinRefusal::TooManyCalls);
+                }
                 self.calls.insert(call, (group, vec![connection]));
                 Ok(())
             }

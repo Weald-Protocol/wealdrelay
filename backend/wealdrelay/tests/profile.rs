@@ -53,6 +53,7 @@ fn refusal(extra: &[(&str, &str)]) -> String {
             outcome.stderr
         }
         Startup::Serve(_) => panic!("this configuration was supposed to be refused"),
+        Startup::Backup { .. } => panic!("no argument here asks for a backup"),
     }
 }
 
@@ -206,6 +207,7 @@ fn check_config_prints_the_profile_and_where_it_came_from() {
             assert!(outcome.stdout.contains("environment"), "{}", outcome.stdout);
         }
         Startup::Serve(_) => panic!("--check-config never serves"),
+        Startup::Backup { .. } => panic!("--check-config never backs up"),
     }
 }
 
@@ -226,6 +228,7 @@ fn check_config_reports_the_refusal_rather_than_the_configuration() {
             assert!(outcome.stderr.contains("WEALD_RELAY_SMTP_URL"));
         }
         Startup::Serve(_) => panic!("--check-config never serves"),
+        Startup::Backup { .. } => panic!("--check-config never backs up"),
     }
 }
 

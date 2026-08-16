@@ -17,6 +17,7 @@
 
 pub mod accept;
 pub mod access;
+pub mod backup;
 pub mod calls;
 pub mod cbor;
 pub mod config;
@@ -28,6 +29,7 @@ pub mod handshake;
 pub mod health;
 pub mod hub;
 pub mod invite;
+pub mod janitor;
 pub mod keys;
 pub mod lifecycle;
 pub mod log;
@@ -156,6 +158,14 @@ pub enum Invocation {
     /// exit without opening a socket. The thing an operator runs when a relay
     /// will not start and they want to know which of two places set a value.
     CheckConfig,
+    /// Write the portable export tarball to this path and exit without opening a
+    /// socket (`specs/backend/cloud/backup-dr.md`, `crate::backup`).
+    Backup(backup::Request),
+    /// A `backup` invocation whose flags could not be read, carrying the message
+    /// that names what was wrong. Separate from `Unknown` because the operator
+    /// asked for the right subcommand and needs to be told about the flag, not
+    /// about the subcommand.
+    BackupUsage(String),
     /// An argument this build does not understand, carried so the message can
     /// name it.
     Unknown(String),
@@ -171,12 +181,19 @@ impl Invocation {
         // argument it did not understand would be a relay running a
         // configuration its operator does not have, so anything unrecognised
         // stops here and is named back to them.
-        match args.into_iter().next() {
+        let mut args = args.into_iter();
+        match args.next() {
             None => Self::Serve,
             Some(arg) => match arg.as_ref() {
                 "--version" | "-V" => Self::Version,
                 "--help" | "-h" => Self::Help,
                 "--check-config" => Self::CheckConfig,
+                // The one invocation that takes arguments of its own, so it is the
+                // one place the rest of argv is read at all.
+                "backup" => match backup::parse_args(args) {
+                    Ok(out) => Self::Backup(out),
+                    Err(message) => Self::BackupUsage(message),
+                },
                 other => Self::Unknown(other.to_string()),
             },
         }
@@ -186,11 +203,18 @@ impl Invocation {
 /// Usage text. Kept beside the parser so the two cannot drift.
 pub const USAGE: &str = "\
 usage: wealdrelay [--version] [--help] [--check-config]
+       wealdrelay backup --out <path|s3://bucket/key> [--database-only]
 
   --version, -V   print the build identity
   --help, -h      print this message
   --check-config  resolve the configuration, print where each value came from,
                   and exit without opening a socket
+  backup          write the portable backup tarball (the encrypted database,
+                  every blob and a manifest) to --out and exit. Gzipped when the
+                  name ends .gz or .tgz. --out takes a local path or an
+                  s3://bucket/key URL, which uploads with the relay's own
+                  storage credentials. --database-only leaves the blobs out,
+                  for a caller that copies them from the bucket itself.
 
 With no arguments the relay serves. Configuration is by environment variable,
 with an optional relay.toml beside the binary; see
@@ -236,6 +260,12 @@ pub enum Startup {
     Print(Outcome),
     /// Serve with this configuration.
     Serve(Box<config::Config>),
+    /// Take a backup with this configuration and write it here. A runtime is
+    /// needed and a socket is not, which is why it is neither of the above.
+    Backup {
+        config: Box<config::Config>,
+        request: backup::Request,
+    },
 }
 
 /// Resolve argv and the environment into an action.
@@ -251,9 +281,20 @@ where
 {
     let invocation = Invocation::parse(args);
     match invocation {
-        Invocation::Version | Invocation::Help | Invocation::Unknown(_) => {
-            Startup::Print(run_invocation(invocation))
-        }
+        Invocation::Version
+        | Invocation::Help
+        | Invocation::Unknown(_)
+        | Invocation::BackupUsage(_) => Startup::Print(run_invocation(invocation)),
+        // Same configuration as serving, and the same failure shape when it will
+        // not resolve: a backup reads the database and the object store the relay
+        // serves from, so a relay that cannot start cannot back itself up either.
+        Invocation::Backup(request) => match config::Config::resolve(values) {
+            Ok(resolved) => Startup::Backup {
+                config: Box::new(resolved),
+                request,
+            },
+            Err(error) => Startup::Print(config_failure(&error)),
+        },
         Invocation::CheckConfig => match config::Config::resolve(values) {
             Ok(resolved) => Startup::Print(Outcome {
                 stdout: describe_config(&resolved, values),
@@ -486,7 +527,12 @@ fn run_invocation(invocation: Invocation) -> Outcome {
             stderr: format!("wealdrelay: unrecognised argument: {arg}\n{USAGE}"),
             code: 64,
         },
-        Invocation::Serve | Invocation::CheckConfig => Outcome {
+        Invocation::BackupUsage(message) => Outcome {
+            stdout: String::new(),
+            stderr: format!("wealdrelay: {message}\n{USAGE}"),
+            code: 64,
+        },
+        Invocation::Serve | Invocation::CheckConfig | Invocation::Backup(_) => Outcome {
             stdout: String::new(),
             stderr: "wealdrelay: this invocation needs a resolved configuration".to_string(),
             code: EXIT_CONFIG,

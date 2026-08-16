@@ -376,15 +376,27 @@ async fn a_client_opening_every_group_it_may_and_a_call_in_each_is_stopped_by_th
     assert_eq!(requested.len(), MAX_GROUPS_PER_CONNECTION);
     attacker.handshake(requested, CLOCK).await;
 
+    // The ceiling that binds one socket is its **share** of the table, not the
+    // whole table. A quarter, never less than one (`CallRegistry::share`): a
+    // finite table with no per-source share is a table one source takes, and on
+    // the hosted tier this process carries many workspaces, so a socket allowed
+    // to fill it would be refusing every other customer's calls (WEALD-340).
+    // This test used to let the attacker have the entire table and only then
+    // expect a refusal, which is the behaviour the share was added to remove.
+    let share = (ceiling / 4).max(1);
     let mut opened = 0u32;
     let mut refused = 0u32;
     for index in 0..64u8 {
         attacker.send_frame(&offer(&call_id(index), &group)).await;
         opened += 1;
-        if opened > ceiling {
+        if opened > share {
             match attacker.recv_frame().await {
                 Frame::Error(error) => {
                     assert_eq!(error.code, ErrorCode::RateLimited);
+                    // The instance ceiling, still, and on purpose: both refusals
+                    // carry the same code and the same number so an attacker
+                    // cannot tell which of the two it found. The operator gets
+                    // the distinction from the `share_refused` counter instead.
                     assert_eq!(
                         error.detail,
                         Some(u64::from(ceiling).to_be_bytes().to_vec())
@@ -398,8 +410,8 @@ async fn a_client_opening_every_group_it_may_and_a_call_in_each_is_stopped_by_th
     assert!(refused > 0, "the ceiling never bound");
     assert_eq!(
         relay.state.calls.open_calls().await,
-        ceiling as usize,
-        "the instance carried more calls than its operator sized it for"
+        share as usize,
+        "one socket took more than its share of the instance's call table"
     );
 
     // And the relay is still serving, on this socket and on a fresh one.
