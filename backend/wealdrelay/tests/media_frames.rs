@@ -1920,7 +1920,32 @@ async fn every_way_a_multipart_frame_can_name_nothing_is_refused() {
     // A COMPLETE whose parts do not add up to what was reserved. The relay's own
     // accounting is the reservation's byte total, never the sum of what the
     // client says it uploaded.
+    // The part is asked for before it is written, which is what a client does and
+    // what this test was missing.
+    //
+    // `MultipartComplete` refuses any part number the relay did not record
+    // (`media/mod.rs`: `recorded_parts`), and it refuses it before it heads a
+    // single object. Writing bytes straight into storage therefore never reached
+    // the byte-total check this assertion is about; it hit the earlier refusal
+    // and answered `MalformedHeader`, so the accounting rule the comment below
+    // describes has never actually been exercised. Asking for the part URL is
+    // what records it.
     let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
+    assert!(matches!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartPart {
+                        session_id: session_id.clone(),
+                        part_number: 1,
+                        expected_len: 8,
+                    }
+                )
+                .await
+        ),
+        Response::MultipartPartUpload { .. }
+    ));
     let part = BlobKey::new("_multipart", uuid.simple().to_string(), "part-1").unwrap();
     harness.storage().put(&part, b"short").await.unwrap();
     assert_eq!(
@@ -1949,12 +1974,21 @@ async fn a_multipart_frame_the_relay_cannot_serve_is_backpressure() {
     let pool = harness.pool();
     let total = media::SINGLE_PART_MAX_BYTES + 8;
 
-    let session_id = match response(
+    // `part_size` is taken from the reservation rather than discarded, because it
+    // is the ceiling a part URL is checked against (`media/mod.rs`: an
+    // `expected_len` above it is `EnvelopeTooLarge`). This asked for a part as
+    // large as the whole upload, so it was refused on the size before it reached
+    // the injected fault below and the fault it exists to prove never ran.
+    let (session_id, part_size) = match response(
         &harness
             .ask(&session, &put(&group, &blob_hash(0xd4), total))
             .await,
     ) {
-        Response::Multipart { session_id, .. } => session_id,
+        Response::Multipart {
+            session_id,
+            part_size,
+            ..
+        } => (session_id, part_size),
         other => panic!("{other:?}"),
     };
     let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
@@ -1969,7 +2003,7 @@ async fn a_multipart_frame_the_relay_cannot_serve_is_backpressure() {
                     &Request::MultipartPart {
                         session_id: session_id.clone(),
                         part_number: 1,
-                        expected_len: total,
+                        expected_len: part_size,
                     }
                 )
                 .await
@@ -2249,6 +2283,26 @@ async fn a_finalization_is_refused_for_each_reason_it_can_be() {
     //    never a completion: the reservation is the number the customer is billed
     //    for and the object would be wrong anyway.
     let (session_id, uuid) = open(&harness, &session, &group, total, blob_hash(0xe3)).await;
+    // The part is asked for before it is written. `MultipartComplete` refuses a
+    // part number the relay never recorded, and refuses it before it heads a
+    // single object (`media/mod.rs`: `recorded_parts`), so writing bytes straight
+    // into the bucket answered `MalformedHeader` and the byte accounting this
+    // case exists for was never reached.
+    assert!(matches!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::MultipartPart {
+                        session_id: session_id.clone(),
+                        part_number: 1,
+                        expected_len: 8,
+                    }
+                )
+                .await
+        ),
+        Response::MultipartPartUpload { .. }
+    ));
     let part = BlobKey::new("_multipart", uuid.simple().to_string(), "part-1").unwrap();
     harness
         .storage()
@@ -2303,12 +2357,47 @@ async fn a_finalization_is_refused_for_each_reason_it_can_be() {
     //    the next sweep would release a reservation for an object that exists.
     //    Backpressure, so the client asks again and the exactly-once path answers.
     let (session_id, uuid) = open(&harness, &session, &group, total, blob_hash(0xe4)).await;
-    let part = BlobKey::new("_multipart", uuid.simple().to_string(), "part-1").unwrap();
-    harness
-        .storage()
-        .put(&part, &vec![0u8; total as usize])
-        .await
+    // Two parts, recorded and then written, because this case has to get all the
+    // way through assembly to reach the failure it injects.
+    //
+    // `total` is one byte-count larger than a single part may carry
+    // (`MULTIPART_PART_SIZE`), so it was never coverable by the one part this
+    // wrote: the part URL was refused `EnvelopeTooLarge`, and before that the
+    // unrecorded part number was refused `MalformedHeader`. Either way the relay
+    // never assembled anything and the "object landed, session did not" state
+    // this case is named for could not arise.
+    let split = [
+        (1u32, media::MULTIPART_PART_SIZE),
+        (2, total - media::MULTIPART_PART_SIZE),
+    ];
+    for (number, length) in split {
+        assert!(matches!(
+            response(
+                &harness
+                    .ask(
+                        &session,
+                        &Request::MultipartPart {
+                            session_id: session_id.clone(),
+                            part_number: number,
+                            expected_len: length,
+                        }
+                    )
+                    .await
+            ),
+            Response::MultipartPartUpload { .. }
+        ));
+        let part = BlobKey::new(
+            "_multipart",
+            uuid.simple().to_string(),
+            format!("part-{number}"),
+        )
         .unwrap();
+        harness
+            .storage()
+            .put(&part, &vec![0u8; length as usize])
+            .await
+            .unwrap();
+    }
     inject(
         harness.pool(),
         "create or replace function weald_injected_refusal() returns trigger \
@@ -2328,7 +2417,7 @@ async fn a_finalization_is_refused_for_each_reason_it_can_be() {
                     &session,
                     &Request::MultipartComplete {
                         session_id: session_id.clone(),
-                        parts: vec![(1, b"etag".to_vec())],
+                        parts: vec![(1, b"etag".to_vec()), (2, b"etag".to_vec())],
                     }
                 )
                 .await
