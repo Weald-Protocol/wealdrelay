@@ -48,6 +48,33 @@ fn main() -> std::process::ExitCode {
                 Err(error) => report("", &format!("wealdrelay: {error}"), error.exit_code()),
             }
         }
+        Startup::Restore { config, request } => {
+            // Same shape as a backup: a runtime, no subscriber, one line out.
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return report(
+                        "",
+                        &format!("wealdrelay: cannot start the runtime: {error}"),
+                        wealdrelay::EXIT_UNAVAILABLE,
+                    )
+                }
+            };
+            match runtime.block_on(wealdrelay::restore::run(&config, &request)) {
+                Ok(report_) => report(
+                    &format!(
+                        "restored {} from {} ({} table(s), {} blob(s))",
+                        config.hostname,
+                        request.from.describe(),
+                        report_.tables,
+                        report_.blobs
+                    ),
+                    "",
+                    0,
+                ),
+                Err(error) => report("", &format!("wealdrelay: {error}"), error.exit_code()),
+            }
+        }
         Startup::Serve(config) => {
             // The subscriber is installed only on the serving path. `--version`
             // writing a JSON log line before its answer would break every script

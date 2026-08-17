@@ -190,7 +190,15 @@ async fn a_query_is_answered_even_with_no_database_at_all() {
         answer,
         Frame::Wake(WakeBody::Capability {
             enabled: true,
-            register_url: format!("{RINGER}/v1/handles"),
+            // The wake path is trimmed before the registration path goes on
+            // (`push::default_register_url`), so the answer is the ringer's
+            // origin plus `/v1/handles`. Appending to `RINGER` whole asserted
+            // `/v1/wake/v1/handles`, a path no ringer serves.
+            register_url: format!(
+                "{}{}",
+                RINGER.trim_end_matches(wealdrelay::push::RINGER_WAKE_PATH),
+                wealdrelay::push::RINGER_REGISTER_PATH
+            ),
         })
     );
 

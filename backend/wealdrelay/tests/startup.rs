@@ -23,6 +23,7 @@ fn printed(startup: Startup) -> Outcome {
         Startup::Print(outcome) => outcome,
         Startup::Serve(_) => panic!("expected a printed outcome, got a serve"),
         Startup::Backup { .. } => panic!("expected a printed outcome, got a backup"),
+        Startup::Restore { .. } => panic!("expected a printed outcome, got a restore"),
     }
 }
 
@@ -36,6 +37,9 @@ fn a_complete_configuration_and_no_arguments_serves() {
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
         Startup::Backup { request, .. } => {
             panic!("expected a serve, got a backup to {:?}", request.out)
+        }
+        Startup::Restore { request, .. } => {
+            panic!("expected a serve, got a restore from {:?}", request.from)
         }
     }
 }
@@ -114,7 +118,11 @@ fn the_description_names_every_key_with_its_source() {
         (keys::REDIS_URL, "redis://cache:6379"),
         (keys::SMTP_URL, "smtp://mail:1025"),
         (keys::BOOTSTRAP_HANDOFF_PUBKEY, "abc"),
-        (keys::TLS, "acme"),
+        // Set explicitly, so the key still comes from the environment for the
+        // source assertion below, but `off`: `Config::enforce_tls` refuses both
+        // `acme` and `file` outright because the relay terminates TLS nowhere
+        // yet, so `resolve` could never return the config this test describes.
+        (keys::TLS, "off"),
         (keys::MAX_STORAGE_GB, "50"),
         (keys::RETENTION_DAYS, "unlimited"),
         (keys::WRITE_MODE, "read_only"),
@@ -237,6 +245,9 @@ fn two_instances_with_process_fanout_refuse_to_start() {
         Startup::Backup { request, .. } => {
             panic!("expected a serve, got a backup to {:?}", request.out)
         }
+        Startup::Restore { request, .. } => {
+            panic!("expected a serve, got a restore from {:?}", request.from)
+        }
     }
 }
 
@@ -270,6 +281,9 @@ fn push_on_with_no_destination_refuses_to_start_and_names_the_variable() {
         Startup::Print(outcome) => panic!("expected a serve, got {outcome:?}"),
         Startup::Backup { request, .. } => {
             panic!("expected a serve, got a backup to {:?}", request.out)
+        }
+        Startup::Restore { request, .. } => {
+            panic!("expected a serve, got a restore from {:?}", request.from)
         }
     }
 

@@ -40,6 +40,7 @@ pub mod negentropy;
 pub mod profile;
 pub mod push;
 pub mod recovery;
+pub mod restore;
 pub mod send_budget;
 pub mod serve;
 pub mod session;
@@ -166,6 +167,14 @@ pub enum Invocation {
     /// asked for the right subcommand and needs to be told about the flag, not
     /// about the subcommand.
     BackupUsage(String),
+    /// Load a capture back into this relay's database and object store, and exit
+    /// without opening a socket (`specs/backend/cloud/backup-dr.md`,
+    /// `crate::restore`). The other half of `Backup`, and the reason the packed
+    /// substrate can roll a cell back at all (WEALD-L234).
+    Restore(restore::Request),
+    /// A `restore` invocation whose flags could not be read. `BackupUsage`'s
+    /// counterpart, and separate for the same reason.
+    RestoreUsage(String),
     /// An argument this build does not understand, carried so the message can
     /// name it.
     Unknown(String),
@@ -194,6 +203,10 @@ impl Invocation {
                     Ok(out) => Self::Backup(out),
                     Err(message) => Self::BackupUsage(message),
                 },
+                "restore" => match restore::parse_args(args) {
+                    Ok(request) => Self::Restore(request),
+                    Err(message) => Self::RestoreUsage(message),
+                },
                 other => Self::Unknown(other.to_string()),
             },
         }
@@ -204,6 +217,7 @@ impl Invocation {
 pub const USAGE: &str = "\
 usage: wealdrelay [--version] [--help] [--check-config]
        wealdrelay backup --out <path|s3://bucket/key> [--database-only]
+       wealdrelay restore --from <path|s3://bucket/key> [--receipt <path|s3://...>]
 
   --version, -V   print the build identity
   --help, -h      print this message
@@ -266,6 +280,12 @@ pub enum Startup {
         config: Box<config::Config>,
         request: backup::Request,
     },
+    /// Load a capture with this configuration. A runtime is needed and a socket
+    /// is not, exactly as for `Backup`.
+    Restore {
+        config: Box<config::Config>,
+        request: restore::Request,
+    },
 }
 
 /// Resolve argv and the environment into an action.
@@ -284,12 +304,22 @@ where
         Invocation::Version
         | Invocation::Help
         | Invocation::Unknown(_)
-        | Invocation::BackupUsage(_) => Startup::Print(run_invocation(invocation)),
+        | Invocation::BackupUsage(_)
+        | Invocation::RestoreUsage(_) => Startup::Print(run_invocation(invocation)),
         // Same configuration as serving, and the same failure shape when it will
         // not resolve: a backup reads the database and the object store the relay
         // serves from, so a relay that cannot start cannot back itself up either.
         Invocation::Backup(request) => match config::Config::resolve(values) {
             Ok(resolved) => Startup::Backup {
+                config: Box::new(resolved),
+                request,
+            },
+            Err(error) => Startup::Print(config_failure(&error)),
+        },
+        // Same configuration as a backup, and for the same reason: a restore
+        // writes the database and the object store the relay serves from.
+        Invocation::Restore(request) => match config::Config::resolve(values) {
+            Ok(resolved) => Startup::Restore {
                 config: Box::new(resolved),
                 request,
             },
@@ -394,6 +424,23 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
         resolved.handshake_timeout_ms.to_string(),
     );
     row(keys::IDLE_TIMEOUT_MS, resolved.idle_timeout_ms.to_string());
+    // Named here because `keys::ALL` names it and this description is what an
+    // operator reads to see what the relay resolved. Its absence was invisible:
+    // `the_description_names_every_key_with_its_source` sets every key including
+    // `WEALD_RELAY_TLS=acme`, which `enforce_tls` refuses outright, so the test
+    // died in `resolve` and never reached the assertion that would have said so.
+    row(
+        keys::JANITOR_INTERVAL_MS,
+        resolved.janitor_interval_ms.to_string(),
+    );
+    row(
+        keys::GC_MIN_OBJECT_AGE_SECONDS,
+        resolved.gc_min_object_age_seconds.to_string(),
+    );
+    row(
+        keys::TRUSTED_PROXY_HOPS,
+        resolved.trusted_proxy_hops.to_string(),
+    );
     row(
         keys::SEND_FRAMES_PER_MINUTE,
         resolved.send_frames_per_minute.to_string(),
@@ -527,12 +574,15 @@ fn run_invocation(invocation: Invocation) -> Outcome {
             stderr: format!("wealdrelay: unrecognised argument: {arg}\n{USAGE}"),
             code: 64,
         },
-        Invocation::BackupUsage(message) => Outcome {
+        Invocation::BackupUsage(message) | Invocation::RestoreUsage(message) => Outcome {
             stdout: String::new(),
             stderr: format!("wealdrelay: {message}\n{USAGE}"),
             code: 64,
         },
-        Invocation::Serve | Invocation::CheckConfig | Invocation::Backup(_) => Outcome {
+        Invocation::Serve
+        | Invocation::CheckConfig
+        | Invocation::Backup(_)
+        | Invocation::Restore(_) => Outcome {
             stdout: String::new(),
             stderr: "wealdrelay: this invocation needs a resolved configuration".to_string(),
             code: EXIT_CONFIG,

@@ -89,6 +89,42 @@ impl S3Store {
         Ok(())
     }
 
+    /// Read one object at a literal key, outside the blob namespace and without
+    /// the configured prefix.
+    ///
+    /// The mirror of `put_file`, for `restore --from s3://bucket/key`. A key
+    /// that is not there is `NotFound` rather than a read failure, because the
+    /// caller acts on the two differently: a capture that was never written is
+    /// the operator's argument being wrong, and an unreadable bucket is the
+    /// environment.
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| {
+                if let SdkError::ServiceError(service) = &error {
+                    if service.err().is_no_such_key() {
+                        return StorageError::NotFound {
+                            key: format!("{}/{key}", self.bucket),
+                        };
+                    }
+                }
+                Self::map_error(&format!("get {}/{key}", self.bucket), error)
+            })?;
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .map_err(|error| StorageError::ReadFailed {
+                reason: format!("read body of {}/{key}: {error}", self.bucket),
+            })?;
+        Ok(bytes.to_vec())
+    }
+
     fn object_key(&self, key: &BlobKey) -> String {
         self.join(&key.path())
     }

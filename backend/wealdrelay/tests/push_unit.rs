@@ -935,8 +935,12 @@ fn a_configured_relay_reports_configured_until_a_wake_fails_to_reach_the_ringer(
         push.capability(),
         WakeBody::Capability {
             enabled: true,
+            // The wake path comes off before the registration path goes on
+            // (`push::default_register_url`), so this is the ringer's origin
+            // plus `/v1/handles`, not the wake url with a second path glued to
+            // the end of it.
             register_url: format!(
-                "https://ringer.example/v1/wake{}",
+                "https://ringer.example{}",
                 wealdrelay::push::RINGER_REGISTER_PATH
             ),
         }

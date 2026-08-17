@@ -677,3 +677,21 @@ pub fn is_within(root: &Path, candidate: &Path) -> bool {
 
 mod s3;
 pub use s3::S3Store;
+
+/// Read one object out of a bucket at a literal key, into memory.
+///
+/// The mirror of `put_object_file`, and deliberate in the same two ways: not a
+/// `Store` method, because `restore --from s3://bucket/key` may name a bucket
+/// that is not the storage bucket and it is an object key rather than a blob,
+/// and routed through the ambient AWS chain, because that is the only credential
+/// path the relay has and a second one would be a second thing to configure.
+///
+/// In memory rather than streamed to a file: the caller unpacks the archive
+/// entry by entry and holds one member at a time, which is the same ceiling
+/// `backup::collect` already accepts.
+pub async fn get_object_bytes(bucket: &str, key: &str) -> Result<Vec<u8>, StorageError> {
+    S3Store::connect(bucket.to_string(), String::new())
+        .await
+        .get_object(key)
+        .await
+}

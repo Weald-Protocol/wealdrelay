@@ -217,7 +217,8 @@ async fn an_applied_migration_that_has_since_been_edited_is_refused() {
             "0012_invite_attempt_by_source".to_string(),
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
-            "0015_gc_restore_marker".to_string()
+            "0015_gc_restore_marker".to_string(),
+            "0016_multipart_survives_release".to_string()
         ]
     );
 
@@ -1145,7 +1146,8 @@ async fn a_pool_the_caller_already_holds_can_be_wrapped_and_used() {
             "0012_invite_attempt_by_source".to_string(),
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
-            "0015_gc_restore_marker".to_string()
+            "0015_gc_restore_marker".to_string(),
+            "0016_multipart_survives_release".to_string()
         ]
     );
     // The same pool, and not a copy of the configuration that opened another one.
@@ -1343,7 +1345,8 @@ async fn a_transaction_that_cannot_be_committed_is_reported_and_not_assumed() {
             "0012_invite_attempt_by_source".to_string(),
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
-            "0015_gc_restore_marker".to_string()
+            "0015_gc_restore_marker".to_string(),
+            "0016_multipart_survives_release".to_string()
         ]
     );
 

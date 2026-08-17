@@ -54,6 +54,7 @@ fn refusal(extra: &[(&str, &str)]) -> String {
         }
         Startup::Serve(_) => panic!("this configuration was supposed to be refused"),
         Startup::Backup { .. } => panic!("no argument here asks for a backup"),
+        Startup::Restore { .. } => panic!("no argument here asks for a restore"),
     }
 }
 
@@ -208,6 +209,7 @@ fn check_config_prints_the_profile_and_where_it_came_from() {
         }
         Startup::Serve(_) => panic!("--check-config never serves"),
         Startup::Backup { .. } => panic!("--check-config never backs up"),
+        Startup::Restore { .. } => panic!("--check-config never restores"),
     }
 }
 
@@ -229,6 +231,7 @@ fn check_config_reports_the_refusal_rather_than_the_configuration() {
         }
         Startup::Serve(_) => panic!("--check-config never serves"),
         Startup::Backup { .. } => panic!("--check-config never backs up"),
+        Startup::Restore { .. } => panic!("--check-config never restores"),
     }
 }
 

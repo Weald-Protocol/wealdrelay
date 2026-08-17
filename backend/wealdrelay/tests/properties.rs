@@ -45,6 +45,12 @@ proptest! {
             Invocation::Backup(_) | Invocation::BackupUsage(_) => {
                 prop_assert_eq!(args[0].as_str(), "backup");
             }
+            // The other half of `backup`, and the same shape: it either read a
+            // `--from` or it refused with a message naming what was wrong, and
+            // it never guesses a source.
+            Invocation::Restore(_) | Invocation::RestoreUsage(_) => {
+                prop_assert_eq!(args[0].as_str(), "restore");
+            }
         }
     }
 
@@ -105,6 +111,12 @@ proptest! {
                 // Same configuration bar as serving: a backup reads the database
                 // and the store, so it cannot be reached on a partial one either.
                 prop_assert_eq!(args.first().map(String::as_str), Some("backup"));
+                prop_assert!(hostname.is_some() && database.is_some() && storage.is_some());
+            }
+            Startup::Restore { .. } => {
+                // A restore writes the database and the store, so it clears the
+                // same bar for the same reason.
+                prop_assert_eq!(args.first().map(String::as_str), Some("restore"));
                 prop_assert!(hostname.is_some() && database.is_some() && storage.is_some());
             }
         }

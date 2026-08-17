@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt as _;
 use wealdrelay::frame::MAX_FRAME_BYTES;
 use wealdrelay::health::{Clock, WS_MAX_MESSAGE_BYTES};
 
-use support::{config_for, Client, Running, Scratch};
+use support::{config_for, default_device, seed_access_set, Client, Running, Scratch};
 
 const CLOCK: u64 = 1_700_000_000_000;
 
@@ -104,6 +104,10 @@ async fn aborted_upgrades_leave_no_connection_slot_behind() {
             .expect("create the group");
         group
     };
+    // The workspace has to admit the device before `AUTH` can succeed. Without
+    // this the handshake is refused `WriterNotInAccessSet`, which says nothing
+    // about the connection slots this test is named for.
+    seed_access_set(&relay.state, "ws-upgrade", &[default_device()]).await;
     let mut client = Client::connect(relay.address).await;
     client.handshake(vec![group], CLOCK).await;
 
