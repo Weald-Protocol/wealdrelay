@@ -134,7 +134,12 @@ async fn an_oversized_message_is_refused_by_the_transport_and_a_maximal_frame_is
     // protocol never ran.
     let mut oversized = Client::connect(relay.address).await;
     oversized.send(&vec![0u8; WS_MAX_MESSAGE_BYTES + 1]).await;
-    let answer = tokio::time::timeout(Duration::from_secs(10), oversized.recv())
+    // Two minutes rather than ten seconds, and the reason is the runner rather
+    // than the relay: this sends and reassembles a multi-megabyte message on a
+    // two-core hosted builder under a debug build, and the v0.1.22 release
+    // failed here on `Elapsed` with nothing about the transport changed. What is
+    // asserted is unchanged, because a relay that buffers forever still fails.
+    let answer = tokio::time::timeout(Duration::from_secs(120), oversized.recv())
         .await
         .expect("the relay answers rather than buffering");
     assert!(
@@ -148,7 +153,7 @@ async fn an_oversized_message_is_refused_by_the_transport_and_a_maximal_frame_is
     // not eat any message a conforming client can send.
     let mut maximal = Client::connect(relay.address).await;
     maximal.send(&vec![0u8; MAX_FRAME_BYTES]).await;
-    let answer = tokio::time::timeout(Duration::from_secs(10), maximal.recv())
+    let answer = tokio::time::timeout(Duration::from_secs(120), maximal.recv())
         .await
         .expect("the relay answers the maximal frame");
     assert!(

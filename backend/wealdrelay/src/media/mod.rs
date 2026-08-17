@@ -244,6 +244,7 @@ fn rolled<'a>(
 ) -> &'a mut DeviceUsage {
     let minute = now_ms / 60_000;
     let day = now_ms / 86_400_000;
+    sweep(devices, minute, day);
     let usage = devices.entry(device.to_vec()).or_default();
     if usage.minute_bucket != minute {
         usage.minute_bucket = minute;
@@ -254,6 +255,26 @@ fn rolled<'a>(
         usage.day_bytes = 0;
     }
     usage
+}
+
+/// Drop counters whose minute and day windows have both turned over, once the
+/// map is larger than the bound.
+///
+/// The same terms as `send_budget::sweep`: only past windows, so a roster larger
+/// than the bound keeps every live counter and no device is handed a fresh
+/// allowance inside a window it has already spent; only above the bound, so the
+/// ordinary path stays a hash lookup rather than a walk. Without it the map
+/// holds one entry per device that has ever made a blob request against this
+/// process, for the life of the process.
+fn sweep(
+    devices: &mut std::collections::HashMap<Vec<u8>, DeviceUsage>,
+    minute: u64,
+    day: u64,
+) {
+    if devices.len() <= crate::send_budget::MAX_TRACKED_DEVICES {
+        return;
+    }
+    devices.retain(|_, usage| usage.minute_bucket == minute || usage.day_bucket == day);
 }
 
 /// The relay's default posture: 50 requests/minute, 5 GB/day.
@@ -535,13 +556,17 @@ async fn handle_list(
     let Some(store) = &state.storage else {
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     };
-    let names = match store.list(&workspace, &hex(group)).await {
+    let mut names = match store.list(&workspace, &hex(group)).await {
         Ok(names) => names,
         Err(error) if error.is_transient() => {
             return Frame::Error(FrameError::new(ErrorCode::Backpressure))
         }
         Err(_) => return Frame::Error(FrameError::new(ErrorCode::Backpressure)),
     };
+    // The decoder refuses a listing longer than `MAX_LIST`, so a group holding
+    // more objects than that would otherwise cost one head per object to build
+    // a reply the client cannot read. Truncate before the head loop.
+    names.truncate(wire::MAX_LIST);
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
         let Ok(hash) = hex_bytes(&name) else { continue };

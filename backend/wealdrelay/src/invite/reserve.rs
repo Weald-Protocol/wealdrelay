@@ -414,22 +414,32 @@ async fn consume(
     workspace_id: String,
     invite_expires_ms: i64,
 ) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(db)?;
     sqlx::query(
         "update relay_invite_reservation set consumed_at = now() \
          where token = $1 and join_nonce = $2 and consumed_at is null",
     )
     .bind(token)
     .bind(nonce)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
     // A void survives this. If revocation reached the grant while the join was in
     // flight, the seat is still spent (the reservation was real and the group work
     // was done) but the credential stays dead: the last frame of a join must not be
     // able to undo the admin's decision.
-    crate::access::store::grant(pool, &workspace_id, device_hash, invite_expires_ms)
-        .await
-        .map_err(|error| StoreError::Database(error.to_string()))?;
+    //
+    // Inside the transaction that spends the seat, as `reserve` does: a grant that
+    // failed after the consume landed left the seat spent and the joiner holding
+    // only the ten minute reservation credential, with the retry refused because
+    // `consumed_at` was already set (WEALD-382).
+    if let Err(error) =
+        crate::access::store::grant(&mut *tx, &workspace_id, device_hash, invite_expires_ms).await
+    {
+        tx.rollback().await.map_err(db)?;
+        return Err(StoreError::Database(error.to_string()));
+    }
+    tx.commit().await.map_err(db)?;
     Ok(())
 }
 
