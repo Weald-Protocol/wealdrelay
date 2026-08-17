@@ -266,11 +266,7 @@ fn rolled<'a>(
 /// ordinary path stays a hash lookup rather than a walk. Without it the map
 /// holds one entry per device that has ever made a blob request against this
 /// process, for the life of the process.
-fn sweep(
-    devices: &mut std::collections::HashMap<Vec<u8>, DeviceUsage>,
-    minute: u64,
-    day: u64,
-) {
+fn sweep(devices: &mut std::collections::HashMap<Vec<u8>, DeviceUsage>, minute: u64, day: u64) {
     if devices.len() <= crate::send_budget::MAX_TRACKED_DEVICES {
         return;
     }
