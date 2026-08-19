@@ -244,6 +244,24 @@ pub async fn reserve(
         );
     }
 
+    // A reservation past its own `expires_at` no longer holds quota. The client was
+    // told the reservation lives `ttl_seconds`; charging it for the 24 hour unclaimed
+    // grace instead would let a handful of abandoned reservations park a workspace for
+    // a day. The row and `reserved_bytes` are left alone: the unclaimed sweep still
+    // owns deleting the object an upload may still be writing, this only stops an
+    // expired charge from counting against the next reservation.
+    let expired: i64 = sqlx::query(
+        "select coalesce(sum(bytes), 0)::bigint as expired from relay_blob_reservation \
+         where workspace_id = $1 and finalized_at is null and expires_at < now()",
+    )
+    .bind(workspace)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db)?
+    .try_get("expired")
+    .map_err(db)?;
+    let reserved = (reserved - expired).max(0);
+
     if let Some(limit) = limit {
         if stored + reserved + bytes > limit {
             // Nothing to undo: the transaction is dropped on return, which rolls

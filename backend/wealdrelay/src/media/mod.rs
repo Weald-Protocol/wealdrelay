@@ -342,6 +342,9 @@ pub async fn handle(
         wire::Request::RetentionDestruction(record) => {
             handle_destruction(state, session, pool, &record).await
         }
+        wire::Request::RetentionResolution(record) => {
+            handle_resolution(session, pool, &record).await
+        }
     }
 }
 
@@ -894,6 +897,35 @@ async fn handle_control(
         }
         Err(error) => {
             tracing::warn!(error = %error, "media: retention control store failed");
+            Frame::Error(FrameError::new(ErrorCode::Backpressure))
+        }
+    }
+}
+
+/// WEALD-L294: the resolution frame `media.md` promised and nothing wired.
+/// `clear_freeze` existed since freezing shipped; no `Request` variant could
+/// ever carry the record that was supposed to trigger it, so a frozen group
+/// had no client-reachable recovery. This is that path.
+async fn handle_resolution(
+    session: &Session,
+    pool: &sqlx::PgPool,
+    record: &wire::RetentionResolution,
+) -> Frame {
+    if authorize_group(pool, session, &record.group).await.is_err() {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    }
+    match retention::resolve_freeze(pool, record).await {
+        Ok(retention::ResolveOutcome::Cleared) => Frame::Blob {
+            payload: wire::Response::RetentionResolved.encode(),
+        },
+        Ok(retention::ResolveOutcome::BadSignature) => {
+            Frame::Error(FrameError::new(ErrorCode::MalformedHeader))
+        }
+        Ok(retention::ResolveOutcome::UnknownVerifier) => {
+            Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet))
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "media: retention resolution store failed");
             Frame::Error(FrameError::new(ErrorCode::Backpressure))
         }
     }

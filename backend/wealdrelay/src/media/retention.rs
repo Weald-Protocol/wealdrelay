@@ -345,6 +345,62 @@ pub async fn clear_freeze(pool: &PgPool, group: &[u8]) -> Result<(), StoreError>
     Ok(())
 }
 
+/// What resolving one `RetentionResolution` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// The freeze is cleared. Also returned when the group was not frozen at
+    /// all, since applying an already-applied resolution is not an error.
+    Cleared,
+    /// The signature does not verify against the verifier the record names.
+    BadSignature,
+    /// `verifier` is not one of the candidates on file for this `(group,
+    /// epoch)` — neither the settled control nor a recorded conflict — so
+    /// this is not a genuine resolution of *this* freeze.
+    UnknownVerifier,
+}
+
+/// Apply one `RetentionResolution` (`media.md`'s "any member holding the true
+/// epoch secret publishes a signed resolution naming which control is
+/// genuine").
+///
+/// The resolution is self-signed by the verifier it names, exactly like a
+/// genesis `RetentionControl`: the relay checks that the signature verifies
+/// against `record.verifier`, and that `verifier` matches a candidate already
+/// on record for this epoch (the winner in `relay_retention_control` or a
+/// loser in `relay_retention_control_conflict`). That is all the relay is
+/// positioned to check — it has no MLS state and cannot tell which candidate
+/// is the group's true successor, only that the caller derives one of the
+/// candidates it already saw asserted for this epoch, which is the same
+/// "current member" proof a genesis control carries.
+pub async fn resolve_freeze(
+    pool: &PgPool,
+    record: &super::wire::RetentionResolution,
+) -> Result<ResolveOutcome, StoreError> {
+    if !crate::access::verify(&record.verifier, &record.signing_bytes(), &record.sig) {
+        return Ok(ResolveOutcome::BadSignature);
+    }
+    let known = if let Some(control) = control_at(pool, &record.group, record.epoch).await? {
+        control.verifier == record.verifier
+    } else {
+        false
+    } || sqlx::query(
+        "select 1 from relay_retention_control_conflict \
+         where group_id = $1 and epoch = $2 and verifier = $3 limit 1",
+    )
+    .bind(&record.group)
+    .bind(record.epoch as i64)
+    .bind(&record.verifier)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?
+    .is_some();
+    if !known {
+        return Ok(ResolveOutcome::UnknownVerifier);
+    }
+    clear_freeze(pool, &record.group).await?;
+    Ok(ResolveOutcome::Cleared)
+}
+
 /// What accepting a `RetentionManifest` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestOutcome {

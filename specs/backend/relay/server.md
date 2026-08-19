@@ -33,14 +33,14 @@ Everything else on this page is packaging around that one binary.
 
 ## Dependencies the operator must provide
 
-Three, all of them commodity, all of them things a hosting provider offers as a
+Two, both of them commodity, both of them things a hosting provider offers as a
 managed add-on.
 
 | Dependency | Purpose | Can it be omitted |
 | --- | --- | --- |
 | PostgreSQL 15+ | Envelope log, group heads, key packages, quotas. | No. |
 | S3-compatible object storage | Encrypted media blobs. | Yes, falls back to a local filesystem path for single-node installs. |
-| Redis 7+ | Fanout across multiple relay processes, presence, ephemeral kinds. | Yes, omit for single-process installs; the binary uses in-process channels instead. |
+| Redis 7+ | None in this build: nothing in the binary dials it. | Yes, always. `WEALD_RELAY_REDIS_URL` is read as a process-count assertion, not as a connection to open. |
 
 A minimum viable deployment is therefore `wealdrelay` plus Postgres plus a disk.
 That runs comfortably for a 30-person team on the smallest instance every
@@ -59,7 +59,9 @@ arm64, distroless base, non-root, no shell. Signed with cosign, SBOM attached,
 provenance attestation via SLSA level 3.
 
 **2. Compose bundle.** One `docker-compose.yml`, one `.env.example`, one
-`README.md`. Includes Postgres, MinIO, Redis and Caddy for automatic TLS.
+`README.md`. Includes Postgres, MinIO and Caddy for automatic TLS. No Redis:
+the bundle is one relay process and nothing in the binary dials Redis, so a
+Redis container would be a dependency nothing reads.
 
 ```
 curl -fsSL https://get.weald.team/relay | sh
@@ -97,7 +99,7 @@ WEALD_RELAY_STORAGE_URL    s3://bucket  |  file:///var/lib/wealdrelay/blobs
 Optional, with defaults that work:
 
 ```
-WEALD_RELAY_REDIS_URL          unset, single-process mode
+WEALD_RELAY_REDIS_URL          unset, one process. Setting it declares a second process, and turns presence and calls off
 WEALD_RELAY_LISTEN             0.0.0.0:8443
 WEALD_RELAY_TLS                acme | file | off
 WEALD_RELAY_MAX_STORAGE_GB     unlimited
@@ -108,6 +110,19 @@ WEALD_RELAY_WRITE_MODE         full | read_only (default full)
 WEALD_RELAY_BOOTSTRAP_HANDOFF_PUBKEY  unset, X25519 public key for a one-time sealed bootstrap handoff
 WEALD_RELAY_OBSERVABILITY_LISTEN  127.0.0.1:9090 (private health and metrics listener)
 ```
+
+**`WEALD_RELAY_REDIS_URL`.** A process-count assertion, not a connection string:
+nothing in this binary dials it, and setting it declares that the deployment
+runs more than one relay process. The consequence is the point of the variable,
+and it is a refusal rather than a warning. Presence and calls are process-local,
+so a deployment with more than one process can have neither: startup refuses
+`WEALD_RELAY_LIVE_FANOUT=process` and `WEALD_RELAY_CALLS=on` while it is set
+(`config.rs: enforce_live_fanout`, `enforce_calls`). There is no configuration
+that gets them back short of a single process. Unset it to return to one, or
+turn the feature off. The ephemeral path therefore does not scale by adding
+processes; it scales by making the one process bigger. When a shared fanout
+exists, this variable and the `WEALD_RELAY_LIVE_FANOUT` value that makes it
+legal come back together.
 
 Two of those decide security posture, so their semantics are pinned here rather
 than left to the implementation:
@@ -252,7 +267,7 @@ on it does not exist.
 | --- | --- | --- |
 | `WEALD_RELAY_DATABASE_URL` | the relay's own Postgres | boot failure. Required |
 | `WEALD_RELAY_STORAGE_URL` | the relay's own object store, ciphertext only | boot failure. Required |
-| `WEALD_RELAY_REDIS_URL` | a declared second instance | one process, which is the ordinary shape |
+| `WEALD_RELAY_REDIS_URL` | nothing: read as a process-count assertion, dialled by nothing | one process, which is the ordinary shape; presence and calls work |
 | `WEALD_RELAY_PUSH_URL` | a ringer's wake route, chosen by the operator | no outbound wake leg. This is the default |
 | `WEALD_RELAY_PUSH_REGISTER_URL` | a ringer's registration route, stated to clients | the wake url's host with the contract's registration path |
 
@@ -353,7 +368,12 @@ Measured against a synthetic 30-person workspace with 12 concurrent agents.
 | --- | --- | --- | --- |
 | 3 to 10 | 1 vCPU, 512 MB | 1 GB | ~400 MB/month |
 | 10 to 30 | 1 vCPU, 1 GB | 5 GB | ~2 GB/month |
-| 30 to 100 | 2 vCPU, 2 GB, 2 replicas + Redis | 20 GB | ~8 GB/month |
+| 30 to 100 | 2 vCPU, 2 GB, one process | 20 GB | ~8 GB/month |
+
+Every row is one relay process. The ephemeral path (presence, calls) does not
+scale by adding processes: a second process turns both off, per the
+`WEALD_RELAY_REDIS_URL` consequence above, so a larger team gets a larger single
+instance, never a second one.
 
 Media dominates storage. Text is small but not negligible, and the earlier
 figures on this table were optimistic because they ignored three things that are

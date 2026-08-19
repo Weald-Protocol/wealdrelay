@@ -506,10 +506,11 @@ impl RelayState {
         // even with both dependencies up. A load balancer using this to decide
         // whether to send traffic should stop sending writes to a relay in
         // maintenance mode.
-        let ready = database.ok
-            && storage.ok
-            && matches!(self.config.write_mode, WriteMode::Full)
-            && frozen_groups.is_empty();
+        // A frozen group is a per-group nuisance (`specs/backend/relay/media.md`
+        // scopes it to "that group"), so it is reported in this document for
+        // diagnosis but never changes the process-level verdict. Letting it do
+        // so takes every unrelated workspace on the instance out of rotation.
+        let ready = database.ok && storage.ok && matches!(self.config.write_mode, WriteMode::Full);
 
         Readiness {
             build: self.build.line(),

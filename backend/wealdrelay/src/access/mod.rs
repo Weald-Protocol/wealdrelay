@@ -279,12 +279,13 @@ impl AccessSet {
     /// who is not a member is an authorizer who cannot connect to use the authority
     /// the set grants them.
     pub fn principals_are_entries(&self, salt: &[u8]) -> Result<(), AccessError> {
+        // One hash per principal, membership decided against a set: the linear
+        // scan hashed once per entry per principal, so a maximal frame cost
+        // millions of keyed BLAKE3 evaluations before any signature was checked.
+        let entries: std::collections::HashSet<&[u8]> =
+            self.entries.iter().map(|e| e.as_slice()).collect();
         for key in self.authorizers.iter().chain(self.recovery.iter()) {
-            if !self
-                .entries
-                .iter()
-                .any(|entry| entry == &entry_hash(key, salt))
-            {
+            if !entries.contains(entry_hash(key, salt).as_slice()) {
                 return Err(AccessError::PrincipalNotAnEntry);
             }
         }

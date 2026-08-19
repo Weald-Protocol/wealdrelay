@@ -497,8 +497,10 @@ pub enum ConfigError {
     /// nothing anywhere reporting a fault. A relay that will not start is a page a
     /// human reads; a half room is one nobody ever sees.
     #[error(
-        "{key}=process is refused because {declared} declares more than one instance; \
-         set {key} to a shared fanout url or set WEALD_RELAY_LIVE=off"
+        "{declared} declares more than one process, and this build has no shared fanout, \
+         so presence cannot cross processes: {key}=process is refused. Nothing gets \
+         presence back short of a single process: unset {declared} to return to one, or \
+         set WEALD_RELAY_LIVE=off"
     )]
     LiveFanoutSingleProcess {
         key: &'static str,
@@ -552,8 +554,9 @@ pub enum ConfigError {
     /// degrades to reconciliation across a process boundary; a call has no
     /// reconciliation to degrade to.
     #[error(
-        "{key}=on is refused because {declared} declares more than one instance and call routing \
-         is process local; unset {declared} or set {key}=off"
+        "{declared} declares more than one process and call routing is process-local, so \
+         calls cannot cross processes: {key}=on is refused. Nothing gets calls back short \
+         of a single process: unset {declared} to return to one, or set {key}=off"
     )]
     CallsSingleProcess {
         key: &'static str,

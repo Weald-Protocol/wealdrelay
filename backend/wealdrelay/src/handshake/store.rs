@@ -24,6 +24,11 @@ pub enum StoreError {
     Database(String),
     #[error("{0}")]
     Refused(#[from] HandshakeError),
+    /// The workspace's log is at `WEALD_RELAY_MAX_LOG_GB`. Handshake bytes count
+    /// against the same counter envelopes do, so this is the same refusal `SEND`
+    /// gives, on the same ceiling.
+    #[error("log budget exhausted: {limit} bytes")]
+    LogBudgetExhausted { limit: i64 },
 }
 
 fn db(error: sqlx::Error) -> StoreError {
@@ -57,7 +62,24 @@ impl Appended {
 }
 
 /// Store one handshake message and return its place in the order.
+///
+/// Unlimited, for callers with no configured ceiling and for tests. The socket
+/// path calls `append_within`.
 pub async fn append(pool: &PgPool, handshake: &Handshake) -> Result<Appended, StoreError> {
+    append_within(pool, handshake, None).await
+}
+
+/// The same append, refused when it would take the workspace past `limit`.
+///
+/// Checked inside the transaction and after the insert, exactly as the accept
+/// path checks the envelope log: the trigger has already charged the counter, so
+/// the read sees the total after this write and two concurrent committers cannot
+/// both slip through the last few bytes.
+pub async fn append_within(
+    pool: &PgPool,
+    handshake: &Handshake,
+    limit: Option<i64>,
+) -> Result<Appended, StoreError> {
     handshake.check()?;
     let hash = handshake.hash();
 
@@ -104,6 +126,31 @@ pub async fn append(pool: &PgPool, handshake: &Handshake) -> Result<Appended, St
     .execute(&mut *tx)
     .await
     .map_err(db)?;
+    if let Some(limit) = limit {
+        let workspace: Option<String> =
+            sqlx::query_scalar("select workspace_id from relay_group where group_id = $1")
+                .bind(&handshake.group)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db)?;
+        if let Some(workspace) = workspace {
+            let used: i64 = sqlx::query_scalar(
+                "select used_bytes from relay_log_budget where workspace_id = $1",
+            )
+            .bind(&workspace)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            // The trigger inserted the row in this transaction, so it is there.
+            // Zero is the honest answer if it somehow is not, and it keeps a
+            // vanished accounting row from costing a member their commit.
+            .unwrap_or(0);
+            if crate::log_budget::over_budget(used, 0, Some(limit)) {
+                tx.rollback().await.map_err(db)?;
+                return Err(StoreError::LogBudgetExhausted { limit });
+            }
+        }
+    }
     tx.commit().await.map_err(db)?;
     Ok(Appended::Stored(next as u64))
 }

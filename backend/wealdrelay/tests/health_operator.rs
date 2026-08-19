@@ -204,17 +204,20 @@ async fn an_unauthenticated_readyz_carries_the_verdict_and_nothing_derived_from_
     .expect("freeze a group");
     let prefix = &wealdrelay::logging::hex_prefix(&group);
 
-    // Unauthenticated: the verdict, truthfully 503 (a frozen group is not ready),
-    // and no value derived from a group id anywhere in the body.
+    // Unauthenticated: the verdict, and no value derived from a group id anywhere
+    // in the body. The verdict is 200, because a freeze is scoped to one group
+    // (`specs/backend/relay/media.md`, the freeze is reported on `/readyz`, it is
+    // not the process verdict) and taking the instance out of rotation would take
+    // every unrelated workspace on it down with the frozen one.
     let (status, body) = ask_at(&relay.state, "/readyz", None).await;
-    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, axum::http::StatusCode::OK);
     assert!(
         !body.contains(prefix) && !body.contains("frozen"),
         "the unauthenticated body leaked a group handle: {body}"
     );
     let verdict: serde_json::Value = serde_json::from_str(&body).expect("json");
-    assert_eq!(verdict["ready"], false);
-    assert_eq!(verdict["ok"], false);
+    assert_eq!(verdict["ready"], true);
+    assert_eq!(verdict["ok"], true);
     assert_eq!(
         verdict.as_object().map(|fields| fields.len()),
         Some(2),
@@ -227,7 +230,7 @@ async fn an_unauthenticated_readyz_carries_the_verdict_and_nothing_derived_from_
 
     // The operator sees the document the control plane polls, frozen group named.
     let (status, body) = ask_at(&relay.state, "/readyz", Some(&format!("Bearer {TOKEN}"))).await;
-    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, axum::http::StatusCode::OK);
     assert!(
         body.contains(prefix),
         "the operator document lost the frozen group: {body}"

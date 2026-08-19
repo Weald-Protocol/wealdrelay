@@ -87,6 +87,20 @@ pub const REGISTRATIONS_PER_HOUR: u32 = 5;
 /// The window the rate ceiling is measured over, in milliseconds.
 pub const RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
 
+/// The furthest ahead of now a registration's `expires_at` may sit.
+///
+/// Thirty days, the ringer's own handle lifetime
+/// (`backend/weald-ringer/src/handles/store.ts:30`). A row the janitor sweep can
+/// never reap is a row an admitted device can hold a handle with forever, so the
+/// ceiling is charged at the boundary, and `push.md` section 4's "already past"
+/// refusal is charged with it.
+pub const MAX_EXPIRY_AHEAD_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Whether a stated expiry is one the relay will store, given the current time.
+pub fn expiry_in_bounds(expires_at_ms: u64, now_ms: u64) -> bool {
+    expires_at_ms > now_ms && expires_at_ms <= now_ms.saturating_add(MAX_EXPIRY_AHEAD_MS)
+}
+
 /// The bound on the wake queue, when the operator has not said otherwise.
 ///
 /// A bound and not a target. Push is best effort by construction: the client's
@@ -486,4 +500,40 @@ pub fn spawn(state: &Arc<crate::health::RelayState>) -> Option<tokio::task::Join
     }
     let state = Arc::clone(state);
     Some(tokio::spawn(worker::run(state)))
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::{expiry_in_bounds, MAX_EXPIRY_AHEAD_MS};
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn refuses_past_and_present() {
+        assert!(!expiry_in_bounds(NOW - 1, NOW));
+        assert!(!expiry_in_bounds(NOW, NOW));
+        assert!(!expiry_in_bounds(0, NOW));
+    }
+
+    #[test]
+    fn refuses_beyond_the_ceiling() {
+        assert!(!expiry_in_bounds(NOW + MAX_EXPIRY_AHEAD_MS + 1, NOW));
+        assert!(!expiry_in_bounds(u64::MAX, NOW));
+    }
+
+    #[test]
+    fn accepts_up_to_the_ceiling() {
+        assert!(expiry_in_bounds(NOW + 1, NOW));
+        assert!(expiry_in_bounds(NOW + MAX_EXPIRY_AHEAD_MS, NOW));
+    }
+
+    #[test]
+    fn every_accepted_expiry_is_sweepable() {
+        for step in 0..64u64 {
+            let candidate = NOW.saturating_add(step.saturating_mul(u64::MAX / 64));
+            if expiry_in_bounds(candidate, NOW) {
+                assert!(candidate <= NOW + MAX_EXPIRY_AHEAD_MS);
+            }
+        }
+    }
 }

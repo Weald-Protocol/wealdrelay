@@ -783,7 +783,8 @@ pub fn record_evidence(step: &str, name: &str, contents: &str) {
 
 use wealdrelay::lifecycle::wire::DropBefore;
 use wealdrelay::media::wire::{
-    RetentionControl, RetentionDestruction, RetentionManifest, RetentionPolicy, Signature,
+    RetentionControl, RetentionDestruction, RetentionManifest, RetentionPolicy,
+    RetentionResolution, Signature,
 };
 
 /// The configuration `config_for` builds, plus whatever else the caller needs.
@@ -921,6 +922,21 @@ pub fn signed_control(
         sig: vec![0u8; 64],
     };
     record.sig = Signer::sign(authority, &record.signing_bytes())
+        .to_bytes()
+        .to_vec();
+    record
+}
+
+/// A `RetentionResolution` self-signed by `key`, naming `key` as the epoch's
+/// genuine verifier — the WEALD-L294 recovery message.
+pub fn signed_resolution(group: &[u8], epoch: u64, key: &SigningKey) -> RetentionResolution {
+    let mut record = RetentionResolution {
+        group: group.to_vec(),
+        epoch,
+        verifier: key.verifying_key().to_bytes().to_vec(),
+        sig: vec![0u8; 64],
+    };
+    record.sig = Signer::sign(key, &record.signing_bytes())
         .to_bytes()
         .to_vec();
     record

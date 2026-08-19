@@ -109,6 +109,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0016_multipart_survives_release",
         include_str!("../migrations/0016_multipart_survives_release.sql"),
     ),
+    (
+        "0017_handshake_log_budget",
+        include_str!("../migrations/0017_handshake_log_budget.sql"),
+    ),
 ];
 
 /// The ledger of what has been applied. Created before anything else, and by the

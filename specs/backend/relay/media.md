@@ -282,6 +282,18 @@ one.
    relay applies it without being able to evaluate it, which is the correct
    division: the relay is the enforcement point for a decision it never makes.
 
+   The wire shape is `RetentionResolution { group, epoch, verifier, sig }`,
+   `BLOB` tag 6 (request) / 6 (response `RetentionResolved`, tag 11 on both
+   sides), self-signed by the verifier it names exactly like a genesis
+   control. The relay accepts it once `verifier` matches a candidate already
+   on file for `(group, epoch)`, either the settled `relay_retention_control` row or
+   a `relay_retention_control_conflict` row, and then clears
+   `relay_group.frozen_reason`. Until WEALD-L294, `clear_freeze` existed in
+   `backend/wealdrelay/src/media/retention.rs` and nothing on the wire could
+   ever call it: a frozen group had no client-reachable recovery at all. See
+   `Sources/Sync/RetentionRecords.swift`'s `Resolution` and
+   `Weald relay-client resolve-freeze --id EPOCH`.
+
 The resulting property, stated at its real strength rather than a flattering one:
 a removed member cannot cause deletion, because their forged branch freezes the
 group instead of governing it. They can cause a **freeze**, meaning the group

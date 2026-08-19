@@ -117,6 +117,14 @@ pub const JOIN_FRAMES_PER_MINUTE: u32 = 20;
 /// per group, and far below a peer pipelining maximum-size frames at line rate.
 pub const HANDSHAKE_FRAMES_PER_MINUTE: u32 = 120;
 
+/// `ACCESS` frames one connection may send per minute.
+///
+/// Judging a publication hashes every authorizer and recovery principal and reads
+/// the prior set before the signature is even looked at, so an unbudgeted `ACCESS`
+/// is a shape check a peer can repeat at socket speed. Set far above real use, one
+/// frame per membership change, and far below a pipelining peer.
+pub const ACCESS_FRAMES_PER_MINUTE: u32 = 30;
+
 /// `SUB` frames one connection may send per minute.
 ///
 /// Above `MAX_GROUPS_PER_CONNECTION`, deliberately and with room to spare: a cold
@@ -368,6 +376,9 @@ pub struct Session {
     /// allowance because the two share no counter: `send_budget::charge` runs in
     /// the `Work::Accept` arm only, so nothing bounded this path at all.
     handshake_budget: FrameBudget,
+    /// `ACCESS` frames per minute. Nothing bounded this path at all before it
+    /// existed: the arm deferred the rotation with no charge.
+    access_budget: FrameBudget,
     /// `SUB` and `RECON` frames per minute, each budgeted separately from the
     /// others and from each other. They are the two largest amplifiers on the
     /// socket, a small frame against a query plus a replay, so an unbudgeted one
@@ -415,6 +426,7 @@ impl Session {
             live_budget: FrameBudget::default(),
             keys_budget: FrameBudget::default(),
             handshake_budget: FrameBudget::default(),
+            access_budget: FrameBudget::default(),
             sub_budget: FrameBudget::default(),
             recon_budget: FrameBudget::default(),
             join_budget: FrameBudget::default(),
@@ -648,6 +660,17 @@ impl Session {
             // The one frame a bootstrapping session may send, and the reason that
             // state exists.
             (State::Ready | State::Bootstrapping, Frame::Access { body }) => {
+                // Charged before the work is deferred, like every sibling arm: the
+                // judgement hashes every principal and reads the prior set, so an
+                // unbudgeted `ACCESS` is one admitted device pipelining maximal
+                // rosters at line rate against a shared runtime.
+                if !self.access_budget.charge(now_ms, ACCESS_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(ACCESS_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::RotateAccessSet { body })
             }
             // Ready only, unlike `ACCESS`. A bootstrapping session has no group

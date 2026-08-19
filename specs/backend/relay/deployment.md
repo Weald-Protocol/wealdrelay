@@ -41,8 +41,10 @@ trust root and refuses afterwards, permanently.
 
 ## Path 2: Compose on a VPS
 
-Three commands, per `specs/backend/relay/server.md`. Postgres, MinIO, Redis and
-Caddy in one file, one hostname to edit.
+Three commands, per `specs/backend/relay/server.md`. Postgres, MinIO and
+Caddy in one file, one hostname to edit. No Redis: the bundle is a single relay
+process, and `WEALD_RELAY_REDIS_URL` is a process-count assertion nothing dials
+(`specs/backend/relay/server.md`).
 
 Failure points, all DNS: a hostname pointed at the wrong address, or a Caddy
 certificate that cannot be issued because port 80 is closed. The bundle's health

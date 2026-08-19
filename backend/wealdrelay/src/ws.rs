@@ -745,7 +745,20 @@ async fn rotate_access_set(
     // root publishing the first set has no groups yet, because groups are made by
     // the trust root. Neither half reads the session's memory, which is the rule a
     // relay that served one workspace's state to another would have broken.
-    match store::publish_for(database.pool(), session.requested(), &candidate, &body).await {
+    // A session that was admitted rotates the set of the workspace it was admitted
+    // into, never the first group id it happened to name: group ids are
+    // client-derived, so a member of A can squat an id B also names, and resolving
+    // by first match would judge B's own rotation against A's chain and refuse it
+    // forever. `state_for` already takes the bound workspace for the same reason.
+    // The group-resolved form stays for a session that carries no claim, which is
+    // the founding publication and `WEALD_RELAY_ACCESS_SET=off`.
+    let published = match session.authorized_workspace() {
+        Some(workspace) => store::publish(database.pool(), workspace, &candidate, &body)
+            .await
+            .map(store::Published::Accepted),
+        None => store::publish_for(database.pool(), session.requested(), &candidate, &body).await,
+    };
+    match published {
         Ok(store::Published::Accepted(accepted)) => {
             // The half of offboarding the relay owns. An `ACCESS` frame that drops
             // an entry closes that device's open connections immediately; combined
@@ -1130,7 +1143,8 @@ async fn publish_handshake(
         Err(code) => return queue_all(sender, vec![Frame::Error(FrameError::new(code))]),
     };
 
-    match store::append(pool, &handshake).await {
+    let limit = crate::log_budget::limit_bytes(&state.config);
+    match store::append_within(pool, &handshake, limit).await {
         Ok(appended) => {
             let frame = Frame::Handshake {
                 group: handshake.group.clone(),
@@ -1169,6 +1183,12 @@ async fn publish_handshake(
         Err(store::StoreError::Database(_)) => queue_all(
             sender,
             vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+        ),
+        // The same ceiling `SEND` refuses on, because handshake bytes are counted
+        // by the same counter. Nothing was written.
+        Err(store::StoreError::LogBudgetExhausted { .. }) => queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(ErrorCode::LogBudgetExhausted))],
         ),
     }
 }
@@ -1308,6 +1328,13 @@ pub async fn wake_answer(
             categories,
             expires_at,
         } => {
+            // An expiry already past is `push.md` section 4's stated refusal, and one
+            // beyond the ringer's thirty day lifetime is a row the janitor sweep could
+            // never reap: either way the bytes are permanently wrong for this
+            // principal, so it is a reject and the client re-mints at the ringer.
+            if !crate::push::expiry_in_bounds(expires_at, now_ms) {
+                return Frame::Error(FrameError::new(ErrorCode::PushHandleMalformed));
+            }
             // The ceiling is charged before the write, because the write is what it
             // exists to protect. Per principal rather than per connection, so a device
             // that reconnects does not get a fresh allowance.

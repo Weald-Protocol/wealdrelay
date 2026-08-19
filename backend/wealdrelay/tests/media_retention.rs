@@ -32,7 +32,8 @@ use wealdrelay::media::store;
 
 use support::{
     blob_hash, config_for, device_from, make_group_in, sign_all, signed_control,
-    signed_destruction, signed_manifest, signed_policy, verifier_key, Running, Scratch,
+    signed_destruction, signed_manifest, signed_policy, signed_resolution, verifier_key, Running,
+    Scratch,
 };
 
 const DAY: u64 = 24 * 60 * 60;
@@ -282,7 +283,24 @@ async fn a_second_differently_signed_control_freezes_the_group_rather_than_gover
     // "Only a client can clear a freeze." Members derive the correct verifier
     // from their own MLS state and publish a resolution; the relay applies it
     // without being able to evaluate it, which is the correct division.
-    retention::clear_freeze(pool, &group).await.unwrap();
+    // WEALD-L294: this is the actual wire message, not a direct pool call —
+    // until it existed, nothing could ever reach `clear_freeze` and a frozen
+    // group had no client-reachable recovery.
+    let bad_verifier = signed_resolution(&group, 1, &verifier_key(0x99));
+    assert_eq!(
+        retention::resolve_freeze(pool, &bad_verifier)
+            .await
+            .unwrap(),
+        retention::ResolveOutcome::UnknownVerifier,
+        "a verifier that never appeared for this epoch resolves nothing"
+    );
+    assert!(retention::is_frozen(pool, &group).await.unwrap());
+
+    let resolution = signed_resolution(&group, 1, &honest);
+    assert_eq!(
+        retention::resolve_freeze(pool, &resolution).await.unwrap(),
+        retention::ResolveOutcome::Cleared
+    );
     assert!(!retention::is_frozen(pool, &group).await.unwrap());
 
     // A group the relay has never heard of is not frozen, and asking is not an

@@ -218,7 +218,8 @@ async fn an_applied_migration_that_has_since_been_edited_is_refused() {
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
             "0015_gc_restore_marker".to_string(),
-            "0016_multipart_survives_release".to_string()
+            "0016_multipart_survives_release".to_string(),
+            "0017_handshake_log_budget".to_string()
         ]
     );
 
@@ -622,7 +623,7 @@ async fn a_relay_running_access_set_off_says_so_on_readyz() {
 }
 
 #[tokio::test]
-async fn a_frozen_group_is_named_on_readyz_and_stops_readiness() {
+async fn a_frozen_group_is_named_on_readyz_and_does_not_stop_readiness() {
     // `media.md`: a group whose retention control chain has a contested successor
     // is reported as frozen on `/readyz`. Nothing can freeze a group until step 10,
     // so the column is set directly here: the point is that the document reports
@@ -653,7 +654,11 @@ async fn a_frozen_group_is_named_on_readyz_and_stops_readiness() {
         readiness.frozen_groups[0],
         "ababababababab".get(..12).unwrap()
     );
-    assert!(!readiness.ready);
+    // Named, and still ready. A freeze is scoped to one group
+    // (`specs/backend/relay/media.md`: the relay refuses retention-driven deletion
+    // for that group and reports it on `/readyz`), so it is a per-group nuisance
+    // for diagnosis rather than the process verdict. See `health.rs`'s `ready`.
+    assert!(readiness.ready);
 
     scratch.drop_database().await;
 }
@@ -1147,7 +1152,8 @@ async fn a_pool_the_caller_already_holds_can_be_wrapped_and_used() {
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
             "0015_gc_restore_marker".to_string(),
-            "0016_multipart_survives_release".to_string()
+            "0016_multipart_survives_release".to_string(),
+            "0017_handshake_log_budget".to_string()
         ]
     );
     // The same pool, and not a copy of the configuration that opened another one.
@@ -1346,7 +1352,8 @@ async fn a_transaction_that_cannot_be_committed_is_reported_and_not_assumed() {
             "0013_invite_bundle_issued".to_string(),
             "0014_ciphertext_storage_external".to_string(),
             "0015_gc_restore_marker".to_string(),
-            "0016_multipart_survives_release".to_string()
+            "0016_multipart_survives_release".to_string(),
+            "0017_handshake_log_budget".to_string()
         ]
     );
 

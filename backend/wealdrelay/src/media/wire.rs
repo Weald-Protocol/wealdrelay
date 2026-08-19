@@ -151,6 +151,65 @@ impl RetentionControl {
     }
 }
 
+/// `RetentionResolution { group, epoch, verifier, sig }`.
+///
+/// `media.md`'s third successor-race rule: "any member holding the true epoch
+/// secret publishes a signed resolution naming which control is genuine." The
+/// resolution is self-signed by the verifier it names, exactly like a genesis
+/// `RetentionControl` — proof that the sender currently derives that key from
+/// their own MLS state, not a claim the relay evaluates for meaning. The relay
+/// only checks that `verifier` is one of the candidates already on file for
+/// `(group, epoch)` (the settled control or a recorded conflict) before
+/// clearing the freeze; WEALD-L294 is the freeze this message exists to clear
+/// and, until now, had no wire frame that could ever carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionResolution {
+    pub group: Vec<u8>,
+    pub epoch: u64,
+    pub verifier: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+impl RetentionResolution {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        cbor::array(&[
+            cbor::bytes(&self.group),
+            cbor::uint(self.epoch),
+            cbor::bytes(&self.verifier),
+        ])
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        cbor::array(&[
+            cbor::bytes(&self.group),
+            cbor::uint(self.epoch),
+            cbor::bytes(&self.verifier),
+            cbor::bytes(&self.sig),
+        ])
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MediaWireError> {
+        let mut reader = Reader::new(bytes);
+        let record = Self::decode_from(&mut reader)?;
+        reader.finish()?;
+        Ok(record)
+    }
+
+    fn decode_from(reader: &mut Reader<'_>) -> Result<Self, MediaWireError> {
+        reader.array(4)?;
+        let group = reader.bytes_of(HASH_BYTES)?;
+        let epoch = reader.uint()?;
+        let verifier = reader.bytes_of(KEY_BYTES)?;
+        let sig = reader.bytes_of(SIG_BYTES)?;
+        Ok(Self {
+            group,
+            epoch,
+            verifier,
+            sig,
+        })
+    }
+}
+
 /// `RetentionManifest { group, epoch, sequence, prev_manifest_hash, blobs, sig }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionManifest {
@@ -411,6 +470,7 @@ pub enum Request {
     RetentionManifest(RetentionManifest),
     RetentionPolicy(RetentionPolicy),
     RetentionDestruction(RetentionDestruction),
+    RetentionResolution(RetentionResolution),
 }
 
 const TAG_PUT: u64 = 1;
@@ -423,6 +483,7 @@ const TAG_RETENTION_MANIFEST: u64 = 7;
 const TAG_RETENTION_POLICY: u64 = 8;
 const TAG_RETENTION_DESTRUCTION: u64 = 9;
 const TAG_LIST: u64 = 10;
+const TAG_RETENTION_RESOLUTION: u64 = 11;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -490,6 +551,7 @@ impl Request {
             Self::RetentionManifest(record) => (TAG_RETENTION_MANIFEST, record.encode()),
             Self::RetentionPolicy(record) => (TAG_RETENTION_POLICY, record.encode()),
             Self::RetentionDestruction(record) => (TAG_RETENTION_DESTRUCTION, record.encode()),
+            Self::RetentionResolution(record) => (TAG_RETENTION_RESOLUTION, record.encode()),
         };
         cbor::array(&[cbor::uint(tag), body])
     }
@@ -587,6 +649,11 @@ impl Request {
                 reader.finish()?;
                 Self::RetentionDestruction(record)
             }
+            TAG_RETENTION_RESOLUTION => {
+                let record = RetentionResolution::decode_from(&mut reader)?;
+                reader.finish()?;
+                Self::RetentionResolution(record)
+            }
             other => return Err(MediaWireError::UnknownTag(other)),
         })
     }
@@ -628,6 +695,8 @@ pub enum Response {
     Listing {
         entries: Vec<(Vec<u8>, u64)>,
     },
+    /// A `RetentionResolution` cleared the freeze it named.
+    RetentionResolved,
 }
 
 const RTAG_UPLOAD: u64 = 1;
@@ -640,6 +709,7 @@ const RTAG_MULTIPART_COMPLETED: u64 = 7;
 const RTAG_MULTIPART_ABORTED: u64 = 8;
 const RTAG_RETENTION_ACK: u64 = 9;
 const RTAG_LISTING: u64 = 10;
+const RTAG_RETENTION_RESOLVED: u64 = 11;
 
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
@@ -693,6 +763,7 @@ impl Response {
                         .collect::<Vec<_>>(),
                 )]),
             ),
+            Self::RetentionResolved => (RTAG_RETENTION_RESOLVED, cbor::array(&[])),
         };
         cbor::array(&[cbor::uint(tag), body])
     }
@@ -776,6 +847,11 @@ impl Response {
                 }
                 reader.finish()?;
                 Self::Listing { entries }
+            }
+            RTAG_RETENTION_RESOLVED => {
+                reader.array(0)?;
+                reader.finish()?;
+                Self::RetentionResolved
             }
             other => return Err(MediaWireError::UnknownTag(other)),
         })

@@ -195,9 +195,11 @@ put a permanent, reconciled, checkpointed record of every member's working hours
 into the group history, which is the single worst artifact this product could
 produce, and it would do it at a thousand times the volume of the content.
 
-**Redis fanout now.** `specs/backend/relay/server.md` lists Redis as optional and
-for exactly this. A single relay process fans out from its own hub with no
-dependency. The plan does not add Redis, and it does add the gate: presence
+**Redis fanout now.** `specs/backend/relay/server.md` states the current shape:
+nothing in the binary dials Redis, and `WEALD_RELAY_REDIS_URL` is a process-count
+assertion declaring a second instance rather than a connection to open. A single
+relay process fans out from its own hub with no dependency. The plan does not
+add Redis, and it does add the gate: presence
 across two relay processes is not correct until a shared fanout exists, so a
 multi-process deployment is refused at startup while `LIVE` is enabled and no
 fanout is configured, rather than quietly showing half the room.
