@@ -84,34 +84,44 @@ jobs:
       - if: always()
         run: scripts/weald-stack down
 
-  # Two independent runners must produce byte-identical artifacts. They differ
-  # in architecture as well as identity, which is a stronger claim than two of
-  # the same: a build that depended on its host would have two chances to say so.
+  # Two independent runners must produce byte-identical artifacts. `fetch-depth:
+  # 0` is load-bearing: relay-reproduce.sh takes SOURCE_DATE_EPOCH from the
+  # tagged commit's own timestamp, and a shallow clone has no commit to take it
+  # from.
   #
-  # `fetch-depth: 0` is load-bearing. relay-reproduce.sh takes
-  # SOURCE_DATE_EPOCH from the tagged commit's own timestamp, and a shallow
-  # clone has no commit to take it from.
+  # Both runners are native arm64, and that is a change. They used to differ in
+  # host architecture as well as identity, which is the stronger claim, and the
+  # x86_64 half of it built the pinned arm64 builder under QEMU: 10776 seconds
+  # against 557 native. Downstream of a test job that costs most of two hours,
+  # that put three hours of emulation on the critical path of every release, and
+  # wealdrelay-v0.1.25 was cancelled at 5h59m28s against GitHub's six hour
+  # ceiling with no image published at all. v0.1.24 had finished in 4h18m26s, so
+  # the budget was spent before that tag added anything.
+  #
+  # The cross-architecture claim is not dropped, it is moved. `cross-host` below
+  # runs the same build on an x86_64 host on every tag, starts at the same
+  # moment this job's dependency does rather than after it, and must agree with
+  # the digest these two settle on. What it no longer does is stand between the
+  # source and the push. A digest is not pinned in production until that job is
+  # green (scripts/relay-crosshost-check.sh in Weald's build repository), so the
+  # emulated proof still gates what anybody runs; it stops gating whether the
+  # release can finish inside a job's lifetime.
   reproducible:
     name: reproducible build, runner ${{ matrix.runner }}
     needs: test
     runs-on: ${{ matrix.os }}
-    # 330, and the number is measured rather than guessed. The Dockerfile pins
-    # its builder to linux/arm64 so that the toolchain is a property of the file
-    # rather than of the host, which means the x86_64 runner builds under QEMU.
-    # A dispatch-only run of exactly this build took 10776 seconds there and 557
-    # on the native host, and 10776 is 179.6 minutes: at the previous 180 the job
-    # was killed in the same second its last step succeeded. Twice the measured
-    # time leaves room for a slower runner without leaving a hung build to burn
-    # six hours.
+    # 60, against a measured 557 seconds on a native arm64 host. The old 330 was
+    # sized for the emulated build, which no longer runs here.
     #
-    # The two manifests from that pair agreed exactly, which is the whole point:
+    # The two manifests from the emulated pair agreed exactly, which is what
+    # makes moving it defensible rather than convenient:
     #   both hosts  artifact sha256:cc1b7e7c5c05ecfc394a52df32c951487454d55e...
-    timeout-minutes: 330
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
           - runner: a
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
           - runner: b
             os: ubuntu-24.04-arm
       fail-fast: false
@@ -141,6 +151,74 @@ jobs:
             repro-${{ matrix.runner }}/manifest.json
             repro-${{ matrix.runner }}/build.log
           if-no-files-found: warn
+
+  # The cross-architecture reproduction, off the critical path and on every tag.
+  #
+  # Same script, same environment, x86_64 host: the Dockerfile's builder is
+  # pinned to linux/arm64, so this one runs the toolchain under QEMU and takes
+  # about three hours. `needs:` is deliberately absent. This job starts the
+  # moment the tag is pushed, in parallel with `test`, so its three hours run
+  # beside the release rather than after it. It fails on its own without taking
+  # the release with it, and `cross-host-agrees` records the verdict.
+  #
+  # A build that failed the tests is a build nobody publishes, so three hours
+  # spent on one is wasted. It is spent anyway: hosted runners are free to this
+  # repository, and serialising behind `test` is the whole defect this job
+  # exists to undo.
+  cross-host:
+    name: cross-architecture reproduction, x86_64 host under emulation
+    runs-on: ubuntu-24.04
+    # 330: twice the measured 10776 seconds (179.6 minutes), which leaves room
+    # for a slower runner without letting a hung build reach the six hour
+    # ceiling.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and record the digest
+        env:
+          WEALD_REPRO_LABEL: cross-host
+          WEALD_REPRO_VERSION: ${{ github.ref_name }}
+        run: scripts/relay-reproduce.sh --out repro-cross-host --label cross-host
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossarch-${{ github.ref_name }}
+          path: |
+            repro-cross-host/manifest.json
+            repro-cross-host/build.log
+          if-no-files-found: warn
+
+  # The verdict of the cross-architecture build, as its own job so that a reader
+  # of the run, and scripts/relay-crosshost-check.sh in Weald's build
+  # repository, can ask one name whether the claim holds. Nothing downstream
+  # needs it: it gates the pin, not the push.
+  cross-host-agrees:
+    name: the x86_64 host agrees with the digest that was published
+    needs: [cross-host, compare]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: crossarch-${{ github.ref_name }}
+          path: repro-cross-host
+      - name: It must equal the digest the two arm64 runners agreed on
+        run: |
+          set -eux
+          rebuilt="$(python3 -c 'import json;print(json.load(open("repro-cross-host/manifest.json"))["artifact_digest"])')"
+          agreed='${{ needs.compare.outputs.digest }}'
+          {
+            echo "### reproducibility, second architecture"
+            echo
+            echo "| build | digest |"
+            echo "| --- | --- |"
+            echo "| agreed by runners a and b (arm64 hosts) | ${agreed} |"
+            echo "| x86_64 host, builder emulated | ${rebuilt} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$rebuilt" = "$agreed"
 
   compare:
     name: the digests must match
