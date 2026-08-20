@@ -246,6 +246,86 @@ async fn a_workspace_publishes_its_genesis_set_over_the_one_socket_it_can_open()
     scratch.drop_database().await;
 }
 
+/// The founding publication also registers the groups the founder named.
+///
+/// WEALD-L304. A workspace's groups are created by its trust root, so at the moment
+/// the genesis set is published there is no row for any of them, and `AUTH` has
+/// already bound the workspace it admitted this session into. The publication
+/// therefore takes the workspace-resolved path, which used to write the set and
+/// nothing else: the founder reconnected, named its own root group, and was answered
+/// `denied/group_unknown` for ever, with the genesis key destroyed and no second
+/// invite to be had.
+///
+/// Asserted through the socket and then through the database, because the failure was
+/// invisible from the publishing session: it was accepted, and the workspace was dead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_founding_publication_registers_the_groups_the_founder_named() {
+    let scratch = Scratch::new("founding_groups").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let salt = salt_of(&relay.state).await;
+    hold_bootstrap_seat(&relay.state, &default_device()).await;
+    // No row for this id, which is the real founding state: the trust root has not
+    // been admitted, so it has not made a group yet.
+    let root = vec![0x9au8; 32];
+    let pool = relay.state.database.as_ref().expect("a database").pool();
+    let held: i64 = sqlx::query_scalar("select count(*) from relay_group where group_id = $1")
+        .bind(&root)
+        .fetch_one(pool)
+        .await
+        .expect("count the group rows");
+    assert_eq!(held, 0, "the founder's group must not exist before genesis");
+
+    let mut founder = Client::connect(relay.address).await;
+    founder.handshake(vec![root.clone()], CLOCK).await;
+    let genesis = set_for(
+        &salt,
+        0,
+        vec![0u8; 32],
+        &[&default_device()],
+        &default_device(),
+    );
+    founder
+        .send_frame(&Frame::Access {
+            body: genesis.encode(),
+        })
+        .await;
+    match founder.recv_frame().await {
+        Frame::Access { body } => assert_eq!(body, genesis.digest().to_vec()),
+        other => panic!("expected an Access answer, got {other:?}"),
+    }
+
+    let registered: i64 = sqlx::query_scalar(
+        "select count(*) from relay_group where group_id = $1 and workspace_id = $2",
+    )
+    .bind(&root)
+    .bind(WORKSPACE)
+    .fetch_one(pool)
+    .await
+    .expect("count the group rows");
+    assert_eq!(
+        registered, 1,
+        "the founding publication must register the group the founder named"
+    );
+
+    // The whole point of the row: the founder can come back and write.
+    let mut again = Client::connect(relay.address).await;
+    again.handshake(vec![root.clone()], CLOCK).await;
+    let envelope = envelope_for(&root, b"the founder came back");
+    again
+        .send_frame(&Frame::Send {
+            envelope: envelope.encode(),
+        })
+        .await;
+    match again.recv_frame().await {
+        Frame::SendAck { seq, .. } => assert_eq!(seq, 1),
+        other => panic!("expected a SendAck, got {other:?}"),
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_the_set_does_not_name_cannot_open_a_socket() {
     // The negative proof for `AUTH`. Before step 6 this handshake succeeded with a

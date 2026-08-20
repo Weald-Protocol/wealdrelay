@@ -283,6 +283,23 @@ pub async fn handle(
             if invite.issuer != device_key {
                 return Err(AdminError::NotAnAdmin);
             }
+            // The declared workspace root and every scope must belong to the
+            // workspace this session is authorized for. Without this the
+            // `MissingWorkspaceRoot` check in `Invite::check` compares the record
+            // with itself, so a record naming another workspace's group passes.
+            // A group the relay has never seen is left to the redeem path: the
+            // bootstrap invite is issued into an empty workspace whose root row
+            // does not exist yet, and refusing it here would close that flow.
+            for group in std::iter::once(&invite.workspace).chain(invite.scopes.iter()) {
+                let owner = crate::access::store::workspace_of(pool, group)
+                    .await
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+                if let Some(found) = owner {
+                    if found != workspace_id {
+                        return Err(AdminError::NotAnAdmin);
+                    }
+                }
+            }
             let token = invite.token.clone();
             store::create(pool, workspace_id, &invite, now_ms).await?;
             Ok(Response::Created { token })

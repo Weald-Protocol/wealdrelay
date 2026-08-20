@@ -120,6 +120,7 @@ event-kind =
   / k-roster-update       ; 0x0020
   / k-roster-revoke       ; 0x0021
   / k-dm-welcome          ; 0x0022
+  / k-roster-removal     ; 0x0023
   / k-media-ref           ; 0x0030
   / k-git-patch           ; 0x0040
   / k-git-status          ; 0x0041
@@ -148,6 +149,12 @@ k-ticket-op          = 17
 k-roster-update      = 32
 k-roster-revoke      = 33
 k-dm-welcome         = 34
+; The receipt a completed removal writes, in the workspace root group, so every
+; admin holds the artifact rather than only the machine that pressed the button.
+; The body is a JSON `RemovalReceipt` and is not schematised here, for the reason
+; the four agent kinds below are not: the relay never reads a body, so nothing it
+; does depends on the difference. See specs/backend/relay/lifecycle.md.
+k-roster-removal     = 35
 k-media-ref          = 48
 k-git-patch          = 64
 k-git-status         = 65

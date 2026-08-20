@@ -551,7 +551,9 @@ pub enum Authorization {
     NoAuthorizers,
 }
 
-const SOLE_AUTHORIZER_FLOOR_SECS: u64 = 7 * 24 * 60 * 60;
+/// Read by `media::authorization_error` too, so the wait it reports and the floor
+/// enforced here are one number (WEALD-L315).
+pub const SOLE_AUTHORIZER_FLOOR_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Check a threshold record's signatures against the workspace's current
 /// authorizers. `signing_bytes` is the canonical body every signer signed;

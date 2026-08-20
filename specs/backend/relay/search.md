@@ -17,33 +17,37 @@ The user-facing stake: the first ten minutes on a new laptop decide whether
 someone believes this product works. A search box that returns nothing while a
 progress bar crawls is indistinguishable from a broken app.
 
-## Status: designed, built, deliberately not wired
+## Status: wired
 
 Everything below is the design, and the pieces named in it exist in
 `Sources/Sync/` (`SearchIndex`, `SearchStore`, `SearchKeyVault`,
 `SearchLocalState`, `SearchDocument`) with their cold start and rebuild paths
-covered by `Tests/ColdStartTests.swift`. Nothing in a shipped build opens one.
-`EnvelopeProjection.index` is nil at both production call sites
-(`RelayConnection`, `RelayTransport`), and no query surface reads the index
-either: the board's search box is `Sources/Core/BoardSearch.swift` over tickets
-already in memory (`specs/board-search.md`).
+covered by `Tests/ColdStartTests.swift`. As of WEALD-L344 a shipped build opens
+one: `Sources/Sync/WorkspaceSearch.swift` owns one index per workspace,
+`RelayTransport` hands it to both `EnvelopeProjection` constructions (the
+connection's projector factory and `projectBacklog`), so a received chat line
+and an arriving ticket are indexed in the same operation that writes the human
+surface, and `relay-client search --body TEXT` is the query behind it
+(`Sources/CLI/RelayClientChatOpsCLI.swift`, `Tests/SearchWiringTests.swift`).
 
-So the "cannot drift" sentence below is a property of the design and not yet a
-property of the product, and no gate may rest on it. Two consequences, stated
-here because the answer was previously nowhere:
+The two decisions this section previously deferred, now settled by that wiring:
 
-- **Nobody owns the index's lifetime.** When it is wired, the owner is
-  `RelayTransport`, on the same setup path that resolves the seal and builds the
-  publisher: it opens the workspace's index once via `SearchIndex.open(store:)`,
-  runs cold start when `wasEmpty`, and hands the index to both
-  `EnvelopeProjection` constructions the way the seal is handed over. An index
-  that will not open is not fatal; projection continues with nil and the failure
-  is recorded on the status.
-- **The write half ships with the read half or not at all.** Wiring projection
-  alone buys a user nothing and costs every workspace a cold-start rebuild, so
-  the ordering is a query surface first, then the index behind it. Whether cold
-  start runs on first launch or is deferred to the first search is a product call
-  and is decided here before either lands.
+- **The index's lifetime is owned by `WorkspaceSearch`**, opened lazily on the
+  first projection or query and keyed by workspace, so two workspaces on one Mac
+  never share an index. An index that will not open is not fatal: projection
+  continues with nil, the failure is recorded on `lastFailure`, and search
+  reports `wired=no` with the reason rather than an empty result set that looks
+  like no matches.
+- **Cold start runs on the first read, not on first launch.** `prepare` awaits
+  the skeleton phase, which the budget below puts under five seconds, then
+  continues the recent window and the backfill from their own cursors. A
+  workspace nobody searches pays nothing, and the first query is truthful about
+  the skeleton rather than fast and wrong.
+
+The remaining gap is a visible one: the in-app chat surface has no search field
+yet, so a person's query today goes through `relay-client search`. The board's
+own box is still `Sources/Core/BoardSearch.swift` over tickets in memory
+(`specs/board-search.md`) and is unchanged by this.
 
 ## Index model
 

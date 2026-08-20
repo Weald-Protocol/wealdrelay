@@ -753,6 +753,23 @@ async fn rotate_access_set(
     // The group-resolved form stays for a session that carries no claim, which is
     // the founding publication and `WEALD_RELAY_ACCESS_SET=off`.
     let published = match session.authorized_workspace() {
+        // The founding publication, which is also where this workspace's first group
+        // rows come from. Version zero is the genesis set and only the genesis set:
+        // `judge` accepts it only when the workspace has no prior, so this arm cannot
+        // be reached twice. It is a separate arm because `AUTH` binds the workspace it
+        // admitted the founder into, on the provisional grant its reservation wrote,
+        // so the founding publication arrives here rather than at `publish_for`, and
+        // a genesis that registered no groups left the founder naming ids no row
+        // exists for and refused `denied/group_unknown` for ever (WEALD-L304).
+        Some(workspace) if candidate.version == 0 => store::publish_founding(
+            database.pool(),
+            workspace,
+            &candidate,
+            &body,
+            session.requested(),
+        )
+        .await
+        .map(store::Published::Accepted),
         Some(workspace) => store::publish(database.pool(), workspace, &candidate, &body)
             .await
             .map(store::Published::Accepted),

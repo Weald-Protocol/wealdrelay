@@ -120,6 +120,56 @@ relay_binary() {
 RELAY_PID_FILE="$STACK_STATE/relay.pid"
 RELAY_LOG_FILE="$STACK_STATE/relay.log"
 RELAY_OBSERVABILITY_PORT=$(( WEALD_STACK_RELAY_PORT + 1 ))
+# Which relay this invocation is driving, and therefore which workspace.
+#
+# A relay serves exactly one workspace, `ws:<hostname>`, and mints exactly one
+# genesis key for it (`backend/wealdrelay/src/serve.rs`, `bootstrap_workspace`).
+# A harness that wanted two workspaces at once on one relay was asking for a
+# second route to trust root, which is the thing the genesis rule exists to
+# refuse, so a second workspace is a second relay: `relay_use NAME` picks its
+# hostname, port, log, pid file and workspace id, and everything below reads
+# these three variables rather than the defaults. WEALD-L304.
+RELAY_HOSTNAME="${WEALD_STACK_RELAY_HOSTNAME:-localhost}"
+ENROLLED_WORKSPACE="ws:$RELAY_HOSTNAME"
+RELAY_PORT_BASE="$WEALD_STACK_RELAY_PORT"
+
+# Point every relay-facing variable at one named relay. No argument is the
+# harness's own relay, on the default port, exactly as it was.
+# The bearer the relay's own operator routes are behind, minted once per stack.
+#
+# `/readyz` answers an orchestrator's verdict to anybody and the full document only
+# to a caller holding `WEALD_RELAY_OPERATOR_TOKEN`, because the private listener is a
+# network boundary and a network boundary is not an authentication boundary
+# (`health.rs`, `readyz`). A harness that wants to assert `write_mode` therefore has
+# to hold one. Random per stack, kept inside `.weald-stack`, which is ignored in its
+# entirety: nothing here is checked in and nothing here reaches a vendor.
+relay_operator_token() {
+  local file="$STACK_STATE/operator-token"
+  if [ ! -s "$file" ]; then
+    mkdir -p "$STACK_STATE"
+    python3 -c 'import os; print(os.urandom(32).hex())' > "$file"
+    chmod 600 "$file"
+  fi
+  cat "$file"
+}
+
+relay_use() {
+  local name="${1:-}" offset="${2:-0}"
+  if [ -z "$name" ]; then
+    RELAY_HOSTNAME="${WEALD_STACK_RELAY_HOSTNAME:-localhost}"
+    RELAY_PID_FILE="$STACK_STATE/relay.pid"
+    RELAY_LOG_FILE="$STACK_STATE/relay.log"
+    WEALD_STACK_RELAY_PORT="$RELAY_PORT_BASE"
+  else
+    RELAY_HOSTNAME="$name"
+    RELAY_PID_FILE="$STACK_STATE/relay-$name.pid"
+    RELAY_LOG_FILE="$STACK_STATE/relay-$name.log"
+    WEALD_STACK_RELAY_PORT=$(( RELAY_PORT_BASE + offset ))
+  fi
+  export WEALD_STACK_RELAY_PORT
+  RELAY_OBSERVABILITY_PORT=$(( WEALD_STACK_RELAY_PORT + 1 ))
+  ENROLLED_WORKSPACE="ws:$RELAY_HOSTNAME"
+}
 
 # The relay the client instances talk to.
 #
@@ -309,7 +359,8 @@ relay_start() {
     optional+=("WEALD_RELAY_PUSH_URL=$WEALD_STACK_PUSH_URL")
   fi
 
-  WEALD_RELAY_HOSTNAME=localhost \
+  WEALD_RELAY_HOSTNAME="$RELAY_HOSTNAME" \
+  WEALD_RELAY_OPERATOR_TOKEN="$(relay_operator_token)" \
   WEALD_RELAY_DATABASE_URL="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/weald_relay_stack" \
   WEALD_RELAY_STORAGE_URL="file://$STACK_STATE/blobs" \
   WEALD_RELAY_LISTEN="$WEALD_STACK_RELAY_BIND:$WEALD_STACK_RELAY_PORT" \
@@ -361,7 +412,6 @@ relay_start() {
 # genesis row and its bootstrap invite and restarts the relay to mint a fresh one.
 # That is a harness action on a harness database and it is spelled out rather than
 # hidden inside `up`.
-ENROLLED_WORKSPACE="ws:localhost"
 
 relay_psql() {
   docker exec -i "$(dc ps -q postgres)" psql -U weald -d weald_relay_stack -tAc "$1" 2>/dev/null
@@ -374,10 +424,23 @@ genesis_state() {
 }
 
 cmd_enrol() {
-  local reset=0
+  local reset=0 into="" who="enrol" machine=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --reset) reset=1; shift ;;
+      # Which checkout becomes the founder. The default is a directory of its own,
+      # which is what `up` wants: a relay nobody has enrolled is a relay nobody can
+      # join, and that founder is not one of a scenario's instances. `clients` passes
+      # its own first instance, because the founder is the device that holds the
+      # workspace's groups and its bootstrap secret, and a founder in a directory the
+      # scenario never drives would hold both where nothing can use them.
+      --into) into="$2"; shift 2 ;;
+      --handle) who="$2"; shift 2 ;;
+      # The device id this checkout's other verbs present. Passed through rather
+      # than left to default, because the private key is filed under it and a
+      # genesis set naming a different one is a workspace whose own founder is
+      # refused (WEALD-L304).
+      --machine) machine="$2"; shift 2 ;;
       *) echo "weald-stack enrol: unknown argument: $1" >&2; exit 64 ;;
     esac
   done
@@ -411,45 +474,89 @@ cmd_enrol() {
     relay_start || return 1
   fi
 
-  local token code
+  local token code fingerprint
   token="$(sed -n 's|^weald:   invite link  https://[^/]*/join/||p' "$RELAY_LOG_FILE" | tail -1)"
   code="$(sed -n 's/^weald:   invite code  //p' "$RELAY_LOG_FILE" | tail -1)"
-  if [ -z "$token" ] || [ -z "$code" ]; then
+  fingerprint="$(sed -n 's/^weald:   genesis key  //p' "$RELAY_LOG_FILE" | tail -1)"
+  if [ -z "$token" ] || [ -z "$code" ] || [ -z "$fingerprint" ]; then
     note "enrolment" "the relay printed no invite banner; see $RELAY_LOG_FILE"
     return 1
   fi
 
   client_build
   local bin; bin="$(client_binary)"
-  local dir="$CLIENTS_DIR/enrol"
+  local dir="${into:-$CLIENTS_DIR/enrol}"
+  if [ -z "$into" ]; then
+    # A fresh directory per enrolment when this command owns it. The founder holds
+    # the workspace's bootstrap secret and its MLS groups, and a directory left over
+    # from an earlier genesis holds both for a workspace that no longer exists. A
+    # caller that named a directory owns what is in it.
+    rm -rf "$dir"
+  fi
   mkdir -p "$dir"
+  # The device the genesis access set names has to be the device every later verb in
+  # this checkout presents: `--machine` when the caller stated one, and otherwise the
+  # id pinned in `.weald-instance/machine-id`. Naming a different one is how
+  # WEALD-L304 read as a relay refusing its own founder.
   local args=(--workspace "$dir" --workspace-id "$ENROLLED_WORKSPACE"
-              --handle enrol --machine enrol --selection relay --relay "$(relay_ws_url)")
+              --handle "$who" --selection relay --relay "$(relay_ws_url)")
+  [ -n "$machine" ] && args+=(--machine "$machine")
   "$bin" relay-client "${args[@]}" init >/dev/null
 
-  # The seat, over a socket, by a device that is nobody yet.
-  if ! "$bin" relay-client "${args[@]}" redeem --id "$token" --title "$code" >/dev/null; then
-    note "enrolment" "the relay refused the redemption; see $RELAY_LOG_FILE"
+  # The product's own first-admin enrolment, and not a second route to trust root.
+  #
+  # WEALD-L304: this used to be `redeem --id` followed by `access-publish`, which
+  # takes the seat and publishes the genesis access set and stops there. That
+  # founder is in the access set and holds no sealing group, no bootstrap secret and
+  # no channels, so on a relay with a floor every envelope it writes is refused and
+  # every invite it issues carries no bundles. `enrol` is the verb the setup sheet
+  # drives (``WorkspaceSetupModel``): it takes the same seat, publishes the same
+  # genesis set, and then founds the workspace's groups and writes the bootstrap
+  # secret, which is what makes the founder able to seal and to invite.
+  local out
+  if ! out="$("$bin" relay-client "${args[@]}" enrol \
+      --link "$(genesis_join_link "$token")" --code "$code" --fingerprint "$fingerprint" \
+      --name "$who" 2>&1)"; then
+    note "enrolment" "$out"
+    return 1
+  fi
+  local groups plaintext
+  groups="$(printf '%s\n' "$out" | sed -n 's/^groups=//p')"
+  plaintext="$(printf '%s\n' "$out" | sed -n 's/^plaintext=//p')"
+  if [ "${groups:-0}" -lt 1 ]; then
+    note "enrolment" "the founder joined no group; it can publish but it cannot seal"
+    return 1
+  fi
+  if [ "$plaintext" = "yes" ] && [ "${WEALD_STACK_MIN_ENC:-mls}" != "none" ]; then
+    note "enrolment" "the founder founded its groups and still resolves the plaintext seal"
     return 1
   fi
 
-  # And the genesis access set, which is what consumes the seat, destroys the
-  # private half of the genesis key and writes entry zero of the transparency log.
-  local device
-  device="$("$bin" relay-client "${args[@]}" device | sed -n 's/^device=//p')"
-  if ! "$bin" relay-client "${args[@]}" --device "$device" access-publish >/dev/null 2>&1; then
-    note "enrolment" "the genesis access set was refused; see $RELAY_LOG_FILE"
-    return 1
-  fi
-
-  local entries fingerprint
+  local entries fingerprint_stored
   entries="$(relay_psql "select count(*) from relay_transparency_log where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
-  fingerprint="$(relay_psql "select encode(fingerprint,'hex') from relay_genesis where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
-  note "enrolment" "$ENROLLED_WORKSPACE founded, genesis $(echo "$fingerprint" | cut -c1-12), log entries $entries"
+  fingerprint_stored="$(relay_psql "select encode(fingerprint,'hex') from relay_genesis where workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
+  note "enrolment" "$ENROLLED_WORKSPACE founded, genesis $(echo "$fingerprint_stored" | cut -c1-12), groups $groups, log entries $entries"
   [ "$(genesis_state)" = "redeemed" ] || {
     note "enrolment" "the genesis key survived its own redemption"
     return 1
   }
+}
+
+# The banner's link, pointed at the socket this harness actually serves.
+#
+# The relay prints `https://<hostname>/join/<token>` because that is what a
+# self-hoster's browser will fetch. Here the hostname is `localhost` and the socket
+# is a plaintext loopback port, so the link the founder is handed carries the port
+# and the scheme this harness serves; the token is the banner's own.
+genesis_join_link() {
+  local token="$1" url host port
+  url="$(relay_ws_url)"
+  host="$(printf '%s\n' "$url" | sed -E 's|^wss?://([^:/]+).*|\1|')"
+  port="$(printf '%s\n' "$url" | sed -nE 's|^wss?://[^:/]+:([0-9]+).*|\1|p')"
+  case "$url" in
+    wss://*) printf 'https://%s%s/join/%s\n' "$host" "${port:+:$port}" "$token" ;;
+    *) printf 'http://%s%s/join/%s\n' "$host" "${port:+:$port}" "$token" ;;
+  esac
 }
 
 relay_stop() {
@@ -681,59 +788,90 @@ instance_create() {
   note "client $name" "$selection, $dir"
 }
 
-# Publish the genesis access set for the instances, from the first one that has a
-# socket.
+# Found the workspace these instances share, and admit every one of them to it.
 #
-# Without this the whole demo path is dead on arrival. `WEALD_RELAY_ACCESS_SET=enforce`
-# is the setting every environment runs (`specs/backend/build/environments.md`), a
-# workspace with no published set admits its first device into `Bootstrapping`, and the
-# only frame that state accepts is `ACCESS`. So every instance would authenticate and
-# then be refused its first write, which reads as a broken relay rather than as the
-# workspace never having been bootstrapped.
+# WEALD-L304. This used to be one `access-publish` from the first instance with a
+# socket, which is a genesis publication, and on a relay running the shipped posture
+# (`WEALD_RELAY_ACCESS_SET=enforce`) a genesis publication is reserved to the single
+# device holding the live reservation on that relay's bootstrap invite
+# (`backend/wealdrelay/src/access/store.rs`, `publish_for`, and
+# `invite/genesis.rs`, `founding_workspace`). No instance holds one, so every
+# instance was refused `denied/writer_not_in_access_set` and no relay scenario could
+# stand a workspace up at all.
 #
-# The publisher is an instance and not this script: the genesis set is signed by the
-# trust root at bootstrap (`specs/backend/relay/wire.md`), the trust root is a device
-# key, and the device keys live in the instances. A harness that signed one would have
-# been a second implementation of the client's own act.
-#
-# Every instance is named, including the git-only ones. A checkout on the git substrate
-# opens no socket and needs no entry today, but naming it costs nothing and is what the
-# roster would say: it is a device of this workspace, and the transport it happens to be
-# on this week is not a membership fact.
-clients_publish_access_set() {
-  local bin="$1"; shift
+# So the workspace is founded the way the product founds one: the first instance
+# with a socket enrols against this relay's own first-run banner (`cmd_enrol`, which
+# drives the shipped `enrol` verb), which publishes the genesis set, founds the
+# workspace's three groups and writes its bootstrap secret. Every other instance is
+# then admitted by that founder, as a member and not as an authorizer, which is the
+# same amendment the Mac publishes when it admits a paired phone.
+clients_found() {
+  local bin="$1" fresh="$2"; shift 2
   local names=("$@")
-  local publisher="" name selection
+  local founder="" name selection
   for name in "${names[@]}"; do
     selection="$(cat "$CLIENTS_DIR/$name/.weald-instance/selection" 2>/dev/null || echo git)"
-    if [ "$selection" != "git" ] && [ -z "$publisher" ]; then publisher="$name"; fi
+    if [ "$selection" != "git" ] && [ -z "$founder" ]; then founder="$name"; fi
   done
-  if [ -z "$publisher" ]; then
-    note "access set" "not published: no instance is on the relay"
+  if [ -z "$founder" ]; then
+    # Every instance is on git. Nothing has to be founded at the relay, and the
+    # groups are registered the way they always were, because two_workspaces asserts
+    # a git workspace's rows exist and hold nothing.
+    clients_register_groups "$bin" "$CLIENTS_DIR/${names[0]}"
+    note "workspace" "not founded at the relay: every instance is on git"
     return 0
   fi
 
-  local args=(--workspace "$CLIENTS_DIR/$publisher" --workspace-id "$WEALD_WORKSPACE_ID"
-              --handle "$publisher" --machine "$publisher")
-  local device
+  local reset=()
+  if [ "$fresh" -eq 1 ] || [ "$(genesis_state)" = "redeemed" ]; then
+    # A fresh run, or a relay whose genesis this harness already spent. Either way
+    # the workspace starts again from a fresh genesis key, which is a harness action
+    # on a harness database: the product has no reissue and must not grow one
+    # (`invite/genesis.rs`, `reminder`).
+    reset=(--reset)
+    relay_workspace_wipe
+  fi
+  cmd_enrol ${reset[@]+"${reset[@]}"} --into "$CLIENTS_DIR/$founder" --handle "$founder" \
+    --machine "$founder" || return 1
+
+  # Every other instance, admitted by the founder. Named including the git-only ones:
+  # a checkout on the git substrate opens no socket and needs no entry today, but it
+  # is a device of this workspace and the transport it is on this week is not a
+  # membership fact.
+  local args=(--workspace "$CLIENTS_DIR/$founder" --workspace-id "$WEALD_WORKSPACE_ID"
+              --handle "$founder" --machine "$founder"
+              --selection relay --relay "$(relay_ws_url)")
+  local device admitted=0
   for name in "${names[@]}"; do
+    [ "$name" = "$founder" ] && continue
     device="$("$bin" relay-client --workspace "$CLIENTS_DIR/$name" --handle "$name" \
       --machine "$name" device | sed -n 's/^device=//p')"
-    [ -n "$device" ] && args+=(--device "$device")
+    [ -n "$device" ] && { args+=(--device "$device"); admitted=$((admitted + 1)); }
   done
-
-  local out
-  if out="$("$bin" relay-client "${args[@]}" access-publish 2>&1)"; then
-    note "access set" "published by $publisher, $(echo "$out" | sed -n 's/^entries=//p') entries"
-  else
-    # Already published is the ordinary case on a second `clients` run against the
-    # same workspace id, and is not a failure: the set is a workspace fact and the
-    # instances are unchanged.
-    case "$out" in
-      *"already has an access set"*) note "access set" "already published" ;;
-      *) note "access set" "not published: $out"; return 1 ;;
-    esac
+  if [ "$admitted" -eq 0 ]; then
+    note "access set" "founded by $founder, no other instance to admit"
+    return 0
   fi
+  local out
+  if ! out="$("$bin" relay-client "${args[@]}" admit 2>&1)"; then
+    note "access set" "not amended: $out"
+    return 1
+  fi
+  note "access set" "founded by $founder, version $(printf '%s\n' "$out" | sed -n 's/^published=//p'), $admitted admitted"
+}
+
+# Everything this relay's workspace holds, dropped, so a fresh run counts one run.
+#
+# Only ever the harness's own database and only ever one workspace's rows. The
+# envelopes and groups go with the access set, because a workspace founded again
+# under the same id would otherwise count the previous run's envelopes in every
+# proof, which is what the timestamped group namespace used to buy and what a
+# genesis-founded workspace cannot buy: its id is the relay's own.
+relay_workspace_wipe() {
+  relay_psql "delete from relay_envelope where group_id in \
+              (select group_id from relay_group where workspace_id = '$ENROLLED_WORKSPACE')" >/dev/null
+  relay_psql "delete from relay_key_package where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+  relay_psql "delete from relay_group where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
 }
 
 # weald-stack clients N [--selections a,b,c] [--fresh]
@@ -756,13 +894,33 @@ cmd_clients() {
   client_build
   local bin; bin="$(client_binary)"
 
+  # Which workspace these instances are in, decided before the first one exists.
+  #
+  # A relay serves one workspace and mints one genesis key for it, so an instance
+  # with a socket is an instance in `ws:<the relay's hostname>` and nothing else: a
+  # group namespace of the harness's own invention has no genesis key, cannot be
+  # founded, and is what WEALD-L304 recorded. A workspace entirely on git keeps the
+  # harness's id, because no relay has an opinion about it.
+  local relay_backed=0 pick
+  if [ -n "$selections" ]; then
+    case ",$selections," in *,relay,*|*,dual,*) relay_backed=1 ;; esac
+  else
+    relay_backed=1
+  fi
+  if [ "$relay_backed" -eq 1 ]; then
+    WEALD_WORKSPACE_ID="$ENROLLED_WORKSPACE"
+  fi
   if [ "$fresh" -eq 1 ]; then
     clients_stop
     rm -rf "$CLIENTS_DIR" "$REMOTE_REPO"
-    # A fresh scenario is a fresh group namespace as well as a fresh disk. Reusing
-    # the ids would leave the previous run's envelopes in the relay and every count
-    # in the proof would be measuring two runs at once.
-    WEALD_WORKSPACE_ID="${WEALD_WORKSPACE_ID}-$(date +%s)"
+    if [ "$relay_backed" -eq 0 ]; then
+      # A fresh scenario is a fresh group namespace as well as a fresh disk. Reusing
+      # the ids would leave the previous run's envelopes in the relay and every count
+      # in the proof would be measuring two runs at once. A relay-backed workspace
+      # cannot rename itself, so it gets the same freshness by dropping the previous
+      # run's rows: see `relay_workspace_wipe`.
+      WEALD_WORKSPACE_ID="${WEALD_WORKSPACE_ID}-$(date +%s)"
+    fi
   fi
   mkdir -p "$CLIENTS_DIR"
   # One secret per workspace, minted before the first instance exists.
@@ -788,11 +946,12 @@ cmd_clients() {
     instance_create "$bin" "$name" "$selection"
   done
 
-  clients_register_groups "$bin" "$CLIENTS_DIR/${names[0]}"
-  # Groups first, then the set: the relay resolves the workspace a publication belongs
-  # to from the groups the connection names, so a publication before registration is
-  # answered `denied/group_unknown`.
-  clients_publish_access_set "$bin" "${names[@]}"
+  # No group registration for a relay-backed workspace. The relay writes its own
+  # rows: the founding publication registers the groups the founder's connection
+  # named, and every group after it is learned from a member's `CONNECT`
+  # (`access/store.rs`, `ensure_groups`). Inserting them by hand was the harness
+  # provisioning a workspace the relay had no genesis key for.
+  clients_found "$bin" "$fresh" "${names[@]}"
   echo "$WEALD_WORKSPACE_ID" > "$CLIENTS_DIR/workspace-id"
   echo
   echo "workspace $WEALD_WORKSPACE_ID, relay $(relay_ws_url)"
@@ -1321,6 +1480,8 @@ scenario_compaction() {
 #
 # Sets the three globals `cmd_clients` works from, so a second call is a second
 # workspace and not a second view of the first.
+TWO_WORKSPACES_BOUND=0
+
 two_workspaces_bind() {
   local name="$1" selections="$2"
   local home="$STACK_STATE/ws-$name"
@@ -1328,7 +1489,35 @@ two_workspaces_bind() {
   REMOTE_REPO="$home/remote.git"
   WEALD_WORKSPACE_ID="weald-$name"
   mkdir -p "$home"
+  # A workspace with a socket gets its own relay, on its own port, with its own
+  # genesis key. One relay serves one workspace (`serve.rs`, `bootstrap_workspace`)
+  # and mints one single-use genesis key for it, so two workspaces sharing one relay
+  # means the second one cannot be founded at all: WEALD-L304. A workspace entirely
+  # on git needs no relay and stays on the harness's own.
+  case ",$selections," in
+    *,relay,*|*,dual,*)
+      TWO_WORKSPACES_BOUND=$((TWO_WORKSPACES_BOUND + 1))
+      relay_use "$name" $(( 10 + 2 * TWO_WORKSPACES_BOUND ))
+      # Stopped first, always. A relay left over from a run that failed inside the
+      # suspended half is a relay still in `read_only`, and `relay_start` adopts a
+      # process that answers, so every write below would be refused for last run's
+      # reason.
+      relay_stop
+      relay_start || scenario_fail "the $name workspace's relay did not start"
+      ;;
+    *) relay_use "" ;;
+  esac
   cmd_clients 2 --selections "$selections" --fresh >/dev/null
+}
+
+# Stop every relay a bound workspace started, and go back to the harness's own.
+two_workspaces_release() {
+  local name
+  for name in "$@"; do
+    relay_use "$name" 0
+    relay_stop
+  done
+  relay_use ""
 }
 
 # Drive one instance of one bound workspace. The clients directory is passed in the
@@ -1475,6 +1664,8 @@ scenario_two_workspaces() {
   [ "${bravo_envelopes:-0}" = "0" ] || scenario_fail "the git workspace reached the relay: $bravo_envelopes envelopes"
   [ "${bravo_packages:-0}" = "0" ] || scenario_fail "the git workspace left $bravo_packages key packages with the relay"
 
+  two_workspaces_release alpha
+
   echo "TWO WORKSPACES LIVE, no crossing: alpha $alpha_id on the relay, bravo $bravo_id on git" \
     | tee -a "$out"
 }
@@ -1509,16 +1700,9 @@ scenario_two_devices() {
   local out="$STEP24_OUT/two-workspaces-two-devices.txt"
   mkdir -p "$STEP24_OUT"
 
-  # A previous run that failed inside the suspended half left the relay in
-  # read_only, and then every convergence assertion below fails for the wrong
-  # reason. Start from full write mode whatever the last run did.
-  case "$(curl -s "http://127.0.0.1:$RELAY_OBSERVABILITY_PORT/readyz")" in
-    *'"write_mode":"read_only"'*)
-      relay_stop
-      relay_start || scenario_fail "the relay did not restart in full write mode"
-      ;;
-  esac
-
+  # Each bound workspace's relay is stopped and started by `two_workspaces_bind`,
+  # so a run that failed inside the suspended half below cannot leave a relay in
+  # `read_only` for the next run to be refused by.
   two_workspaces_bind alpha relay,relay
   two_workspaces_bind delta dual,dual
   local alpha_id delta_id
@@ -1619,7 +1803,8 @@ scenario_two_devices() {
   # operator reads. Asserted rather than assumed, because everything below is only
   # interesting if the relay really is in the mode a suspended instance runs in.
   local readyz
-  readyz="$(curl -s "http://127.0.0.1:$RELAY_OBSERVABILITY_PORT/readyz")"
+  readyz="$(curl -s -H "Authorization: Bearer $(relay_operator_token)" \
+    "http://127.0.0.1:$RELAY_OBSERVABILITY_PORT/readyz")"
   case "$readyz" in
     *'"write_mode":"read_only"'*'"write_mode_reason":"service_read_only"'*) ;;
     *) scenario_fail "the relay did not report read_only/service_read_only: $readyz" ;;
@@ -1668,6 +1853,10 @@ scenario_two_devices() {
     echo "The client kept the record, the second device received it over the working"
     echo "tree, and nothing about the app became unlicensed."
   } >> "$out"
+
+  # Both workspaces' relays stopped, and the harness's own relay is the one this
+  # process leaves behind, so the next command in the session drives what it expects.
+  two_workspaces_release alpha delta
 
   echo "FOUR COMBINATIONS CONVERGED, and a suspended relay degraded to solo mode" \
     | tee -a "$out"
@@ -1812,6 +2001,118 @@ PY
   echo "  scripts/weald-client peer1 send 'and another' && scripts/weald-client peer1 sync"
 }
 
+# --- the self-hosted genesis proof -------------------------------------------
+#
+# WEALD-L304's acceptance, whole: from a fresh relay's first-run banner alone, enrol
+# a founder, send a message the relay accepts, issue an invite, redeem it on a second
+# device, and read the founder's message there. At the shipped posture, which is what
+# makes it a proof: `min_enc=mls`, so an envelope from a workspace with no sealing
+# group is refused, and `access_set=enforce`, so a device the set does not name is
+# refused before it can write.
+#
+# Its own relay on its own port, because it consumes a genesis key and a relay has
+# exactly one.
+GENESIS_OUT="${WEALD_GENESIS_OUT:-$ROOT/build-evidence/genesis}"
+
+scenario_genesis_founder() {
+  local out="$GENESIS_OUT/self-hosted-genesis.txt"
+  mkdir -p "$GENESIS_OUT"
+  client_build
+  local bin; bin="$(client_binary)"
+
+  relay_use founder 30
+  relay_stop
+  relay_start || scenario_fail "the founder relay did not start"
+  local home="$STACK_STATE/ws-founder"
+  rm -rf "$home"
+  mkdir -p "$home"
+  CLIENTS_DIR="$home/clients"
+  mkdir -p "$CLIENTS_DIR"
+
+  # A fresh banner: the previous run's genesis key and access set go, and so do the
+  # workspace's groups and envelopes, because this workspace is founded again under
+  # the same id and a stale envelope would be counted as this run's.
+  relay_workspace_wipe
+  cmd_enrol --reset --into "$CLIENTS_DIR/f1" --handle f1 --machine f1 || \
+    scenario_fail "the founder could not enrol from the banner"
+
+  local floor
+  floor="$(grep -o '"min_enc":"[a-z]*"' "$RELAY_LOG_FILE" | tail -1)"
+  [ "$floor" = '"min_enc":"mls"' ] || \
+    scenario_fail "this proof needs a relay at the shipped floor, not $floor"
+
+  local f1=(--workspace "$CLIENTS_DIR/f1" --workspace-id "$ENROLLED_WORKSPACE"
+            --handle f1 --machine f1 --selection relay --relay "$(relay_ws_url)")
+
+  # One message, and the relay's own answer to it. `sync` reports the session, so a
+  # refusal at the floor is a field and not an inference.
+  "$bin" relay-client "${f1[@]}" send "the founder can seal" >/dev/null
+  local round
+  round="$("$bin" relay-client "${f1[@]}" --seconds 20 sync 2>&1)"
+  [ "$(field "$round" connected)" = "yes" ] || \
+    scenario_fail "the founder's session was refused: $round"
+  local envelopes
+  envelopes="$(relay_psql "select count(*) from relay_envelope e \
+      join relay_group g on g.group_id = e.group_id \
+      where g.workspace_id = '$ENROLLED_WORKSPACE'" | tr -d '[:space:]')"
+  [ "${envelopes:-0}" -ge 1 ] || \
+    scenario_fail "the relay holds no envelope from the founder: $round"
+
+  # The invite, from a founder that holds the groups an invite admits somebody to.
+  local issued link code unsealed
+  issued="$("$bin" relay-client "${f1[@]}" invite --title "second device" 2>&1)" || \
+    scenario_fail "the founder could not issue an invite: $issued"
+  link="$(field "$issued" link)"
+  code="$(field "$issued" code)"
+  unsealed="$(field "$issued" unsealed)"
+  [ -n "$link" ] && [ -n "$code" ] || scenario_fail "the invite printed no halves: $issued"
+  [ -z "$unsealed" ] || \
+    scenario_fail "the invite carries no bundle for $unsealed, so its bearer could not seal there"
+
+  # The second device, which knows nothing but the two halves it was handed.
+  local f2=(--workspace "$CLIENTS_DIR/f2" --workspace-id "$ENROLLED_WORKSPACE"
+            --handle f2 --machine f2 --selection relay --relay "$(relay_ws_url)")
+  mkdir -p "$CLIENTS_DIR/f2"
+  "$bin" relay-client "${f2[@]}" init >/dev/null
+  local redeemed
+  redeemed="$("$bin" relay-client "${f2[@]}" redeem --link "$link" --code "$code" 2>&1)" || \
+    scenario_fail "the second device could not redeem the invite: $redeemed"
+  local joined
+  joined="$(field "$redeemed" joined)"
+  [ "${joined:-0}" -ge 1 ] || scenario_fail "the redemption joined no group: $redeemed"
+
+  # And the founder's message, read on the second device.
+  local second
+  second="$("$bin" relay-client "${f2[@]}" --seconds 30 sync 2>&1)"
+  local state; state="$("$bin" relay-client "${f2[@]}" state)"
+  [ "$(field "$state" chat)" -ge 1 ] || \
+    scenario_fail "the second device read none of the founder's records: $second"
+
+  {
+    echo "# A self-hosted relay's genesis invite founds a workspace with two members"
+    echo
+    echo "relay        $(relay_ws_url)  ($ENROLLED_WORKSPACE)"
+    echo "posture      min_enc mls, access set enforce"
+    echo "banner       $RELAY_LOG_FILE"
+    echo
+    echo "## The founder, from the banner alone"
+    echo
+    printf '%s\n\n' "$round"
+    echo "relay envelopes  $envelopes"
+    echo
+    echo "## The invite it issued"
+    echo
+    printf '%s\n\n' "$issued"
+    echo "## The second device"
+    echo
+    printf '%s\n\n%s\n\n%s\n' "$redeemed" "$second" "$state"
+  } > "$out"
+
+  relay_stop
+  relay_use ""
+  echo "GENESIS FOUNDER SEALED, INVITED, AND THE SECOND DEVICE READ IT" | tee -a "$out"
+}
+
 cmd_scenario() {
   local name="${1:-}"
   shift || true
@@ -1824,6 +2125,7 @@ cmd_scenario() {
     rollback) scenario_rollback ;;
     two-workspaces) scenario_two_workspaces ;;
     two-devices) scenario_two_devices ;;
+    genesis-founder) scenario_genesis_founder ;;
     compaction) scenario_compaction ;;
     digest-mismatch) scenario_digest_mismatch ;;
     all)
@@ -1834,9 +2136,10 @@ cmd_scenario() {
       scenario_two_workspaces
       scenario_two_devices
       scenario_compaction
+      scenario_genesis_founder
       ;;
     *)
-      echo "weald-stack scenario NAME, one of: converge, catchup, fork, rollback, two-workspaces, two-devices, compaction, all" >&2
+      echo "weald-stack scenario NAME, one of: converge, catchup, fork, rollback, two-workspaces, two-devices, compaction, genesis-founder, all" >&2
       exit 64
       ;;
   esac

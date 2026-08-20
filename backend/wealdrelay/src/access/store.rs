@@ -576,6 +576,33 @@ pub enum Published {
     Accepted(Accepted),
 }
 
+/// The founding publication, with the groups the founding connection named.
+///
+/// The genesis set and the first group rows are one act. A founding device is admitted
+/// on the provisional grant its reservation wrote, so `AUTH` binds the workspace it
+/// resolved and this publication arrives with a workspace already known: it takes
+/// `publish` rather than `publish_for`, and without the registration below the
+/// founder's own groups were never written, so it reconnected, named groups no row
+/// exists for and was answered `denied/group_unknown` for ever. That is the outcome
+/// `publish_for` documents and
+/// avoids on the path where the workspace is resolved from the reservation, and it
+/// was reachable through the path where it is resolved from the session. WEALD-L304.
+///
+/// The registration runs only after the set is accepted, so a refused publication
+/// registers nothing: group rows for a workspace with no trust root are how a device
+/// that knows a group id becomes its founder.
+pub async fn publish_founding(
+    pool: &PgPool,
+    workspace: &str,
+    candidate: &AccessSet,
+    body: &[u8],
+    groups: &[Vec<u8>],
+) -> Result<Accepted, StoreError> {
+    let accepted = publish(pool, workspace, candidate, body).await?;
+    ensure_groups(pool, workspace, groups).await?;
+    Ok(accepted)
+}
+
 pub async fn publish_for(
     pool: &PgPool,
     groups: &[Vec<u8>],

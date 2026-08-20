@@ -1059,7 +1059,45 @@ async fn handle_policy(
                 }
             }
         }
-        _ => Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet)),
+        other => Frame::Error(authorization_error(&other, record.not_before, now_secs)),
+    }
+}
+
+/// Why a threshold record was not authorized, in the `detail` the registry already
+/// reserves for "a non-content reason code".
+///
+/// WEALD-L315. All three non-authorizing outcomes answered
+/// `denied/writer_not_in_access_set`, so a founder whose access set the relay holds,
+/// refused only because a solo owner's seven day grace had not elapsed, read the
+/// answer as a broken access set and went looking for one. The code stays: the
+/// registry is closed and a new code is a protocol change. The reason travels beside
+/// it, and `SoleAuthorizerTooSoon` also carries the wait, which is the one outcome
+/// that clears by itself.
+fn authorization_error(
+    outcome: &retention::Authorization,
+    not_before_secs: u64,
+    now_secs: u64,
+) -> FrameError {
+    let error = FrameError::new(ErrorCode::WriterNotInAccessSet);
+    match outcome {
+        retention::Authorization::NoAuthorizers => error.detail(&b"no_authorizers"[..]),
+        retention::Authorization::Insufficient => error.detail(&b"insufficient_signatures"[..]),
+        retention::Authorization::SoleAuthorizerTooSoon => {
+            // How far short the record's own `not_before` falls, which is what a
+            // client has to add to the next one. Not a wait after which these same
+            // bytes become acceptable: a solo owner's floor is measured from the
+            // relay's receipt, so the record has to be reissued either way.
+            let floor = now_secs.saturating_add(retention::SOLE_AUTHORIZER_FLOOR_SECS);
+            let wait = floor.saturating_sub(not_before_secs);
+            error
+                .detail(&b"sole_authorizer_too_soon"[..])
+                .retry_after(u32::try_from(wait).unwrap_or(u32::MAX))
+        }
+        // Authorized outcomes never reach here; naming them keeps the match total so
+        // a new outcome is a compile error rather than a silent denial.
+        retention::Authorization::Threshold | retention::Authorization::SoleAuthorizerGraced => {
+            error
+        }
     }
 }
 
@@ -1107,7 +1145,7 @@ async fn handle_destruction(
                 }
             }
         }
-        _ => Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet)),
+        other => Frame::Error(authorization_error(&other, record.not_before, now_secs)),
     }
 }
 
