@@ -450,15 +450,29 @@ async fn a_frozen_chain_freezes_text_compaction_too() {
     let harness = Harness::new("lifecycle_frozen").await;
     let group = harness.group(0x45).await;
     harness.chain(&group, 0).await;
+    // Epoch one, because a freeze is only ever a *successor* race now: WEALD-L183
+    // refuses a second genesis instead of freezing on it, since a genesis
+    // impostor proves possession of nothing the group asserted while a successor
+    // impostor holds the prior epoch's verifier and cannot be told apart.
+    harness.chain(&group, 1).await;
     harness.policy(&group, 1, NOW_SECS - 1).await;
     harness.fill(&group, 3).await;
     let manifest = harness.fill(&group, 1).await[0].clone();
     let _barrier = harness.seq_of(&group, &manifest).await as u64;
 
     // A second, differently signed control for the same epoch: the successor race
-    // from `media.md`, run for real rather than asserted.
-    let genuine = verifier_key(0x51);
-    let forged = signed_control(&group, 0, &verifier_key(0x7f), None, &verifier_key(0x7f));
+    // from `media.md`, run for real rather than asserted. Signed by epoch zero's
+    // verifier, which is exactly what a member removed at that rotation holds.
+    let genuine = verifier_key(0x52);
+    let epoch0 = verifier_key(0x51);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    let forged = signed_control(
+        &group,
+        1,
+        &verifier_key(0x7f),
+        Some(genesis.digest()),
+        &epoch0,
+    );
     let outcome = retention::apply_control(harness.pool(), &forged)
         .await
         .expect("the conflicting control is stored as evidence");
@@ -467,7 +481,7 @@ async fn a_frozen_chain_freezes_text_compaction_too() {
     let refusal = lifecycle::drop_before(
         harness.pool(),
         WORKSPACE,
-        &instruction(&group, &manifest, Vec::new(), 0),
+        &instruction(&group, &manifest, Vec::new(), 1),
         NOW_SECS,
     )
     .await
@@ -485,7 +499,7 @@ async fn a_frozen_chain_freezes_text_compaction_too() {
     let outcome = lifecycle::drop_before(
         harness.pool(),
         WORKSPACE,
-        &signed_drop(&group, &manifest, Vec::new(), 0, Some(1), None, &genuine),
+        &signed_drop(&group, &manifest, Vec::new(), 1, Some(1), None, &genuine),
         NOW_SECS,
     )
     .await

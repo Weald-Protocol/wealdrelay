@@ -187,9 +187,13 @@ Rules that keep it safe:
 
 OpenMLS's storage provider trait is implemented against SQLite, in the same
 per-workspace database as the search index
-(`specs/backend/relay/multi-workspace.md`), encrypted at rest with a Keychain
-key bound to the device with
-`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`.
+(`specs/backend/relay/multi-workspace.md`). The requirement is encryption at
+rest with a device-bound Keychain key at
+`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`. **That requirement is not met
+today**: the binding opens a plain SQLite file with no SQLCipher and no key
+pragma, so the device MLS signing key and all group ratchet state are readable
+by anything that can read the file. No surface (comment, spec, or marketing)
+may describe the MLS store as encrypted at rest until this is actually built.
 
 Writes are transactional with the local document state. This is the sharp edge:
 processing a commit advances the epoch, and if the app crashes between advancing

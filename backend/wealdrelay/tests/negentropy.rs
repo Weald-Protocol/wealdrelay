@@ -50,6 +50,37 @@ fn items(seqs: impl IntoIterator<Item = u64>) -> Vec<Item> {
 // MARK: The codec
 
 #[test]
+fn a_wide_disagreement_answers_a_message_the_peer_can_decode() {
+    // WEALD-L178. One legal `RECON` carrying `MAX_RANGES` disagreeing fingerprint
+    // spans, each over more than `IDLIST_LIMIT` items, used to answer with up to
+    // eight thousand ranges: under the frame ceiling, over the decoder's own range
+    // bound, and deterministic, so the group could never reconcile again.
+    let per_span = IDLIST_LIMIT * 4;
+    let held = items((0..(MAX_RANGES * per_span) as u64).map(|n| n + 1));
+    let mut ranges: Vec<Range> = (1..MAX_RANGES)
+        .map(|index| {
+            Range::new(
+                (index * per_span) as u64 + 1,
+                Mode::Fingerprint([index as u8; 32]),
+            )
+        })
+        .collect();
+    ranges.push(Range::new(INFINITY, Mode::Fingerprint([9u8; 32])));
+    let incoming = Message { ranges };
+    let response = respond(&held, &incoming);
+    assert!(
+        response.reply.ranges.len() <= MAX_RANGES,
+        "answered with {} ranges",
+        response.reply.ranges.len()
+    );
+    assert_eq!(
+        Message::decode(&response.reply.encode()),
+        Ok(response.reply.clone()),
+        "the reply must be one the peer's decoder accepts"
+    );
+}
+
+#[test]
 fn a_message_round_trips_through_every_mode() {
     let message = Message {
         ranges: vec![
@@ -712,6 +743,25 @@ proptest! {
         prop_assert_eq!(decoded_reply, Ok(response.reply.clone()));
     }
 
+    /// No reply either side builds can exceed the bound its own decoder enforces.
+    #[test]
+    fn a_reply_never_exceeds_the_range_bound(seqs in set_strategy()) {
+        let held = items(seqs);
+        let mut wide_ranges: Vec<Range> = (1..MAX_RANGES)
+            .map(|index| Range::new(index as u64 * 4, Mode::Fingerprint([index as u8; 32])))
+            .collect();
+        // A cover reaches the open end, which is what the decoder means by complete.
+        wide_ranges.push(Range::new(INFINITY, Mode::Fingerprint([7u8; 32])));
+        let wide = Message { ranges: wide_ranges };
+        let response = respond(&held, &wide);
+        prop_assert!(response.reply.ranges.len() <= MAX_RANGES);
+        prop_assert!(Message::decode(&response.reply.encode()).is_ok());
+        if let Some(reply) = advance(&held, &wide).reply {
+            prop_assert!(reply.ranges.len() <= MAX_RANGES);
+            prop_assert!(Message::decode(&reply.encode()).is_ok());
+        }
+    }
+
     /// Decoding is total: no payload panics, whatever bytes a peer sends.
     #[test]
     fn decoding_is_total(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
@@ -1051,4 +1101,115 @@ fn a_range_of_one_sequence_number_is_named_rather_than_re_asserted() {
     assert!(!step.done());
     assert_eq!(step.send.len(), crowded.len());
     assert!(step.want.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// WEALD-L392: what the *client's* decoder accepts, checked against what the
+// relay emits on a cold reconciliation of a large backlog.
+// ---------------------------------------------------------------------------
+
+/// The acceptance rules of `Sources/Sync/ReconMessage.swift decode`, written out
+/// here rather than borrowed from `Message::decode`.
+///
+/// Borrowing the relay's own decoder would prove nothing: two halves of one
+/// implementation agreeing is the thing this module's header says is not a proof
+/// about the wire. So these are the Swift decoder's guards, in its order, with its
+/// names, and a divergence between the two decoders shows up here as a failure
+/// rather than as a live workspace reporting a permanent error string
+/// (WEALD-L392).
+fn client_would_accept(bytes: &[u8]) -> Result<(), String> {
+    let decoded = Message::decode(bytes).map_err(|error| format!("cbor: {error}"))?;
+    if decoded.ranges.is_empty() {
+        return Err("empty: the payload carries no ranges at all".into());
+    }
+    if decoded.ranges.len() > MAX_RANGES {
+        return Err(format!("tooManyRanges: {}", decoded.ranges.len()));
+    }
+    let mut previous: Option<u64> = None;
+    for range in &decoded.ranges {
+        if previous.is_some_and(|last| range.upper <= last) {
+            return Err("unorderedRanges: bounds are not strictly ascending".into());
+        }
+        previous = Some(range.upper);
+        if let Mode::IdList(ids) = &range.mode {
+            if ids.len() > MAX_IDS_PER_RANGE {
+                return Err(format!("tooManyIds: {}", ids.len()));
+            }
+            for pair in ids.windows(2) {
+                if pair[1] <= pair[0] {
+                    return Err("unorderedIds: ids are not strictly ascending".into());
+                }
+            }
+        }
+    }
+    if previous != Some(INFINITY) {
+        return Err("incompleteCover: the last range does not reach the open end".into());
+    }
+    Ok(())
+}
+
+/// A whole exchange, with every payload either side puts on the wire checked
+/// against the client's rules.
+fn drive_and_check(relay: &[Item], client: &[Item]) {
+    let mut held: Vec<Item> = client.to_vec();
+    let mut message = initiate(&held);
+    for _ in 0..64 {
+        client_would_accept(&message.encode()).expect("a client payload the peer must accept");
+        let response = respond(relay, &message);
+        client_would_accept(&response.reply.encode())
+            .expect("a relay payload the client must accept");
+        for id in &response.push {
+            if let Some(item) = relay.iter().find(|item| &item.id == id) {
+                if !held.iter().any(|mine| mine.id == item.id) {
+                    held.push(*item);
+                }
+            }
+        }
+        held.sort();
+        let step = advance(&held, &response.reply);
+        match step.reply {
+            None => return,
+            Some(next) => message = next,
+        }
+    }
+    panic!("the exchange did not converge inside the round bound");
+}
+
+#[test]
+fn a_cold_client_reconciling_a_large_backlog_sends_nothing_the_client_refuses() {
+    // The live shape WEALD-L392 came from: a checkout that holds nothing at all
+    // against a workspace with more than two thousand records.
+    let relay: Vec<Item> = (1..=2019).map(item).collect();
+    drive_and_check(&relay, &[]);
+}
+
+#[test]
+fn a_partly_cold_client_over_the_same_backlog_is_also_accepted() {
+    // The other half of the same run: a device that has some of the history and
+    // reconciles the rest, which is what makes the round trips recurse rather
+    // than settle in one push.
+    let relay: Vec<Item> = (1..=2500).map(item).collect();
+    let client: Vec<Item> = relay.iter().copied().step_by(7).collect();
+    drive_and_check(&relay, &client);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Every payload of every exchange over a large corpus is one the client's
+    /// decoder accepts, whatever the client already holds.
+    #[test]
+    fn no_payload_over_a_large_corpus_is_one_the_client_refuses(
+        total in 2001usize..2600,
+        keep in proptest::collection::vec(any::<bool>(), 2001..2600),
+        gap in 1u64..5,
+    ) {
+        let relay: Vec<Item> = (1..=total as u64).map(|n| item(n * gap)).collect();
+        let client: Vec<Item> = relay
+            .iter()
+            .zip(keep.iter())
+            .filter_map(|(item, keep)| keep.then_some(*item))
+            .collect();
+        drive_and_check(&relay, &client);
+    }
 }

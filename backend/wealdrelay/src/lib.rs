@@ -41,6 +41,7 @@ pub mod profile;
 pub mod push;
 pub mod recovery;
 pub mod restore;
+pub mod retention_notice;
 pub mod send_budget;
 pub mod serve;
 pub mod session;
@@ -436,6 +437,10 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
     row(
         keys::GC_MIN_OBJECT_AGE_SECONDS,
         resolved.gc_min_object_age_seconds.to_string(),
+    );
+    row(
+        keys::MEDIA_UNCLAIMED_GRACE_SECONDS,
+        resolved.media_unclaimed_grace_seconds.to_string(),
     );
     row(
         keys::TRUSTED_PROXY_HOPS,

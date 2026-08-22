@@ -121,6 +121,7 @@ event-kind =
   / k-roster-revoke       ; 0x0021
   / k-dm-welcome          ; 0x0022
   / k-roster-removal     ; 0x0023
+  / k-access-snapshot     ; 0x0024
   / k-media-ref           ; 0x0030
   / k-git-patch           ; 0x0040
   / k-git-status          ; 0x0041
@@ -155,6 +156,15 @@ k-dm-welcome         = 34
 ; the four agent kinds below are not: the relay never reads a body, so nothing it
 ; does depends on the difference. See specs/backend/relay/lifecycle.md.
 k-roster-removal     = 35
+; The workspace's access set, republished into the workspace root group so a
+; device that never published one still holds the list it is supposed to enforce.
+; The relay answers an ACCESS read with the salt and the accepted head's version
+; and digest only, and it cannot hand the entries back: they are salted hashes it
+; stores as opaque bytes. A member adopts a snapshot only when its version and
+; digest equal that head, so the relay's head stays authority and a rewritten or
+; replayed one is dropped. Body is the `AccessSet` encoding, unchanged.
+; See specs/backend/relay/access.md and WEALD-L354.
+k-access-snapshot    = 36
 k-media-ref          = 48
 k-git-patch          = 64
 k-git-status         = 65

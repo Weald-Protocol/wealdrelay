@@ -692,7 +692,7 @@ async fn revocation_writes_the_tombstone_before_it_deletes_the_ciphertext() {
         .unwrap()
         .is_none());
     // The ciphertext does not.
-    assert!(store::bundles_for(pool, &record.token, &root())
+    assert!(store::bundles_for(pool, &record.token, &root(), NOW)
         .await
         .unwrap()
         .is_empty());
@@ -952,7 +952,7 @@ async fn a_refresh_keeps_the_newest_three_and_the_relay_reads_none_of_them() {
         .unwrap());
     }
 
-    let held = store::bundles_for(pool, &record.token, &root())
+    let held = store::bundles_for(pool, &record.token, &root(), NOW)
         .await
         .unwrap();
     // Three refreshed candidates plus the pinned one the issuer sealed into the
@@ -979,7 +979,7 @@ async fn a_refresh_keeps_the_newest_three_and_the_relay_reads_none_of_them() {
     )
     .await
     .unwrap());
-    let after = store::bundles_for(pool, &record.token, &root())
+    let after = store::bundles_for(pool, &record.token, &root(), NOW)
         .await
         .unwrap();
     assert!(after.iter().any(|bundle| bundle.epoch == 5));
@@ -1067,7 +1067,7 @@ async fn a_flood_of_bogus_updates_cannot_evict_the_candidate_the_issuer_sealed()
     .await
     .unwrap());
 
-    let held = store::bundles_for(pool, &record.token, &root())
+    let held = store::bundles_for(pool, &record.token, &root(), NOW)
         .await
         .unwrap();
     // The valid candidate is still retrievable, byte for byte, and the table is

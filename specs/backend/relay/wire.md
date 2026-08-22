@@ -309,6 +309,7 @@ payload whose chain fails is retained and rendered as rejected, never dropped.
 | `0x0021` | `roster.revoke` | Revocation plus the epoch change that enforces it. |
 | `0x0022` | `dm.welcome` | One MLS Welcome into a two-person group, addressed by a blinded tag over the target key package reference and carrying no group id, published in the workspace root group because the two devices share no other. See `specs/backend/relay/private-messaging.md`. |
 | `0x0023` | `roster.removal` | The receipt a completed removal writes: which groups rotated, how many devices and agents were revoked, how many recovery wraps and invites went, and the access-set head the removal published. Travels in the workspace root group as an ordinary sealed envelope, so every admin holds the artifact rather than only the Mac that pressed the button. The membership transparency log is the relay's (`specs/backend/relay/lifecycle.md` step 6); this is the client's half of the same sentence. Body is a JSON `RemovalReceipt`. |
+| `0x0024` | `access.snapshot` | The workspace's access set, republished into the workspace root group so a device that never published one still holds the list it enforces. `ACCESS` answers with the salt and the accepted head's version and digest and never the entries, which are salted hashes the relay stores as opaque bytes, so a joiner had no set at all: it refused every `roster.update` it read and its own claim, and no invited member could appear in a member list (WEALD-L354). A reader adopts a snapshot only when its version and digest equal the head the relay reports, so the head stays authority and a rewritten or replayed one is dropped. Body is the `AccessSet` encoding, unchanged. |
 | `0x0030` | `media.ref` | Ciphertext hash, per-blob key, name, mime, size, dimensions. The name is here and nowhere else: it is sealed with the rest of the record, so members read it and the relay never can. See `specs/backend/relay/media.md`. |
 | `0x0040` | `git.patch` | Patch bytes, base commit, target ticket. Proposal only, never applied by the receiver. |
 | `0x0041` | `git.status` | CI or review status for a patch. |
@@ -361,6 +362,7 @@ The map, which was warned about for six steps and never written until step 31:
 | `rosterEntry` | 7 | `roster.update` | `0x0020` |
 | `rosterRevoke` | 8 | `roster.revoke` | `0x0021` |
 | `removalReceipt` | 16 | `roster.removal` | `0x0023` |
+| `accessSetSnapshot` | 17 | `access.snapshot` | `0x0024` |
 | `directWelcome` | 9 | `dm.welcome` | `0x0022` |
 | `agentCard` | 10 | `agent.card` | `0x0090` |
 | `agentInvoke` | 11 | `agent.invoke` | `0x0091` |

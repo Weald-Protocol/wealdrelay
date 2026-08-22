@@ -148,6 +148,61 @@ async fn a_closed_call_gives_its_seat_on_the_instance_ceiling_back() {
 }
 
 #[tokio::test]
+async fn one_connection_cannot_take_the_whole_table_from_another_workspace() {
+    // WEALD-L182. The table is process-wide, so a device that opened a fresh call
+    // id at its frame budget and never said `Bye` used to fill it and every later
+    // offer in the process was refused, including offers between members of
+    // unrelated workspaces on a shared hosted relay. The share is what makes the
+    // abuser the one refused.
+    let registry = CallRegistry::new(8);
+    let (greedy, _sender, _keep) = peer(1);
+    let mut opened = 0usize;
+    for index in 0..8u8 {
+        let (_, sender, receiver) = peer(1);
+        std::mem::forget(receiver);
+        match registry
+            .join(&call_id(index + 10), &group(1), greedy, sender)
+            .await
+        {
+            Ok(()) => opened += 1,
+            Err(JoinRefusal::TooManyCalls) => break,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        }
+    }
+    assert!(
+        opened < 8,
+        "one connection must not be able to open the whole table"
+    );
+    assert!(
+        registry.share_refused() >= 1,
+        "the abuser is what was refused"
+    );
+
+    // And a different connection, in a different workspace, is still admitted.
+    let (other, sender, _other_keep) = peer(2);
+    registry
+        .join(&call_id(200), &group(2), other, sender)
+        .await
+        .expect("an unrelated workspace still gets a call");
+}
+
+#[tokio::test]
+async fn a_call_that_carries_nothing_is_collected() {
+    // The other half of WEALD-L182: entries were removed only by `Bye` or by the
+    // socket ending, so a silent participant on a live socket held its share of the
+    // table for the life of the process.
+    let registry = CallRegistry::new(4);
+    let (connection, sender, _keep) = peer(1);
+    registry
+        .join(&call_id(1), &group(1), connection, sender)
+        .await
+        .expect("the call opens");
+    assert_eq!(registry.open_calls().await, 1);
+    assert_eq!(registry.sweep_idle(std::time::Duration::ZERO).await, 1);
+    assert_eq!(registry.open_calls().await, 0, "the silent call is gone");
+}
+
+#[tokio::test]
 async fn an_instance_configured_to_carry_no_calls_carries_none() {
     // Zero is reachable: `max_concurrent_calls` is an operator's number, and the
     // conversion in `health.rs` produces zero for a relay with calls off. What must

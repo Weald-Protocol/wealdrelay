@@ -305,7 +305,7 @@ pub async fn handle(
             hash,
             ciphertext_len,
             ..
-        } => handle_put(state, session, pool, &group, &hash, ciphertext_len).await,
+        } => handle_put(state, session, pool, &group, &hash, ciphertext_len, rate).await,
         wire::Request::Get { group, hash, .. } => {
             handle_get(state, session, pool, &group, &hash, rate).await
         }
@@ -326,7 +326,7 @@ pub async fn handle(
             .await
         }
         wire::Request::MultipartComplete { session_id, parts } => {
-            handle_multipart_complete(state, session, pool, &session_id, &parts).await
+            handle_multipart_complete(state, session, pool, &session_id, &parts, rate).await
         }
         wire::Request::MultipartAbort { session_id } => {
             handle_multipart_abort(state, session, pool, &session_id).await
@@ -345,6 +345,8 @@ pub async fn handle(
         wire::Request::RetentionResolution(record) => {
             handle_resolution(session, pool, &record).await
         }
+        wire::Request::RetentionPosition { group } => handle_position(session, pool, &group).await,
+        wire::Request::Quota { group } => handle_quota(state, session, pool, &group, rate).await,
     }
 }
 
@@ -373,11 +375,21 @@ async fn handle_put(
     group: &[u8],
     hash: &[u8],
     ciphertext_len: u64,
+    rate: &RateLimiter,
 ) -> Frame {
     let workspace = match authorize_group(pool, session, group).await {
         Ok(workspace) => workspace,
         Err(code) => return Frame::Error(FrameError::new(code)),
     };
+    let Some(device) = session.device_key() else {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    // The request count is charged first, before the relay looks anything up, for
+    // the same reason `handle_get` charges first: an uncharged `PUT` is a free
+    // quota probe and a free object-store head per frame (WEALD-L217).
+    if !rate.allow_request(device, state.now_ms()).await {
+        return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
+    }
     if ciphertext_len == 0 || ciphertext_len > BLOB_MAX_BYTES {
         return Frame::Error(FrameError::new(ErrorCode::EnvelopeTooLarge));
     }
@@ -532,9 +544,19 @@ async fn handle_get(
 /// lengths, not objects, and charging the sum of the sizes would make opening the
 /// files view cost the same as downloading everything in it.
 ///
-/// A `head` that fails for one object reports that object as zero length rather
-/// than failing the listing: the file is there, and a view that showed nothing
-/// because one size was unreadable would be the less true answer.
+/// The lengths come from the relay's own reservation rows in one query, never
+/// from one `head` per object. Heading each key in series is what made a group
+/// holding roughly 500 objects answer nothing at all: a few hundred serial round
+/// trips to the bucket outlast the client's exchange window, so the files view
+/// showed "the relay did not answer the listing" and no file list existed for
+/// that workspace at any size (WEALD-L399). One listing is now one store listing
+/// plus one query, whatever the object count.
+///
+/// An object with no reservation row is reported as zero length rather than
+/// omitted, which is what a failed `head` did before: the file is there, and a
+/// view that hid it because its size was unreadable would be the less true
+/// answer. Reconciling a bucket key against the rows is the collector's job
+/// (`media.md` "Reconciliation"), not a read path a person is waiting on.
 async fn handle_list(
     state: &Arc<RelayState>,
     session: &Session,
@@ -566,16 +588,21 @@ async fn handle_list(
     // more objects than that would otherwise cost one head per object to build
     // a reply the client cannot read. Truncate before the head loop.
     names.truncate(wire::MAX_LIST);
+    let charged = match store::charged_lengths(pool, &workspace, group).await {
+        Ok(charged) => charged,
+        Err(error) => {
+            tracing::warn!(error = %error, "media: could not read charged lengths for a listing");
+            return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+        }
+    };
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
         let Ok(hash) = hex_bytes(&name) else { continue };
-        let Ok(key) = object_key(&workspace, group, &hash) else {
-            continue;
-        };
-        let len = match store.head(&key).await {
-            Ok(Some(info)) => info.len,
-            _ => 0,
-        };
+        let len = charged
+            .get(&hash)
+            .copied()
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(0) as u64;
         entries.push((hash, len));
     }
     Frame::Blob {
@@ -691,10 +718,19 @@ async fn handle_multipart_complete(
     pool: &sqlx::PgPool,
     session_id: &[u8],
     parts: &[(u32, Vec<u8>)],
+    rate: &RateLimiter,
 ) -> Frame {
     let Some(session_uuid) = parse_session_id(session_id) else {
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
+    // Charged before anything is looked up, like the part path above: a complete
+    // costs one object-store head per client-supplied part, so an uncharged
+    // complete is a free loop of store reads (WEALD-L217).
+    if let Some(device) = session.device_key() {
+        if !rate.allow_request(device, state.now_ms()).await {
+            return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
+        }
+    }
     let Ok(Some(multipart)) = store::find_multipart(pool, session_uuid).await else {
         return Frame::Error(FrameError::new(ErrorCode::MalformedHeader));
     };
@@ -873,13 +909,43 @@ async fn handle_multipart_abort(
     }
 }
 
+/// A genesis control roots a group's whole retention chain, so WEALD-L183 holds
+/// it to more than `authorize_group`: the publishing device must be named by the
+/// workspace's *current* access set, not merely be able to reach the workspace.
+/// A provisional grant and a device an offboarding commit dropped both fail
+/// here. The relay keeps no per-group roster on purpose (`wire.md`), so this is
+/// the strongest binding to the group's own membership the relay can hold.
+///
+/// Applied to epoch 0 only because the later epochs already carry a stronger
+/// proof of their own: a successor is signed by the prior epoch's verifier, a
+/// secret no non-member holds.
+async fn genesis_publisher_is_in_the_access_set(
+    pool: &sqlx::PgPool,
+    session: &Session,
+    workspace: &str,
+) -> Result<(), ErrorCode> {
+    let Some(device) = session.device_key() else {
+        return Err(ErrorCode::WriterNotInAccessSet);
+    };
+    match access::store::admits(pool, workspace, device).await {
+        Ok(access::store::Admission::InSet) => Ok(()),
+        Ok(_) => Err(ErrorCode::WriterNotInAccessSet),
+        Err(_) => Err(ErrorCode::Backpressure),
+    }
+}
+
 async fn handle_control(
     session: &Session,
     pool: &sqlx::PgPool,
     record: &wire::RetentionControl,
 ) -> Frame {
-    if authorize_group(pool, session, &record.group).await.is_err() {
+    let Ok(workspace) = authorize_group(pool, session, &record.group).await else {
         return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    if record.epoch == 0 {
+        if let Err(code) = genesis_publisher_is_in_the_access_set(pool, session, &workspace).await {
+            return Frame::Error(FrameError::new(code));
+        }
     }
     match retention::apply_control(pool, record).await {
         Ok(retention::ControlOutcome::Accepted) => Frame::Blob {
@@ -981,11 +1047,99 @@ async fn handle_manifest(
         Ok(retention::ManifestOutcome::Accepted { digest }) => Frame::Blob {
             payload: wire::Response::RetentionAck { digest }.encode(),
         },
-        Ok(retention::ManifestOutcome::Invalid(_)) => {
+        Ok(retention::ManifestOutcome::Invalid(reason)) => {
+            // The reason, in the relay's own log. One wire code covers five rules
+            // (no control chain, a stale epoch, a bad signature, a sequence that
+            // does not advance, a predecessor that does not match), and a client
+            // told only `reject/malformed_header` reads it as a codec fault: that
+            // is how WEALD-L333 and WEALD-L336 were each closed against encoders
+            // that agreed all along, while the real cause was a first manifest
+            // numbered zero. The reason names no content and no tenant, only which
+            // rule the record broke.
+            tracing::warn!(reason = %reason, "media: retention manifest refused");
             Frame::Error(FrameError::new(ErrorCode::MalformedHeader))
         }
         Err(error) => {
             tracing::warn!(error = %error, "media: retention manifest store failed");
+            Frame::Error(FrameError::new(ErrorCode::Backpressure))
+        }
+    }
+}
+
+/// Answer where a group's retention chain has got to.
+///
+/// Authorized exactly like every other retention request: the group must belong
+/// to the session's own workspace. Read only, so there is nothing to refuse
+/// beyond that, and nothing it reports was not already derivable by a member of
+/// the same workspace from `Request::List` plus its own manifests.
+async fn handle_position(session: &Session, pool: &sqlx::PgPool, group: &[u8]) -> Frame {
+    if let Err(code) = authorize_group(pool, session, group).await {
+        return Frame::Error(FrameError::new(code));
+    }
+    match retention::position(pool, group).await {
+        Ok(position) => Frame::Blob {
+            payload: wire::Response::RetentionPosition {
+                control_epoch: position.control_epoch,
+                control_digest: position.control_digest,
+                next_sequence: position.next_sequence,
+                prev_manifest_hash: position.prev_manifest_hash,
+                blobs: position.blobs,
+            }
+            .encode(),
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "media: retention position read failed");
+            Frame::Error(FrameError::new(ErrorCode::Backpressure))
+        }
+    }
+}
+
+/// Answer how much of its plan the session's workspace has spent.
+///
+/// Authorized exactly like `Request::List`, through ``authorize_group``, and it
+/// reports nothing a member of the same workspace could not already total up from
+/// a listing. It costs one request against the same per-device budget a listing
+/// does, because it is the same kind of question and a view that polled it would
+/// otherwise poll for free.
+///
+/// It writes the quota row before reading it, with the same `ensure_quota_row`
+/// call `handle_put` makes. A workspace that has never stored anything has no row,
+/// and reading a missing row answers `limit_bytes: None`, which means unlimited on
+/// this wire: the one relay shape where a warning matters most would report no
+/// ceiling at all until the first upload. Idempotent, and identical to what the
+/// next put would have written anyway (WEALD-L401).
+async fn handle_quota(
+    state: &Arc<RelayState>,
+    session: &Session,
+    pool: &sqlx::PgPool,
+    group: &[u8],
+    rate: &RateLimiter,
+) -> Frame {
+    let workspace = match authorize_group(pool, session, group).await {
+        Ok(workspace) => workspace,
+        Err(code) => return Frame::Error(FrameError::new(code)),
+    };
+    let Some(device) = session.device_key() else {
+        return Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet));
+    };
+    if !rate.allow_request(device, state.now_ms()).await {
+        return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
+    }
+    if let Err(error) = store::ensure_quota_row(pool, &workspace, limit_bytes(state)).await {
+        tracing::warn!(error = %error, "media: could not ensure quota row for a quota read");
+        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    }
+    match store::usage(pool, &workspace).await {
+        Ok(usage) => Frame::Blob {
+            payload: wire::Response::Quota {
+                stored_bytes: usage.stored_bytes.max(0) as u64,
+                reserved_bytes: usage.reserved_bytes.max(0) as u64,
+                limit_bytes: usage.limit_bytes.map(|limit| limit.max(0) as u64),
+            }
+            .encode(),
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "media: quota read failed");
             Frame::Error(FrameError::new(ErrorCode::Backpressure))
         }
     }

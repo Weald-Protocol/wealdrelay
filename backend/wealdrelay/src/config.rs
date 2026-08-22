@@ -83,20 +83,31 @@ pub mod keys {
     pub const LIVE_FANOUT: &str = "WEALD_RELAY_LIVE_FANOUT";
     /// Whether voice calls are carried at all.
     ///
-    /// `off` by default, unlike `WEALD_RELAY_LIVE`, and the difference is
-    /// deliberate. Presence is the ordinary shape of the app and costs a beat
-    /// every twenty seconds. A call is a sustained stream an operator has to have
-    /// sized for, so it is opt-in: an instance carries calls because somebody
-    /// decided it would, and that decision is the same act as setting
-    /// `WEALD_RELAY_MAX_CONCURRENT_CALLS` (`specs/backend/relay/calls.md`).
+    /// `on` by default, as of 2026-08-21, and the reason for the change is the
+    /// reason the old default was wrong: a person who presses the call button in a
+    /// workspace they bought expects it to ring, and every relay this control plane
+    /// provisioned answered `version/protocol_unsupported` instead
+    /// (`specs/launch-review-2026-08-11.md:36` recorded it as calls being
+    /// unavailable on the tier customers buy). A feature nobody can reach is not a
+    /// posture, it is an absence.
+    ///
+    /// The ceiling keeps its own rule: with calls on and no ceiling stated the
+    /// relay takes `DEFAULT_CONCURRENT_CALLS`, which is a bound rather than a
+    /// guess at anybody's bandwidth, and an operator who has sized their instance
+    /// states their own (`specs/backend/relay/calls.md`, Configuration).
+    ///
+    /// `off` is still a posture an operator may adopt, and a deployment that has
+    /// declared a second process still gets calls off rather than a boot refusal
+    /// unless it asked for them explicitly: see `enforce_calls`.
     pub const CALLS: &str = "WEALD_RELAY_CALLS";
     /// How many calls one instance may carry at once.
     ///
-    /// Required when `WEALD_RELAY_CALLS=on` and refused as meaningless when it is
-    /// off. There is no default and there deliberately never will be: call
-    /// capacity is a sizing decision about one instance's bandwidth, and a relay
-    /// that guessed one would be a relay whose ceiling nobody chose and whose
-    /// operator discovers it under load.
+    /// Refused as meaningless when calls are off. With calls on it defaults to
+    /// `DEFAULT_CONCURRENT_CALLS`: the earlier rule made it required, which was
+    /// correct while calls were opt-in and became the thing that kept every relay
+    /// silent once they were not. Call capacity is still a sizing decision, and an
+    /// operator who has made one states it here; what the default buys is a relay
+    /// that carries a call at all.
     pub const MAX_CONCURRENT_CALLS: &str = "WEALD_RELAY_MAX_CONCURRENT_CALLS";
     /// How many client sockets may be open at once.
     ///
@@ -200,6 +211,20 @@ pub mod keys {
     /// backup cadence it actually runs; 48 hours without it, against a stated
     /// 12-hour recovery-point objective. Zero is legal and means no floor.
     pub const GC_MIN_OBJECT_AGE_SECONDS: &str = "WEALD_RELAY_GC_MIN_OBJECT_AGE_SECONDS";
+    /// The grace an unclaimed upload gets before the collector may delete it, in
+    /// seconds. 24 hours without it, which is the window
+    /// `specs/backend/relay/media.md` promises the client that crashed between
+    /// `BLOB put` and its retention manifest.
+    ///
+    /// It exists because that window is the one product promise no test against a
+    /// running relay could ever observe: a probe cannot wait out a day, so before
+    /// this variable the only proof of collection was a unit test calling the sweep
+    /// function directly. An operator shortens it on a probe instance, drives
+    /// `POST /gc/sweep`, and reads the deletion. Zero is legal and means an
+    /// unfinalized reservation is collectable on the next pass, which is a posture
+    /// only a probe wants: on a real instance it would delete the upload of every
+    /// client that is still mid-PUT.
+    pub const MEDIA_UNCLAIMED_GRACE_SECONDS: &str = "WEALD_RELAY_MEDIA_UNCLAIMED_GRACE_SECONDS";
     /// How many reverse proxies the relay sits behind, each of which appends the
     /// address it received the request from to `X-Forwarded-For`.
     ///
@@ -266,6 +291,7 @@ pub mod keys {
         PUSH_QUEUE,
         JANITOR_INTERVAL_MS,
         GC_MIN_OBJECT_AGE_SECONDS,
+        MEDIA_UNCLAIMED_GRACE_SECONDS,
         TRUSTED_PROXY_HOPS,
     ];
 }
@@ -336,8 +362,9 @@ pub enum LiveFanout {
 /// `off` refuses both frames with `reject/protocol_unsupported`, which is what a
 /// version 3 client reads as calls being unavailable on this relay: the same
 /// thing it reads from a version 2 relay, and a different thing from a call that
-/// failed. `off` is the default, because carrying a sustained media stream is a
-/// posture an operator adopts rather than one they inherit from an upgrade.
+/// failed. `on` is the default as of 2026-08-21, because the previous default made
+/// the feature unreachable on every instance anybody bought; `off` remains the
+/// posture an operator adopts deliberately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallMode {
     On,
@@ -401,6 +428,10 @@ pub struct Config {
     pub max_storage_gb: Limit,
     /// The envelope log's per-workspace ceiling. See `keys::MAX_LOG_GB`.
     pub max_log_gb: Limit,
+    /// The retention warning threshold, in days. Never a deletion:
+    /// `specs/backend/relay/lifecycle.md:293` splits the three levers as retention
+    /// *warns*, `MAX_LOG_GB` *refuses*, and a signed `drop_before` deletes. Read by
+    /// `crate::retention_notice`, which the collector runs once a pass.
     pub retention_days: Limit,
     pub access_set: AccessSetMode,
     pub min_encryption: MinEncryption,
@@ -450,6 +481,9 @@ pub struct Config {
     /// How old an unreferenced object must be before the storage-listing sweep may
     /// delete it. See `keys::GC_MIN_OBJECT_AGE_SECONDS`.
     pub gc_min_object_age_seconds: u64,
+    /// How long an unfinalized reservation is left alone before the unclaimed sweep
+    /// may delete its object. See `keys::MEDIA_UNCLAIMED_GRACE_SECONDS`.
+    pub media_unclaimed_grace_seconds: u64,
     /// Declared reverse-proxy hops in front of this relay. Zero means direct, and
     /// zero ignores forwarding headers entirely. See `keys::TRUSTED_PROXY_HOPS`.
     pub trusted_proxy_hops: u64,
@@ -877,13 +911,15 @@ impl Config {
     /// All three are startup refusals rather than warnings. A relay that will not
     /// start is a page a human reads; a call that connects and is silent is a bug
     /// report six months later.
-    fn enforce_calls(&self) -> Result<(), ConfigError> {
+    fn enforce_calls(&mut self, asked_for_calls: bool) -> Result<(), ConfigError> {
         match (self.calls, self.max_concurrent_calls) {
+            // The ceiling a relay takes when calls are on and nobody sized the
+            // instance. It was a startup refusal while calls were opt-in, which was
+            // right then: the operator turning them on was the operator sizing them.
+            // With calls on by default that refusal would have been every relay
+            // failing to boot, so the default ceiling is what carries the change.
             (CallMode::On, None) => {
-                return Err(ConfigError::CallsCeilingMissing {
-                    key: keys::MAX_CONCURRENT_CALLS,
-                    because: keys::CALLS,
-                })
+                self.max_concurrent_calls = Some(crate::calls::DEFAULT_CONCURRENT_CALLS)
             }
             (CallMode::Off, Some(_)) => {
                 return Err(ConfigError::CallsCeilingUnused {
@@ -894,10 +930,22 @@ impl Config {
             (CallMode::On, Some(_)) | (CallMode::Off, None) => {}
         }
         if matches!(self.calls, CallMode::On) && self.redis_url.is_some() {
-            return Err(ConfigError::CallsSingleProcess {
-                key: keys::CALLS,
-                declared: keys::REDIS_URL,
-            });
+            // Explicit `on` in a multi-process deployment is still fatal, because
+            // the operator asked for a thing this build cannot do: call routing is
+            // process-local and the two halves of a call would land on different
+            // processes, connect, and be silent.
+            if asked_for_calls {
+                return Err(ConfigError::CallsSingleProcess {
+                    key: keys::CALLS,
+                    declared: keys::REDIS_URL,
+                });
+            }
+            // Inherited `on` in the same deployment is not: a default must never
+            // stop a relay from booting. Calls go off, which is the truthful state,
+            // and the client reads `version/protocol_unsupported` exactly as it does
+            // from an instance whose operator chose it.
+            self.calls = CallMode::Off;
+            self.max_concurrent_calls = None;
         }
         Ok(())
     }
@@ -991,7 +1039,7 @@ impl Config {
         let database_url = postgres_url(values, keys::DATABASE_URL)?;
         let storage = storage_target(values, keys::STORAGE_URL)?;
 
-        let resolved = Self {
+        let mut resolved = Self {
             hostname,
             database_url,
             storage,
@@ -1015,7 +1063,12 @@ impl Config {
             )?,
             max_storage_gb: capacity(values, keys::MAX_STORAGE_GB)?,
             max_log_gb: capacity(values, keys::MAX_LOG_GB)?,
-            retention_days: limit(values, keys::RETENTION_DAYS)?,
+            // `capacity` rather than `limit`: zero days is not a tighter warning,
+            // it is a threshold that calls every envelope the relay has ever
+            // accepted overdue on the pass after it was written, which is a warning
+            // an operator learns to ignore. `unlimited` remains the way to say no
+            // threshold, and it is the default (WEALD-L180).
+            retention_days: capacity(values, keys::RETENTION_DAYS)?,
             // `enforce` in every environment including local, so nobody ever
             // develops against the permissive path and discovers the difference
             // in staging (specs/backend/build/environments.md).
@@ -1052,11 +1105,11 @@ impl Config {
                 &[("on", LiveMode::On), ("off", LiveMode::Off)],
             )?,
             live_fanout: live_fanout(values, keys::LIVE_FANOUT)?,
-            // `off` by default, unlike `live`. See `keys::CALLS`.
+            // `on` by default, like `live`. See `keys::CALLS`.
             calls: one_of(
                 values,
                 keys::CALLS,
-                CallMode::Off,
+                CallMode::On,
                 "on, off",
                 &[("on", CallMode::On), ("off", CallMode::Off)],
             )?,
@@ -1142,6 +1195,13 @@ impl Config {
                 keys::GC_MIN_OBJECT_AGE_SECONDS,
                 crate::media::gc::DEFAULT_MIN_OBJECT_AGE_SECONDS,
             )?,
+            // `count` again, and for the same shape of reason: zero is a setting a
+            // probe instance wants and never one a customer's relay is given.
+            media_unclaimed_grace_seconds: count(
+                values,
+                keys::MEDIA_UNCLAIMED_GRACE_SECONDS,
+                crate::media::gc::UNCLAIMED_GRACE_SECONDS as u64,
+            )?,
             // `count` with a zero default rather than `positive`: zero is the
             // meaningful value here, not a refused one. It says the relay is
             // reached directly, which is what a developer running it on a laptop
@@ -1151,7 +1211,10 @@ impl Config {
         };
         resolved.enforce_tls()?;
         resolved.enforce_live_fanout()?;
-        resolved.enforce_calls()?;
+        // Whether the value was stated rather than inherited, which is the whole
+        // difference between a refusal and a downgrade below.
+        let asked_for_calls = values.get(keys::CALLS).is_some();
+        resolved.enforce_calls(asked_for_calls)?;
         resolved.enforce_push()?;
         // Last, because the hosted rules are about the resolved values rather
         // than about the strings, and a rule that ran mid-resolution would have

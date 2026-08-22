@@ -451,6 +451,38 @@ async fn an_expiry_already_in_the_past_is_rejected_against_the_relays_own_clock(
         Frame::Error(error) => assert_eq!(error.code, ErrorCode::PushHandleMalformed),
         other => panic!("expected a reject, got {other:?}"),
     }
+    // WEALD-L179. Year 9999 stores a row the janitor sweep can never reap, so the
+    // handle would be held forever and burned for every other principal on the
+    // relay. It is a reject, not a row.
+    ada.send_frame(&Frame::Wake(WakeBody::Register {
+        handle: wake_handle(0x8A),
+        categories: ALL_CATEGORIES,
+        expires_at: 253_402_300_799_000,
+    }))
+    .await;
+    match ada.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::PushHandleMalformed),
+        other => panic!("expected a reject, got {other:?}"),
+    }
+    // And the extreme, which used to reach `to_timestamp` out of range and come
+    // back as a retryable `PushBackpressure`: a client told to back off and resend
+    // a frame that is permanently wrong as sent.
+    ada.send_frame(&Frame::Wake(WakeBody::Register {
+        handle: wake_handle(0x8B),
+        categories: ALL_CATEGORIES,
+        expires_at: u64::MAX,
+    }))
+    .await;
+    match ada.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::PushHandleMalformed),
+        other => panic!("expected a reject, got {other:?}"),
+    }
+    let pool = relay.state.database.as_ref().unwrap().pool();
+    let rows: i64 = sqlx::query_scalar("select count(*) from relay_push_handle")
+        .fetch_one(pool)
+        .await
+        .expect("count the rows");
+    assert_eq!(rows, 0, "no out-of-bounds registration may be stored");
 
     relay.shutdown().await;
     scratch.drop_database().await;

@@ -129,9 +129,29 @@ pub async fn sweep_unclaimed(
     workspace: &str,
     now_ms: u64,
 ) -> Report {
+    sweep_unclaimed_after(pool, storage, workspace, now_ms, UNCLAIMED_GRACE_SECONDS).await
+}
+
+/// The same collector with the grace named by the caller.
+///
+/// The window is a product promise measured in a day, which is longer than any
+/// probe against a running relay can wait, so before this existed the only proof
+/// that an unclaimed object is ever deleted was a unit test calling this function.
+/// The collector passes `Config::media_unclaimed_grace_seconds`, whose default is
+/// `UNCLAIMED_GRACE_SECONDS`, so a relay nobody configured behaves exactly as it
+/// did; an operator running a probe instance shortens it and drives one pass.
+/// Nothing else about eligibility moves: a finalized reservation is still never
+/// touched, and a claimed object is still out of this sweep's reach entirely.
+pub async fn sweep_unclaimed_after(
+    pool: &PgPool,
+    storage: &Store,
+    workspace: &str,
+    now_ms: u64,
+    grace_seconds: i64,
+) -> Report {
     let started = now_ms;
     let mut report = Report::default();
-    let stale = match store::stale_unclaimed(pool, UNCLAIMED_GRACE_SECONDS).await {
+    let stale = match store::stale_unclaimed(pool, grace_seconds).await {
         Ok(rows) => rows,
         Err(error) => {
             report.note = format!(

@@ -77,7 +77,11 @@ const _: () = assert!(
 /// the socket, and it puts the rows back when they did not.
 pub struct Answer {
     pub frame: Frame,
-    pub restore: Vec<i64>,
+    /// Rows a fetch took off a shelf. The fetch deletes them, so an undelivered
+    /// answer puts these back rather than clearing a mark.
+    pub restore: Vec<store::Served>,
+    /// The workspace those rows belong to, needed to insert them again.
+    pub restore_workspace: Option<String>,
 }
 
 impl Answer {
@@ -85,6 +89,7 @@ impl Answer {
         Self {
             frame,
             restore: Vec::new(),
+            restore_workspace: None,
         }
     }
 }
@@ -161,11 +166,11 @@ pub async fn handle(state: &Arc<RelayState>, session: &Session, body: KeysBody) 
                 // would invite exactly the retry loop that drains a shelf.
                 Ok(served) if served.is_empty() => Answer::plain(Frame::Keys(KeysBody::None)),
                 Ok(served) => {
-                    let restore = served.iter().map(|s| s.id).collect();
-                    let packages = served.into_iter().map(|s| s.package).collect();
+                    let packages = served.iter().map(|s| s.package.clone()).collect();
                     Answer {
                         frame: Frame::Keys(KeysBody::Bundles { packages }),
-                        restore,
+                        restore: served,
+                        restore_workspace: Some(workspace.to_string()),
                     }
                 }
                 Err(_) => Answer::plain(Frame::Error(FrameError::new(ErrorCode::Backpressure))),

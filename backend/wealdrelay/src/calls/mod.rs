@@ -56,6 +56,7 @@ pub mod socket;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -117,12 +118,33 @@ pub const CALL_FRAMES_PER_MINUTE: u32 = 120;
 /// cap is enforced here rather than only stated in a UI.
 pub const MAX_PARTICIPANTS_PER_CALL: usize = 5;
 
+/// Calls one instance carries at once when nobody sized the instance.
+///
+/// Eight, which is forty streams of relayed audio at the five-participant ceiling
+/// and well inside the per-connection queue budget a modest box already holds
+/// (`specs/backend/relay/calls.md`, Limits and Shedding). It exists because calls
+/// are on by default as of 2026-08-21: while they were opt-in, the operator turning
+/// them on was the operator sizing them and the absence of a ceiling was correctly
+/// fatal. An operator who has sized their instance still states
+/// `WEALD_RELAY_MAX_CONCURRENT_CALLS` and this number is never consulted.
+pub const DEFAULT_CONCURRENT_CALLS: u64 = 8;
+
 /// How many distinct streams one connection's budget tracks at once.
 ///
 /// A bound on the budget's own memory, so a client cannot make the relay hold a
 /// window per invented stream id. Well above one call's worth: five participants
 /// is five streams, and a client that legitimately exceeds this is not on a call.
 pub const MAX_TRACKED_STREAMS: usize = 32;
+
+/// How long a call may carry no media or signalling before the table forgets it.
+///
+/// Two minutes. Entries are otherwise removed only by `Bye` or by the socket
+/// ending, so a connection that opened calls and stayed silent on a live socket
+/// held its entries for the life of the process: the per-connection share bounds
+/// how many, and this bounds how long (WEALD-L182). Well above any gap a real call
+/// has, because media is fifty frames a second and even a ringing offer answers
+/// inside forty-five.
+pub const CALL_IDLE_MS: u64 = 2 * 60 * 1000;
 
 /// The protocol version at which both call frames exist.
 ///
@@ -392,6 +414,10 @@ struct Call {
     /// rooms.
     group: Vec<u8>,
     participants: Vec<(ConnectionId, OutboundSender)>,
+    /// When this call last carried a frame. Monotonic rather than wall clock,
+    /// because the question is an elapsed duration and a clock that stepped
+    /// backwards must not extend a silent call's lifetime.
+    last_activity: Instant,
 }
 
 /// Why a `CALL` could not be admitted.
@@ -562,6 +588,10 @@ impl CallRegistry {
         sender: OutboundSender,
     ) -> Result<(), JoinRefusal> {
         let mut calls = self.calls.lock().await;
+        // Reclaim before admitting. A silent call is not a call, and collecting it
+        // here rather than on a timer keeps the rule in the one place the table's
+        // capacity is actually spent, with no second task to own the lock.
+        Self::drop_idle(&mut calls, Duration::from_millis(CALL_IDLE_MS));
         match calls.get_mut(call_id) {
             Some(call) => {
                 if call.group != group {
@@ -580,6 +610,7 @@ impl CallRegistry {
                     return Err(JoinRefusal::CallFull);
                 }
                 call.participants.push((connection, sender));
+                call.last_activity = Instant::now();
                 Ok(())
             }
             None => {
@@ -621,11 +652,28 @@ impl CallRegistry {
                     Call {
                         group: group.to_vec(),
                         participants: vec![(connection, sender)],
+                        last_activity: Instant::now(),
                     },
                 );
                 Ok(())
             }
         }
+    }
+
+    /// Forget every call that has carried no frame for `idle`.
+    ///
+    /// Returns how many were collected. Exposed so the invariant is testable
+    /// without waiting out the window.
+    pub async fn sweep_idle(&self, idle: Duration) -> usize {
+        let mut calls = self.calls.lock().await;
+        Self::drop_idle(&mut calls, idle)
+    }
+
+    fn drop_idle(calls: &mut HashMap<[u8; CALL_ID_BYTES], Call>, idle: Duration) -> usize {
+        let before = calls.len();
+        let now = Instant::now();
+        calls.retain(|_, call| now.duration_since(call.last_activity) < idle);
+        before - calls.len()
     }
 
     /// Take one connection out of one call, forgetting the call when it empties.
@@ -705,6 +753,10 @@ impl CallRegistry {
                 self.denied.fetch_add(1, Ordering::Relaxed);
                 return Err(ErrorCode::WriterNotInAccessSet);
             }
+            // A participant's media is what keeps a call alive. Refreshed after the
+            // membership check, so a stranger's frame cannot extend the lifetime of
+            // a call it is not in.
+            call.last_activity = Instant::now();
             for (id, sender) in call.participants.iter() {
                 if *id == from {
                     continue;

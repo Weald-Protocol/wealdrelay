@@ -179,6 +179,28 @@ pub fn config_for_calls(scratch: &Scratch, blobs: &std::path::Path, max_calls: u
     .expect("the call configuration resolves")
 }
 
+/// The call path explicitly off.
+///
+/// `WEALD_RELAY_CALLS` is `on` by default, so a suite that is about the refusals an
+/// operator who turned calls off owes its clients has to say so: `config_for` used
+/// to be that posture and is not any more.
+pub fn config_for_calls_off(scratch: &Scratch, blobs: &std::path::Path) -> Config {
+    Config::resolve(&Values::from_pairs(
+        [
+            (keys::HOSTNAME, "localhost".to_string()),
+            (keys::DATABASE_URL, scratch.url.clone()),
+            (keys::STORAGE_URL, format!("file://{}", blobs.display())),
+            (keys::LISTEN, "127.0.0.1:0".to_string()),
+            (keys::OBSERVABILITY_LISTEN, "127.0.0.1:0".to_string()),
+            (keys::RELEASE_CHECK, "off".to_string()),
+            (keys::CALLS, "off".to_string()),
+        ]
+        .into_iter()
+        .chain(deadline_pairs()),
+    ))
+    .expect("the calls-off configuration resolves")
+}
+
 /// A relay, running, with the address a client connects to.
 pub struct Running {
     pub address: std::net::SocketAddr,

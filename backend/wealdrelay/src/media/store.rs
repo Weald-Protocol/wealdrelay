@@ -557,6 +557,43 @@ pub async fn stale_unclaimed(
         .collect()
 }
 
+/// The charged length of every blob this relay holds a reservation row for, in
+/// one query, as a map from hash to bytes.
+///
+/// This exists so a listing costs one query rather than one object-store `head`
+/// per object. `handle_list` used to head every key it was going to report, and
+/// at a few hundred objects those serial round trips outlast the client's
+/// exchange window, so a group holding roughly 500 files answered nothing at all
+/// (WEALD-L399). The length is already the relay's own record: `bytes` is the
+/// number quota is kept in, charged at reservation and reconciled at claim.
+///
+/// Every row is read, finalized or not, because an object present in the bucket
+/// and not yet claimed is still an object the client can fetch, and reporting it
+/// at zero length would be the less true answer. A hash with no row is absent
+/// from the map and the caller reports it the way a failed `head` was reported.
+pub async fn charged_lengths(
+    pool: &PgPool,
+    workspace: &str,
+    group: &[u8],
+) -> Result<std::collections::HashMap<Vec<u8>, i64>, StoreError> {
+    let rows = sqlx::query(
+        "select blob_hash, max(bytes) as bytes from relay_blob_reservation \
+         where workspace_id = $1 and group_id = $2 group by blob_hash",
+    )
+    .bind(workspace)
+    .bind(group)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let hash: Vec<u8> = row.try_get("blob_hash").map_err(db)?;
+        let bytes: i64 = row.try_get("bytes").map_err(db)?;
+        out.insert(hash, bytes);
+    }
+    Ok(out)
+}
+
 /// Every claimed blob for one workspace and group, with its reserved byte count
 /// (the size the relay charges it at) — the set the storage-listing collector
 /// checks a bucket key against.

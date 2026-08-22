@@ -429,6 +429,152 @@ async fn a_workspace_out_of_storage_is_told_so_and_text_still_flows() {
     harness.finish().await;
 }
 
+/// The quota read answers the real row, before an upload is refused (WEALD-L401).
+///
+/// `relay_quota` was read inside `reserve` and `claim` and reported on no frame at
+/// all, so the only way to learn a workspace's ceiling was to hit it: reaching a
+/// 25 GB one on a hosted relay cost two hours and forty minutes of real uploading.
+/// This asserts the three numbers a files view needs to warn first, against a
+/// reservation and a claim that really happened, and it asserts them from the
+/// handler rather than from `store::usage`: a read that authorized nothing, or that
+/// reported the wrong side of the sum, would still agree with the store.
+#[tokio::test]
+async fn the_quota_read_reports_the_workspace_s_real_stored_limit_and_remaining() {
+    let harness = Harness::with(
+        "frames_quota_read",
+        [(keys::MAX_STORAGE_GB, "1".to_string())],
+        |_| {},
+    )
+    .await;
+    let group = harness.group(0x4b, &[device_from(0x71)]).await;
+    let session = harness.session();
+
+    let quota = |frame: &Frame| match response(frame) {
+        Response::Quota {
+            stored_bytes,
+            reserved_bytes,
+            limit_bytes,
+        } => (stored_bytes, reserved_bytes, limit_bytes),
+        other => panic!("expected a quota answer, got {other:?}"),
+    };
+
+    // A workspace that has stored nothing still knows its ceiling. Before this the
+    // row did not exist yet, and a read of a missing row answers "no limit", which
+    // is the one wrong answer a warning could be built on.
+    let empty = harness
+        .ask(
+            &session,
+            &Request::Quota {
+                group: group.clone(),
+            },
+        )
+        .await;
+    assert_eq!(quota(&empty), (0, 0, Some(1_000_000_000)));
+
+    // One reservation in flight. `reserved_bytes` is on the wire because the
+    // ceiling is enforced against the sum: a client shown only `stored_bytes` here
+    // would promise 1 GB of room that is already spoken for.
+    let hash = blob_hash(0x4c);
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&session, &put(&group, &hash, 400_000_000))
+                .await
+        ),
+        Response::Multipart { .. }
+    ));
+    let reserved = harness
+        .ask(
+            &session,
+            &Request::Quota {
+                group: group.clone(),
+            },
+        )
+        .await;
+    assert_eq!(quota(&reserved), (0, 400_000_000, Some(1_000_000_000)));
+
+    // And the same bytes once they are claimed rather than reserved: the total the
+    // ceiling is measured against has not moved, which is what a person reading
+    // "600 MB left" is entitled to.
+    assert!(store::claim(harness.pool(), WS, &group, &hash)
+        .await
+        .unwrap());
+    let claimed = harness
+        .ask(
+            &session,
+            &Request::Quota {
+                group: group.clone(),
+            },
+        )
+        .await;
+    assert_eq!(quota(&claimed), (400_000_000, 0, Some(1_000_000_000)));
+
+    // Another workspace's group is refused, exactly as a listing of it would be:
+    // the quota read authorizes through `authorize_group` and reports a number that
+    // belongs to whoever owns the group.
+    let mut stranger = Session::new(&harness.state.config);
+    stranger.bind_workspace("ws-somebody-else".to_string());
+    stranger.bind_device(device_from(0x72).verifying_key().to_bytes().to_vec());
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(
+                    &stranger,
+                    &Request::Quota {
+                        group: group.clone()
+                    }
+                )
+                .await
+        ),
+        ErrorCode::WriterNotInAccessSet
+    );
+
+    harness.finish().await;
+}
+
+/// The read costs one request against the same budget a listing does.
+///
+/// A poll-shaped question that was free is a poll-shaped question a client will
+/// make on every keystroke, and the media wire's whole rate story is per device.
+#[tokio::test]
+async fn the_quota_read_is_charged_against_the_device_s_request_budget() {
+    let harness = Harness::new("frames_quota_rate").await;
+    let group = harness.group(0x4e, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let rate = RateLimiter::new(1, 60_000);
+
+    assert!(matches!(
+        response(
+            &harness
+                .ask_with(
+                    &session,
+                    &rate,
+                    &Request::Quota {
+                        group: group.clone()
+                    }
+                )
+                .await
+        ),
+        Response::Quota { .. }
+    ));
+    assert_eq!(
+        error_code(
+            &harness
+                .ask_with(
+                    &session,
+                    &rate,
+                    &Request::Quota {
+                        group: group.clone()
+                    }
+                )
+                .await
+        ),
+        ErrorCode::RateLimited
+    );
+
+    harness.finish().await;
+}
+
 #[tokio::test]
 async fn an_unlimited_relay_puts_no_ceiling_on_a_workspace() {
     let harness = Harness::with(
@@ -1022,13 +1168,31 @@ async fn a_conflicting_control_is_answered_group_frozen() {
     let session = harness.session();
     let epoch = verifier_key(0x21);
 
+    let genesis = signed_control(&group, 0, &epoch, None, &epoch);
     harness
-        .ask(
-            &session,
-            &Request::RetentionControl(signed_control(&group, 0, &epoch, None, &epoch)),
-        )
+        .ask(&session, &Request::RetentionControl(genesis.clone()))
         .await;
-    let forged = signed_control(&group, 0, &verifier_key(0xee), None, &verifier_key(0xee));
+    // Epoch one is where the freeze lives. WEALD-L183: a second *genesis* is
+    // refused rather than frozen on, because any admitted device could mint one
+    // for any group id in the workspace and a freeze it could set was a
+    // permanent, unclearable stop on that group's retention.
+    let rotated = signed_control(
+        &group,
+        1,
+        &verifier_key(0x22),
+        Some(genesis.digest()),
+        &epoch,
+    );
+    harness
+        .ask(&session, &Request::RetentionControl(rotated))
+        .await;
+    let forged = signed_control(
+        &group,
+        1,
+        &verifier_key(0xee),
+        Some(genesis.digest()),
+        &epoch,
+    );
     assert_eq!(
         error_code(
             &harness
@@ -1047,6 +1211,55 @@ async fn a_conflicting_control_is_answered_group_frozen() {
         ErrorCode::GroupFrozen
     );
     assert!(retention::is_frozen(harness.pool(), &group).await.unwrap());
+
+    harness.finish().await;
+}
+
+/// WEALD-L183, the wire half: a genesis control roots a group's retention chain,
+/// so the device publishing it must be named by the workspace's current access
+/// set. Reaching the workspace is not enough, and a provisional grant is not
+/// enough. The self-signature proves possession of a key the publisher made a
+/// moment ago and nothing about the group.
+#[tokio::test]
+async fn a_genesis_control_from_a_device_outside_the_access_set_is_refused() {
+    let harness = Harness::new("frames_genesis_binding").await;
+    let group = harness.group(0x52, &[device_from(0x71)]).await;
+    let epoch = verifier_key(0x21);
+
+    // A session for a device the access set does not name, holding the same
+    // workspace authorization the socket grants.
+    let mut stranger = Session::new(&harness.state.config);
+    stranger.bind_workspace(WS.to_string());
+    stranger.bind_device(device_from(0xcc).verifying_key().to_bytes().to_vec());
+
+    assert_eq!(
+        error_code(
+            &harness
+                .ask(
+                    &stranger,
+                    &Request::RetentionControl(signed_control(&group, 0, &epoch, None, &epoch)),
+                )
+                .await
+        ),
+        ErrorCode::WriterNotInAccessSet
+    );
+    assert!(retention::latest_control(harness.pool(), &group)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!retention::is_frozen(harness.pool(), &group).await.unwrap());
+
+    // The member's own genesis still lands.
+    let session = harness.session();
+    assert!(matches!(
+        harness
+            .ask(
+                &session,
+                &Request::RetentionControl(signed_control(&group, 0, &epoch, None, &epoch)),
+            )
+            .await,
+        Frame::Blob { .. }
+    ));
 
     harness.finish().await;
 }
@@ -2520,5 +2733,226 @@ async fn a_finalization_is_refused_for_each_reason_it_can_be() {
         "a workspace that cannot be a key is refused at finalization too"
     );
 
+    harness.finish().await;
+}
+
+// MARK: BLOB list at scale (WEALD-L399)
+
+/// A hash that is distinct per index, so a thousand of them are a thousand
+/// objects rather than one written a thousand times.
+fn indexed_hash(index: u16) -> Vec<u8> {
+    let mut hash = vec![0u8; 32];
+    hash[0] = (index >> 8) as u8;
+    hash[1] = (index & 0xff) as u8;
+    hash
+}
+
+/// A listing of a thousand objects is built from the relay's own reservation
+/// rows, in one query, and never from one `head` per object.
+///
+/// The regression this holds shut is WEALD-L399: `handle_list` used to head every
+/// key before it encoded a reply, so a group holding a few hundred objects took
+/// longer than the client's exchange window and the files view answered "the
+/// relay did not answer the listing" at every size above that. The assertion is
+/// therefore both halves: every object is named with its charged length, and the
+/// whole answer arrives well inside the window a person is waiting on.
+#[tokio::test]
+async fn a_listing_of_a_thousand_objects_is_answered_from_the_reservation_rows() {
+    let harness = Harness::with("frames_list_scale", [], |_| {}).await;
+    let group = harness.group(0x4c, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let pool = harness.pool();
+    let store = harness.storage();
+
+    const COUNT: u16 = 1000;
+    const BYTES: i64 = 4096;
+    for index in 0..COUNT {
+        let hash = indexed_hash(index);
+        store
+            .put(&key(WS, &group, &hash), &vec![7u8; BYTES as usize])
+            .await
+            .expect("the object is written");
+        store::ensure_quota_row(pool, WS, None)
+            .await
+            .expect("a quota row");
+        store::reserve(
+            pool,
+            WS,
+            &group,
+            &hash,
+            BYTES,
+            false,
+            i64::from(media::PRESIGN_TTL_SECONDS),
+        )
+        .await
+        .expect("a reservation");
+    }
+
+    let started = std::time::Instant::now();
+    let frame = harness
+        .ask(
+            &session,
+            &Request::List {
+                workspace: WS.as_bytes().to_vec(),
+                group: group.clone(),
+            },
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    match response(&frame) {
+        Response::Listing { entries } => {
+            assert_eq!(entries.len(), COUNT as usize);
+            assert!(
+                entries.iter().all(|(_, len)| *len == BYTES as u64),
+                "every entry carries the length the reservation was charged for"
+            );
+        }
+        other => panic!("expected a listing, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a thousand-object listing took {elapsed:?}, which is a per-object head loop"
+    );
+    harness.finish().await;
+}
+
+// MARK: A joiner's upload (WEALD-L400)
+
+/// A second device's small upload is stored, and its manifest claim accepted, on
+/// exactly the terms the founder's is.
+///
+/// WEALD-L400: against a live cell the founder's 4 KB `media-put` stored while a
+/// joined second workspace's identical put came back `reject/malformed_header`
+/// twice. `media.md:25-58` gives every group member the same upload path, and
+/// mp.14 and mp.15 had only ever been driven from the founder side, so nothing
+/// covered this direction. The joiner here holds no genesis key and never will,
+/// which is the whole difference between the two devices: it reads the chain
+/// position the relay reports, signs at the epoch that position names with the
+/// key every member of that epoch derives, and extends the chain by one.
+#[tokio::test]
+async fn a_joiners_manifest_claim_is_accepted_on_the_founders_terms() {
+    let harness = Harness::new("frames_joiner_claim").await;
+    let founder_device = device_from(0x71);
+    let joiner_device = device_from(0x72);
+    let group = harness
+        .group(0x52, &[founder_device.clone(), joiner_device.clone()])
+        .await;
+    let genesis_key = verifier_key(0x21);
+    let rotated_key = verifier_key(0x22);
+
+    let mut founder = harness.session();
+    founder.bind_device(founder_device.verifying_key().to_bytes().to_vec());
+    // The joiner is the same workspace and a different device, which is what a
+    // second Mac admitted to the access set is.
+    let mut joiner = harness.session();
+    joiner.bind_device(joiner_device.verifying_key().to_bytes().to_vec());
+
+    // The founder's chain: genesis, then one rotation, which is the epoch the
+    // joiner arrived at and the only retention key it holds.
+    let genesis = signed_control(&group, 0, &genesis_key, None, &genesis_key);
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&founder, &Request::RetentionControl(genesis.clone()))
+                .await
+        ),
+        Response::RetentionAck { .. }
+    ));
+    let rotated = signed_control(
+        &group,
+        1,
+        &rotated_key,
+        Some(genesis.digest()),
+        &genesis_key,
+    );
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&founder, &Request::RetentionControl(rotated))
+                .await
+        ),
+        Response::RetentionAck { .. }
+    ));
+
+    // The founder's own 4 KB upload and claim, so the chain is already past its
+    // first manifest when the joiner arrives.
+    let founder_hash = blob_hash(0xf1);
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&founder, &put(&group, &founder_hash, 4096))
+                .await
+        ),
+        Response::Upload { .. }
+    ));
+    let first = signed_manifest(&group, 1, 1, None, vec![founder_hash.clone()], &rotated_key);
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&founder, &Request::RetentionManifest(first.clone()))
+                .await
+        ),
+        Response::RetentionAck { .. }
+    ));
+
+    // The joiner's identical put.
+    let joiner_hash = blob_hash(0x1a);
+    assert!(matches!(
+        response(&harness.ask(&joiner, &put(&group, &joiner_hash, 4096)).await),
+        Response::Upload { .. }
+    ));
+
+    // The position it builds its claim from, which is the whole of what a joiner
+    // knows about a chain it did not start.
+    let position = match response(
+        &harness
+            .ask(
+                &joiner,
+                &Request::RetentionPosition {
+                    group: group.clone(),
+                },
+            )
+            .await,
+    ) {
+        Response::RetentionPosition {
+            control_epoch,
+            next_sequence,
+            prev_manifest_hash,
+            blobs,
+            ..
+        } => (control_epoch, next_sequence, prev_manifest_hash, blobs),
+        other => panic!("expected a chain position, got {other:?}"),
+    };
+    let (control_epoch, next_sequence, prev_manifest_hash, mut blobs) = position;
+    assert_eq!(control_epoch, 1);
+    assert_eq!(next_sequence, 2);
+    assert_eq!(prev_manifest_hash, Some(first.digest()));
+    // The union, never a replacement: a joiner that published only what it can
+    // see would un-claim the founder's attachment.
+    blobs.push(joiner_hash.clone());
+
+    let claim = signed_manifest(
+        &group,
+        control_epoch,
+        next_sequence,
+        prev_manifest_hash,
+        blobs,
+        &rotated_key,
+    );
+    match response(
+        &harness
+            .ask(&joiner, &Request::RetentionManifest(claim.clone()))
+            .await,
+    ) {
+        Response::RetentionAck { digest } => assert_eq!(digest, claim.digest()),
+        other => panic!("a joiner's manifest claim was refused: {other:?}"),
+    }
+    // Both objects are charged, which is the founder's fetchable file and the
+    // joiner's, not one at the cost of the other.
+    assert_eq!(
+        store::usage(harness.pool(), WS).await.unwrap().stored_bytes,
+        8192
+    );
     harness.finish().await;
 }

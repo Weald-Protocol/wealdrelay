@@ -675,10 +675,22 @@ pub fn public_router(state: Arc<RelayState>) -> Router {
                 get(admitted).layer(axum::Extension(OperatorToken(token.clone()))),
             )
             .route(
+                "/version",
+                get(version).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
                 "/gc/restore-marker",
                 post(set_restore_marker)
                     .delete(clear_restore_marker)
-                    .layer(axum::Extension(OperatorToken(token))),
+                    .layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/media/quota",
+                post(set_media_quota).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/gc/sweep",
+                post(run_sweep).layer(axum::Extension(OperatorToken(token))),
             ),
         None => router,
     };
@@ -1004,10 +1016,22 @@ pub fn private_router(state: Arc<RelayState>) -> Router {
                 get(admitted).layer(axum::Extension(OperatorToken(token.clone()))),
             )
             .route(
+                "/version",
+                get(version).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
                 "/gc/restore-marker",
                 post(set_restore_marker)
                     .delete(clear_restore_marker)
-                    .layer(axum::Extension(OperatorToken(token))),
+                    .layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/media/quota",
+                post(set_media_quota).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
+                "/gc/sweep",
+                post(run_sweep).layer(axum::Extension(OperatorToken(token))),
             ),
         None => router,
     };
@@ -1080,6 +1104,47 @@ async fn admitted(
     }
 }
 
+/// What `GET /version` answers: what this binary is, and what it believes it is
+/// running, with the digest form named rather than implied.
+///
+/// `digest` is `RunningDigest::line`, so an image build reports its published
+/// manifest digest and anything else reports a labelled self-hash. `comparable`
+/// says which of those it is, so a caller reconciling against a pinned digest
+/// never compares a self-hash to a release and reads the mismatch as drift
+/// (WEALD-L352).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Version {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub digest: String,
+    pub comparable: bool,
+}
+
+/// `GET /version`: the running version and digest, behind the operator bearer.
+///
+/// No database, unlike `/admitted`: this is what the process is, and a relay
+/// whose database is down must still be able to say which build is down.
+async fn version(
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let build = crate::BuildInfo::current();
+    let digest = crate::RunningDigest::resolve();
+    (
+        StatusCode::OK,
+        Json(Version {
+            name: build.name,
+            version: build.version,
+            digest: digest.line(),
+            comparable: digest.is_comparable(),
+        }),
+    )
+        .into_response()
+}
+
 /// What `POST /gc/restore-marker` answers, and what `DELETE` answers when it has
 /// cleared one. One field, and the field is how many collector passes are still
 /// suppressed.
@@ -1139,6 +1204,141 @@ async fn set_restore_marker(
         )
             .into_response(),
     }
+}
+
+/// The ceiling to put on one workspace, and the workspace to put it on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaQuotaRequest {
+    pub workspace: String,
+    /// The new ceiling in bytes. `null` means unlimited, which is the same
+    /// `relay_quota.limit_bytes` a relay with no `WEALD_RELAY_MAX_STORAGE_GB`
+    /// writes, so the route can raise a ceiling as well as lower one.
+    pub limit_bytes: Option<i64>,
+}
+
+/// What `POST /media/quota` answers: the row as it now stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaQuota {
+    pub workspace: String,
+    pub stored_bytes: i64,
+    pub reserved_bytes: i64,
+    pub limit_bytes: Option<i64>,
+}
+
+/// `POST /media/quota`: set one workspace's storage ceiling now.
+///
+/// The ceiling is otherwise `WEALD_RELAY_MAX_STORAGE_GB`, set once per instance
+/// from its tier, and the only lever on it was reprovisioning. That made
+/// `quota/storage_exhausted` the most expensive assertion in the multiplayer table:
+/// reaching a 25 GB ceiling took two hours and forty minutes of real uploading, and
+/// the refusal was simply unreachable anywhere not prepared to upload 25 GB
+/// (WEALD-L401). This puts the ceiling one object away instead, and the refusal it
+/// then drives is the same one the same code raises in production.
+///
+/// It writes a limit and nothing else. It cannot delete an object, cannot lower
+/// `stored_bytes`, and cannot reach across to another relay: the worst an operator
+/// holding this bearer can do with it is refuse their own customer's next upload,
+/// which is the same authority `WEALD_RELAY_MAX_STORAGE_GB` already gave them. Every
+/// other quota rule, including the reservation arithmetic the ceiling is enforced
+/// against, stays with `media::store`.
+async fn set_media_quota(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<MediaQuotaRequest>>,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    };
+    let Some(Json(body)) = request else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a JSON body naming a workspace is required\n",
+        )
+            .into_response();
+    };
+    if body.workspace.is_empty() {
+        return (StatusCode::BAD_REQUEST, "workspace must not be empty\n").into_response();
+    }
+    if body.limit_bytes.is_some_and(|limit| limit < 0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "limit_bytes must not be negative; null means unlimited\n",
+        )
+            .into_response();
+    }
+    let pool = database.pool();
+    if let Err(error) =
+        crate::media::store::ensure_quota_row(pool, &body.workspace, body.limit_bytes).await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::logging::scrub(&error.to_string()),
+        )
+            .into_response();
+    }
+    match crate::media::store::usage(pool, &body.workspace).await {
+        Ok(usage) => (
+            StatusCode::OK,
+            Json(MediaQuota {
+                workspace: body.workspace,
+                stored_bytes: usage.stored_bytes,
+                reserved_bytes: usage.reserved_bytes,
+                limit_bytes: usage.limit_bytes,
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::logging::scrub(&error.to_string()),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether the caller wants the storage-listing sweep in this pass.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SweepRequest {
+    /// Absent means yes. The listing sweep is the one pass that costs a billed
+    /// Class A operation per scope, so an operator driving repeated passes can turn
+    /// it off rather than pay for a reconcile they are not asking about.
+    pub storage_listing: Option<bool>,
+}
+
+/// `POST /gc/sweep`: run one collector pass now and answer with what it did.
+///
+/// The collector's own clock is fifteen minutes and the shortest window a pass
+/// enforces is the 24-hour unclaimed grace, so every deletion this relay promises
+/// is a promise no probe against a running instance could observe: waiting out the
+/// window is not a test anybody runs. This is the trigger half. The other half is
+/// `WEALD_RELAY_MEDIA_UNCLAIMED_GRACE_SECONDS`, which shortens the window on a
+/// probe instance; together they make "an unclaimed object is deleted and a
+/// claimed one is not" an assertion instead of an argument.
+///
+/// It authorizes nothing the collector would not already do on its own schedule
+/// and it takes no target: there is no per-object deletion here, only the pass,
+/// so an operator holding the token cannot use this to delete one customer's
+/// attachment. Eligibility stays entirely with `media::gc`.
+async fn run_sweep(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<SweepRequest>>,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    if state.database.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no database\n").into_response();
+    }
+    let list_storage = request
+        .and_then(|Json(body)| body.storage_listing)
+        .unwrap_or(true);
+    let summary = crate::janitor::pass_with(&state, list_storage).await;
+    (StatusCode::OK, Json(summary)).into_response()
 }
 
 /// `DELETE /gc/restore-marker`: the restore is settled, let the sweep run again.

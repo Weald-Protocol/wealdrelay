@@ -211,12 +211,21 @@ async fn a_successor_race_the_relay_cannot_record_or_freeze_is_never_reported_as
     let (scratch, _blobs, state) = prepared("retentionfault_race").await;
     let pool = pool_of(&state);
     let group = workspace_with(&state, "ws-race", 0x63).await;
-    let settled = verifier_key(0x21);
+    let epoch0 = verifier_key(0x21);
+    let settled = verifier_key(0x22);
     let rival = verifier_key(0x31);
-    retention::apply_control(pool, &signed_control(&group, 0, &settled, None, &settled))
-        .await
-        .unwrap();
-    let forged = signed_control(&group, 0, &rival, None, &rival);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    retention::apply_control(pool, &genesis).await.unwrap();
+    // The contested epoch is one, not zero: WEALD-L183 refuses a second genesis
+    // outright rather than freezing on it, so the successor race is where the
+    // freeze this test is about actually lives.
+    retention::apply_control(
+        pool,
+        &signed_control(&group, 1, &settled, Some(genesis.digest()), &epoch0),
+    )
+    .await
+    .unwrap();
+    let forged = signed_control(&group, 1, &rival, Some(genesis.digest()), &epoch0);
 
     // The evidence row first, because a conflict that cannot be recorded must not
     // go on to freeze: the freeze without the evidence is an alarm with nothing

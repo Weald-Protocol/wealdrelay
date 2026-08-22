@@ -125,6 +125,22 @@ pub const HANDSHAKE_FRAMES_PER_MINUTE: u32 = 120;
 /// frame per membership change, and far below a pipelining peer.
 pub const ACCESS_FRAMES_PER_MINUTE: u32 = 30;
 
+/// `WRAP` frames one connection may send per minute.
+///
+/// A wrap is a durable write: one row per recovery key, inserted before the
+/// signature work behind it is ever questioned, so an unbudgeted `WRAP` is one
+/// admitted device growing a table nothing compacts at line rate. Same shape as
+/// `ACCESS`: far above real use, one frame per rotation, far below a pipelining
+/// peer.
+pub const WRAP_FRAMES_PER_MINUTE: u32 = 30;
+
+/// `INVITE` frames one connection may send per minute.
+///
+/// Invite administration inserts and revokes rows and reads the invite record
+/// first, so an unbudgeted `INVITE` is free database work for any admitted
+/// device. Same allowance as its sibling durable-write frames.
+pub const INVITE_FRAMES_PER_MINUTE: u32 = 30;
+
 /// `SUB` frames one connection may send per minute.
 ///
 /// Above `MAX_GROUPS_PER_CONNECTION`, deliberately and with room to spare: a cold
@@ -379,6 +395,12 @@ pub struct Session {
     /// `ACCESS` frames per minute. Nothing bounded this path at all before it
     /// existed: the arm deferred the rotation with no charge.
     access_budget: FrameBudget,
+    /// `WRAP` frames per minute, the same story as `access_budget`: a durable
+    /// write per frame that no counter bounded.
+    wrap_budget: FrameBudget,
+    /// `INVITE` frames per minute, for the same reason: inserts and revokes
+    /// behind an unbudgeted frame are free work for an admitted device.
+    invite_budget: FrameBudget,
     /// `SUB` and `RECON` frames per minute, each budgeted separately from the
     /// others and from each other. They are the two largest amplifiers on the
     /// socket, a small frame against a query plus a replay, so an unbudgeted one
@@ -427,6 +449,8 @@ impl Session {
             keys_budget: FrameBudget::default(),
             handshake_budget: FrameBudget::default(),
             access_budget: FrameBudget::default(),
+            wrap_budget: FrameBudget::default(),
+            invite_budget: FrameBudget::default(),
             sub_budget: FrameBudget::default(),
             recon_budget: FrameBudget::default(),
             join_budget: FrameBudget::default(),
@@ -506,6 +530,23 @@ impl Session {
     }
 
     /// The only workspace this ready session may operate in.
+    /// True while the operator has quiesced this instance for writes.
+    fn refuses_writes(&self) -> bool {
+        matches!(self.write_mode, WriteMode::ReadOnly)
+    }
+
+    /// The answer every durable-write frame owes in `read_only`, or `None` when
+    /// the instance is taking writes. Answered from the session rather than
+    /// deferred, so a quiesced relay does no database round trip per refusal and
+    /// the reads the mode exists to keep serving are untouched.
+    fn read_only_refusal(&self) -> Option<Reaction> {
+        self.refuses_writes().then(|| {
+            Reaction::Reply(vec![Frame::Error(FrameError::new(
+                ErrorCode::ServiceReadOnly,
+            ))])
+        })
+    }
+
     pub fn authorized_workspace(&self) -> Option<&str> {
         self.authorized_workspace.as_deref()
     }
@@ -612,7 +653,7 @@ impl Session {
                 })
             }
             (State::Ready, Frame::Send { envelope }) => {
-                if matches!(self.write_mode, WriteMode::ReadOnly) {
+                if self.refuses_writes() {
                     // Answered here rather than deferred, so a relay in
                     // maintenance does not do a database round trip per refused
                     // write. `SUB`, `RECON` and export keep working, which is the
@@ -660,6 +701,13 @@ impl Session {
             // The one frame a bootstrapping session may send, and the reason that
             // state exists.
             (State::Ready | State::Bootstrapping, Frame::Access { body }) => {
+                // An access-set rotation is a durable write, so `read_only` owes it
+                // the same refusal `SEND` gets (WEALD-L158). Answered before the
+                // budget is charged: a refused frame must cost the caller nothing
+                // and reach no database.
+                if let Some(refusal) = self.read_only_refusal() {
+                    return refusal;
+                }
                 // Charged before the work is deferred, like every sibling arm: the
                 // judgement hashes every principal and reads the prior set, so an
                 // unbudgeted `ACCESS` is one admitted device pipelining maximal
@@ -677,7 +725,24 @@ impl Session {
             // whose epoch secret could have derived a tag, so a wrap from one is
             // a client that is wrong about the protocol rather than a case to
             // allow for.
-            (State::Ready, Frame::Wrap { body }) => Reaction::Defer(Work::PublishWrap { body }),
+            (State::Ready, Frame::Wrap { body }) => {
+                // A recovery wrap is a durable write (WEALD-L158).
+                if let Some(refusal) = self.read_only_refusal() {
+                    return refusal;
+                }
+                // Charged before the work is deferred, like every sibling arm: a
+                // wrap inserts a row per recovery key, so an unbudgeted frame is
+                // one admitted device growing that table at line rate
+                // (WEALD-L217).
+                if !self.wrap_budget.charge(now_ms, WRAP_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(WRAP_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
+                Reaction::Defer(Work::PublishWrap { body })
+            }
             // Before authentication, deliberately, and it is the only frame that is.
             // A device redeeming an invite has no membership yet by definition: it is
             // asking for the reservation that will let it authenticate at all
@@ -716,9 +781,29 @@ impl Session {
             // anything but "no", and a refusal is clearer than a frame accepted into
             // a path that cannot serve it.
             (State::Ready, Frame::Invite { body }) => {
+                // Invite administration inserts and revokes rows (WEALD-L158).
+                if let Some(refusal) = self.read_only_refusal() {
+                    return refusal;
+                }
+                // Charged before the work is deferred, like every sibling arm: the
+                // administration path reads the invite record and writes rows, so
+                // an unbudgeted frame is free database work for an admitted device
+                // (WEALD-L217).
+                if !self.invite_budget.charge(now_ms, INVITE_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(INVITE_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::AdministerInvite { body })
             }
             (State::Ready, Frame::Handshake { group, message, .. }) => {
+                // A handshake commit appends a row (WEALD-L158), so the mode that
+                // quiesces the instance refuses it too.
+                if let Some(refusal) = self.read_only_refusal() {
+                    return refusal;
+                }
                 // Charged before the work is deferred, so a refused frame reaches
                 // no database: it takes no row lock, appends no row and fans nothing
                 // out, which is the whole point of budgeting the frame rather than
@@ -781,6 +866,13 @@ impl Session {
                         ErrorCode::MalformedHeader,
                     ))]);
                 }
+                // Publishing key packages inserts rows; a fetch only reads and
+                // takes off the shelf, so the mode leaves it alone (WEALD-L158).
+                if matches!(body, KeysBody::Publish { .. }) {
+                    if let Some(refusal) = self.read_only_refusal() {
+                        return refusal;
+                    }
+                }
                 if let KeysBody::Fetch { count, .. } = &body {
                     if *count == 0 || *count > MAX_KEY_PACKAGE_FETCH {
                         return Reaction::Reply(vec![Frame::Error(
@@ -818,14 +910,16 @@ impl Session {
                         ErrorCode::MalformedHeader,
                     ))]);
                 }
-                // An expiry that has already passed, judged against the relay's own
-                // observed time. Here rather than in the codec because the codec has
-                // no clock, and `reject` rather than `denied` because a registration
-                // that expired before it arrived is permanently wrong as sent: the
-                // client's fix is to ask the ringer for a live handle, never to resend
-                // this one (`specs/backend/relay/push.md` section 3).
+                // An expiry outside the storable window, judged against the relay's
+                // own observed time. Here rather than in the codec because the codec
+                // has no clock, and `reject` rather than `denied` because a
+                // registration already expired, or so far ahead that the janitor sweep
+                // could never reap it, is permanently wrong as sent: the client's fix
+                // is to ask the ringer for a live handle, never to resend this one
+                // (`specs/backend/relay/push.md` sections 3 and 4). One bound, shared
+                // with the writing path in `ws.rs`, so the two cannot drift.
                 if let crate::frame::WakeBody::Register { expires_at, .. } = &body {
-                    if *expires_at <= now_ms {
+                    if !crate::push::expiry_in_bounds(*expires_at, now_ms) {
                         return Reaction::Reply(vec![Frame::Error(FrameError::new(
                             ErrorCode::PushHandleMalformed,
                         ))]);

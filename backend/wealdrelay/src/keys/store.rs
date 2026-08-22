@@ -136,6 +136,13 @@ pub async fn publish(
 pub struct Served {
     pub id: i64,
     pub package: Vec<u8>,
+    /// The shelf the row came off, so a restore can put back a row that no
+    /// longer exists.
+    pub device_hash: Vec<u8>,
+    /// Seconds of the original lifetime still to run when the row was taken. A
+    /// restore must not extend a package's life, and must not resurrect one
+    /// whose expiry has already passed.
+    pub ttl_seconds: i64,
 }
 
 /// Take at most `count` packages off one device's shelf, consuming them.
@@ -162,7 +169,7 @@ pub async fn fetch_served(
 ) -> Result<Vec<Served>, StoreError> {
     let hash = device_hash(device_key);
     let rows = sqlx::query(
-        "update relay_key_package set consumed_at = now() \
+        "delete from relay_key_package \
          where id in ( \
              select id from relay_key_package \
              where workspace_id = $1 and device_hash = $2 \
@@ -171,7 +178,8 @@ pub async fn fetch_served(
              limit $3 \
              for update skip locked \
          ) \
-         returning id, package",
+         returning id, package, device_hash, \
+                   greatest(0, floor(extract(epoch from (expires_at - now()))))::bigint as ttl",
     )
     .bind(workspace)
     .bind(&hash)
@@ -184,6 +192,8 @@ pub async fn fetch_served(
             Ok(Served {
                 id: row.try_get("id").map_err(db)?,
                 package: row.try_get("package").map_err(db)?,
+                device_hash: row.try_get("device_hash").map_err(db)?,
+                ttl_seconds: row.try_get("ttl").map_err(db)?,
             })
         })
         .collect()
@@ -191,21 +201,48 @@ pub async fn fetch_served(
 
 /// Put back packages whose answer was never delivered.
 ///
-/// Only rows this call consumed are named, and the update re-checks
-/// `consumed_at is not null` so a restore can never resurrect a package that was
-/// already served to somebody: the invariant that no package is handed out twice
-/// is the reason this shelf exists.
-pub async fn restore(pool: &PgPool, ids: &[i64]) -> Result<(), StoreError> {
-    if ids.is_empty() {
+/// The fetch deletes the rows it hands out, because a package the relay still
+/// holds after serving it is cleartext leaf-key material kept past its stated
+/// life (WEALD-L155). So a restore is an insert of exactly the rows this call
+/// took, on the shelf they came off, with the lifetime they had left. A row
+/// whose remaining lifetime is gone is dropped rather than resurrected, and a
+/// package already delivered to somebody is never among these ids, so the
+/// invariant that no package is handed out twice still holds.
+pub async fn restore(pool: &PgPool, workspace: &str, served: &[Served]) -> Result<(), StoreError> {
+    if served.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "update relay_key_package set consumed_at = null \
-         where id = any($1) and consumed_at is not null",
-    )
-    .bind(ids)
-    .execute(pool)
-    .await
-    .map_err(db)?;
+    let mut transaction = pool.begin().await.map_err(db)?;
+    for row in served {
+        if row.ttl_seconds <= 0 {
+            continue;
+        }
+        sqlx::query(
+            "insert into relay_key_package \
+                 (workspace_id, device_hash, package, expires_at) \
+             values ($1, $2, $3, now() + make_interval(secs => $4))",
+        )
+        .bind(workspace)
+        .bind(row.device_hash.as_slice())
+        .bind(row.package.as_slice())
+        .bind(row.ttl_seconds as f64)
+        .execute(&mut *transaction)
+        .await
+        .map_err(db)?;
+    }
+    transaction.commit().await.map_err(db)?;
     Ok(())
+}
+
+/// Delete packages whose stated lifetime has passed.
+///
+/// The shelf's cap counts only live rows, so without this an expired package is
+/// a row nothing can serve, nothing can count and nothing removes. Called by the
+/// collector alongside the other plain expiry deletes.
+pub async fn sweep_expired(pool: &PgPool) -> Result<u64, StoreError> {
+    let done = sqlx::query("delete from relay_key_package where expires_at <= now()")
+        .execute(pool)
+        .await
+        .map_err(db)?;
+    Ok(done.rows_affected())
 }

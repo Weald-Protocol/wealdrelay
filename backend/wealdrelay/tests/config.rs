@@ -338,7 +338,7 @@ fn a_listen_address_must_be_host_and_port() {
 /// the variable, while `unlimited` still means no ceiling.
 #[test]
 fn a_zero_capacity_is_refused_at_boot_rather_than_starving_every_write() {
-    for key in [keys::MAX_STORAGE_GB, keys::MAX_LOG_GB] {
+    for key in [keys::MAX_STORAGE_GB, keys::MAX_LOG_GB, keys::RETENTION_DAYS] {
         let error = resolve(key, "0").expect_err("zero is refused");
         assert_eq!(error, ConfigError::ZeroLimit { key });
         assert_eq!(error.key(), Some(key));
@@ -677,7 +677,12 @@ fn the_key_list_is_complete_and_has_no_duplicates() {
     // written before the envelope that references it, so a sweep with no floor
     // would collect a blob that was seconds away from being pointed at
     // (`src/janitor.rs`).
-    assert_eq!(keys::ALL.len(), 38);
+    // 39 with WEALD_RELAY_MEDIA_UNCLAIMED_GRACE_SECONDS, how long a reservation
+    // that never finalized is left alone before the janitor may delete its object.
+    // The window is the one promise no probe could observe, because a probe cannot
+    // wait out a day, so an operator shortens it and drives the sweep
+    // (`src/media`, `specs/backend/relay/media.md`).
+    assert_eq!(keys::ALL.len(), 39);
     assert!(keys::ALL.iter().all(|key| key.starts_with("WEALD_RELAY_")));
 }
 
@@ -1056,11 +1061,27 @@ fn calls_on(pairs: &[(&'static str, &'static str)]) -> Result<Config, ConfigErro
 }
 
 #[test]
-fn the_call_path_is_off_by_default_and_carries_no_ceiling() {
-    // Off, unlike the ephemeral path, and the asymmetry is the decision. A beat
-    // every twenty seconds is the ordinary shape of the app; a sustained media
-    // stream is capacity an operator has to have sized for, so it is opted into.
+fn the_call_path_is_on_by_default_and_takes_the_default_ceiling() {
+    // On, as of 2026-08-21, and the old default is what the change is against: a
+    // relay nobody could place a call to was not a posture, it was the feature being
+    // unreachable on every instance anybody bought
+    // (`specs/launch-review-2026-08-11.md:36`). The ceiling comes with it, because a
+    // default that made every relay refuse to boot would be no default at all.
     let config = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(config.calls, CallMode::On);
+    assert_eq!(config.calls_label(), "on");
+    assert_eq!(
+        config.max_concurrent_calls,
+        Some(wealdrelay::calls::DEFAULT_CONCURRENT_CALLS)
+    );
+}
+
+#[test]
+fn calls_may_still_be_turned_off_and_then_carry_no_ceiling() {
+    // The posture an operator adopts deliberately, which the new default does not
+    // take away: off refuses both frames with version/protocol_unsupported and the
+    // ceiling goes back to being meaningless.
+    let config = resolve(keys::CALLS, "off").expect("calls off resolves");
     assert_eq!(config.calls, CallMode::Off);
     assert_eq!(config.calls_label(), "off");
     assert_eq!(config.max_concurrent_calls, None);
@@ -1075,23 +1096,28 @@ fn calls_on_with_a_ceiling_resolves() {
 }
 
 #[test]
-fn calls_on_without_a_ceiling_refuses_to_start_and_names_the_key() {
-    // The variable with no default, and the reason there will never be one: call
-    // capacity is a sizing decision about one instance's bandwidth, and a relay
-    // that guessed would be a relay whose ceiling nobody chose and whose operator
-    // meets it as a refusal during a call.
-    let error = resolve(keys::CALLS, "on").expect_err("a ceiling is required");
-    assert!(matches!(error, ConfigError::CallsCeilingMissing { .. }));
-    assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
-    assert!(error.to_string().contains(keys::CALLS));
+fn calls_on_without_a_ceiling_takes_the_default_rather_than_refusing() {
+    // This was a startup refusal, and it was right while calls were opt-in: the
+    // operator turning them on was the operator sizing them. With calls on by
+    // default the same rule would have been every relay in the fleet failing to
+    // boot, so the ceiling has a default and an operator who has sized their
+    // instance still states their own.
+    let config = resolve(keys::CALLS, "on").expect("calls on resolves without a ceiling");
+    assert_eq!(config.calls, CallMode::On);
+    assert_eq!(
+        config.max_concurrent_calls,
+        Some(wealdrelay::calls::DEFAULT_CONCURRENT_CALLS)
+    );
 }
 
 #[test]
-fn a_ceiling_without_calls_is_refused_rather_than_ignored() {
+fn a_ceiling_with_calls_turned_off_is_refused_rather_than_ignored() {
     // For the reason an empty value is refused: a setting the binary accepts and
-    // does not honour is one an operator reads back and believes.
-    let error =
-        resolve(keys::MAX_CONCURRENT_CALLS, "3").expect_err("a ceiling with calls off is refused");
+    // does not honour is one an operator reads back and believes. Calls have to be
+    // named off for this to be the conflict it is testing, because on is now the
+    // default and a bare ceiling is simply honoured.
+    let error = resolve_with(&[(keys::CALLS, "off"), (keys::MAX_CONCURRENT_CALLS, "3")])
+        .expect_err("a ceiling with calls off is refused");
     assert!(matches!(error, ConfigError::CallsCeilingUnused { .. }));
     assert_eq!(error.key(), Some(keys::MAX_CONCURRENT_CALLS));
 }
@@ -1143,9 +1169,27 @@ fn a_multi_instance_deployment_may_leave_calls_off() {
     let config = resolve_with(&[
         (keys::REDIS_URL, "redis://localhost:6379"),
         (keys::LIVE, "off"),
+        (keys::CALLS, "off"),
     ])
     .expect("calls off resolves alongside a second instance");
     assert_eq!(config.calls, CallMode::Off);
+}
+
+#[test]
+fn a_multi_instance_deployment_boots_with_calls_off_rather_than_refusing_the_default() {
+    // The one place the default and an existing refusal met. Explicit `on` beside a
+    // declared second instance stays fatal, because call routing is process-local
+    // and the operator asked for something this build cannot do. Inherited `on` in
+    // the same deployment must not stop a relay from booting, so calls go off and
+    // the client reads exactly what it reads from an instance whose operator chose
+    // it (`specs/backend/relay/calls.md`, One process, stated plainly).
+    let config = resolve_with(&[
+        (keys::REDIS_URL, "redis://localhost:6379"),
+        (keys::LIVE, "off"),
+    ])
+    .expect("an inherited default never refuses a boot");
+    assert_eq!(config.calls, CallMode::Off);
+    assert_eq!(config.max_concurrent_calls, None);
 }
 
 // MARK: The connection cap

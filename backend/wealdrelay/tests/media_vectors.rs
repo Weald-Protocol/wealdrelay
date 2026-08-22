@@ -97,6 +97,9 @@ fn request_of(case: &serde_json::Value) -> Request {
             workspace: hex_to_bytes(fields["workspace"].as_str().expect("workspace")),
             group: hex_to_bytes(fields["group"].as_str().expect("group")),
         },
+        13 => Request::Quota {
+            group: hex_to_bytes(fields["group"].as_str().expect("group")),
+        },
         other => panic!("a media vector carried tag {other}, which this build does not know"),
     }
 }
@@ -109,7 +112,7 @@ fn the_relay_reads_every_byte_the_client_encoded() {
     let document = document();
     let cases = document["cases"].as_array().expect("a cases array");
     assert!(
-        cases.len() >= 9,
+        cases.len() >= 10,
         "the corpus lost cases: {} left, and a shrinking corpus is how a wire test stops testing",
         cases.len()
     );
@@ -155,7 +158,7 @@ fn the_corpus_covers_every_request_tag_the_transfer_path_uses() {
         .iter()
         .filter_map(|case| case["tag"].as_u64())
         .collect();
-    for tag in [1, 2, 3, 4, 5, 10] {
+    for tag in [1, 2, 3, 4, 5, 10, 13] {
         assert!(tags.contains(&tag), "no vector carries request tag {tag}");
     }
 }

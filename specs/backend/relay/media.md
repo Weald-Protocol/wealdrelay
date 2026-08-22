@@ -71,7 +71,11 @@ predicted should not be refused.
 
 The blob is unreferenced between steps 3 and 4. An upload with no accepted
 manifest claim is collected after 24 hours, which covers the client that crashed
-mid-post. Once a manifest claim exists, the relay never deletes it merely because
+mid-post. That window is `WEALD_RELAY_MEDIA_UNCLAIMED_GRACE_SECONDS`, whose
+default is the promised 24 hours; an operator shortens it on a probe instance and
+forces one collector pass with `POST /gc/sweep`
+(`specs/backend/relay/janitor.md`), because a day is longer than any test against
+a running relay can wait and a promise nothing can observe is not a proof. Once a manifest claim exists, the relay never deletes it merely because
 the group has been quiet; deletion requires a later, valid manifest omission or
 an explicit valid tombstone.
 
@@ -152,6 +156,57 @@ Text envelopes are never rejected for quota. Blocking someone from sending a
 message because a colleague uploaded a video is a worse failure than a slightly
 over-quota bill, and text is a rounding error against media anyway.
 
+**The ceiling is readable before it is hit.** The refusal above is raised at `BLOB
+put` against the declared length and nowhere else, so a client used to learn the
+plan existed only by being refused at it, after a person had already chosen a file
+and the client had already sealed it. Reaching a real ceiling cost hours of real
+uploading, which made the refusal unobservable anywhere not prepared to fill the
+plan (WEALD-L401). A device already authorized for the group may therefore ask:
+
+```
+Request  Quota { group }
+Response Quota { stored_bytes, reserved_bytes, limit_bytes }
+```
+
+`stored_bytes` is what claimed objects charge and `reserved_bytes` is what uploads
+in flight hold, and both are answered because the ceiling is enforced against
+their sum: a client shown only `stored_bytes` would promise room a concurrent
+upload has already taken. `limit_bytes` is absent exactly when the relay was
+configured with no ceiling at all, which is the self-hosted shape; a ceiling of
+zero is a real limit and a different answer, so the field is nullable rather than
+sentinel. Remaining headroom is the client's subtraction, saturating at zero,
+because a lowered ceiling can leave a workspace already over it.
+
+Authorized exactly as a listing is, by the group belonging to the session's own
+workspace, and charged one request against the same per-device limiter, because a
+free number is a free poll. It names no object, no filename and no member: three
+integers a member of the same workspace could already total up from a listing. The
+row is written with the instance's configured limit before it is read, the same
+`ensure_quota_row` call `BLOB put` makes, so a workspace that has stored nothing
+reports its ceiling rather than reporting none. A relay that does not know this
+request answers an unknown-tag error frame and the client shows no warning rather
+than failing anything; the upload it was going to warn about is still refused at
+the relay if it should be.
+
+**An operator can set a workspace's ceiling.** `POST /media/quota` on the operator
+listeners, behind `WEALD_RELAY_OPERATOR_TOKEN` and mounted only where that bearer
+exists, writes `relay_quota.limit_bytes` for one named workspace and nothing else:
+
+```
+POST /media/quota  {"workspace": "...", "limit_bytes": 4096}   # null is unlimited
+200                {"workspace", "stored_bytes", "reserved_bytes", "limit_bytes"}
+```
+
+It exists so `quota/storage_exhausted` is an assertion instead of an argument: put
+the ceiling one object away and the refusal a full workspace gets is driven in
+seconds by the same code that raises it in production. It cannot delete an object,
+cannot lower `stored_bytes` and takes no per-object target, so the worst it grants
+an operator holding the bearer is refusing their own instance's next upload, which
+is authority `WEALD_RELAY_MAX_STORAGE_GB` already gave them. A negative limit and
+an empty workspace name are refused rather than written. Every other quota rule,
+including the reservation arithmetic the ceiling is enforced against, stays with
+the store.
+
 **One object is charged once, and a missing object is not a charge.** A finalized
 reservation is the relay's own record that it confirmed the object exists, so a
 finalized row whose object is *not* in the store is a contradiction, and it is
@@ -207,6 +262,61 @@ latest manifest is what the collection rule reads as permission to delete. Clien
 verifiers from their MLS state and warn if a public control record disagrees, so
 the relay cannot turn a storage-control record into an unnoticed membership
 decision.
+
+**The relay states the chain position; the client does not guess it.** The
+manifest chain is per group, but a client can only see its own device state, and
+the two are not the same fact. A device that joined an existing group holds no
+manifest of its own, so a client deriving `sequence` and `prev_manifest_hash`
+from local state alone sends the first sequence into a group already past it,
+which this section's own advance rule refuses. Because the client only records a
+manifest it saw acknowledged, that refusal is permanent: the same refused record
+is sent again for the life of the group (WEALD-L355). A client therefore asks:
+
+```
+Request  RetentionPosition { group }
+Response RetentionPosition { control_epoch, control_digest, next_sequence,
+                             prev_manifest_hash, blobs }
+```
+
+`control_digest` is absent exactly when the group has no `RetentionControl` at
+all, which is the only case `control_epoch` carries no meaning; epoch zero with a
+chain and no chain at all are opposite instructions to the client. `next_sequence`
+is the sequence the next manifest must name, `prev_manifest_hash` the digest it
+must name as its predecessor, and `blobs` the claim set the latest manifest
+named. The answer names no content, no filename and no member: it is an epoch,
+two digests, a counter, and ciphertext hashes the same caller can already read
+back with a listing. It is authorized exactly as every other retention request
+is, by the group belonging to the session's own workspace, and it is read only.
+
+A relay that does not know this request answers with an error frame for an
+unknown `BLOB` tag, and a client that gets one falls back to its own log rather
+than failing the upload. That is the compatibility rule for this wire in both
+directions: a peer that has never had to know a message must not be broken by
+it, so neither the question nor the answer is ever required for a transfer to
+succeed.
+
+A client that publishes a manifest and is refused re-reads the position once and
+republishes from it; a second refusal is a real refusal.
+
+**The successor control may be published by any member who holds both keys.**
+The genesis record needs the founder, because self-signing is the founder's
+possession proof. Every later record needs the prior epoch's key and the prior
+record's digest, and both are held by every member who lived through that
+rotation, not only by the founder. A client that holds no key for epoch zero
+therefore publishes its chain from the earliest epoch it can actually anchor:
+the successor to the `control_epoch` the relay reported, when it holds the keys
+for both. Before this, such a client published no control at all, so its
+manifests named an epoch newer than the relay's latest control and were refused
+under the epoch rule above.
+
+**A manifest is the complete claim set, so it is published as a union.** Because
+an omission is the only deletion signal the relay has, a device that cannot
+replay every historical `media.ref` must not publish only what it can see: for a
+joiner that is every attachment written before it arrived, and publishing that
+set would silently un-claim the founder's attachments. A client therefore
+publishes the union of what it can prove and the `blobs` the relay reported.
+Dropping a claim is a `RetentionDestruction`, which is threshold-authorized and
+deliberate, never an accident of what one device happened to have decrypted.
 
 **A manifest is evidence, not deletion authority.** The epoch-derived verifier
 proves only that a current group member produced a complete retention view. It

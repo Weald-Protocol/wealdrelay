@@ -507,3 +507,106 @@ fn every_error_names_what_it_refused() {
     assert!(format!("{encoding:?}").contains("Encoding"));
     assert_eq!(encoding.clone(), encoding);
 }
+
+/// The retention position question and its answer (WEALD-L355).
+///
+/// Both directions round trip, and the answer's "no chain at all" case is
+/// distinguishable from "chain at epoch zero", which is the distinction the
+/// client has to make before deciding whether to publish a genesis control.
+#[test]
+fn the_retention_position_round_trips_in_both_directions() {
+    let request = Request::RetentionPosition { group: h(0x41) };
+    assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+
+    let answered = Response::RetentionPosition {
+        control_epoch: 7,
+        control_digest: Some(h(0x42)),
+        next_sequence: 9,
+        prev_manifest_hash: Some(h(0x43)),
+        blobs: vec![h(0x44), h(0x45)],
+    };
+    assert_eq!(Response::decode(&answered.encode()).unwrap(), answered);
+
+    let empty = Response::RetentionPosition {
+        control_epoch: 0,
+        control_digest: None,
+        next_sequence: 1,
+        prev_manifest_hash: None,
+        blobs: Vec::new(),
+    };
+    assert_eq!(Response::decode(&empty.encode()).unwrap(), empty);
+    assert_ne!(empty.encode(), answered.encode());
+}
+
+/// A position answer naming more blobs than the wire allows is refused rather
+/// than allocated for, the same bound every list on this wire is held to.
+#[test]
+fn a_position_answer_over_the_list_bound_is_refused() {
+    let flood = Response::RetentionPosition {
+        control_epoch: 0,
+        control_digest: Some(h(0x42)),
+        next_sequence: 1,
+        prev_manifest_hash: None,
+        blobs: (0..=MAX_LIST).map(|_| h(0x44)).collect(),
+    };
+    assert!(matches!(
+        Response::decode(&flood.encode()),
+        Err(MediaWireError::TooManyEntries)
+    ));
+}
+
+/// The quota question and its answer (WEALD-L401).
+///
+/// The nullable limit is the whole subtlety: unlimited and a ceiling of zero are
+/// opposite answers, and a client that read them as the same one would either warn
+/// a self-hoster about a limit they do not have or promise room to a workspace
+/// allowed none.
+#[test]
+fn the_quota_read_round_trips_in_both_directions() {
+    let request = Request::Quota { group: h(0x51) };
+    assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+
+    let limited = Response::Quota {
+        stored_bytes: 400_000_000,
+        reserved_bytes: 50_000_000,
+        limit_bytes: Some(1_000_000_000),
+    };
+    assert_eq!(Response::decode(&limited.encode()).unwrap(), limited);
+
+    let unlimited = Response::Quota {
+        stored_bytes: 400_000_000,
+        reserved_bytes: 50_000_000,
+        limit_bytes: None,
+    };
+    assert_eq!(Response::decode(&unlimited.encode()).unwrap(), unlimited);
+
+    let none_allowed = Response::Quota {
+        stored_bytes: 0,
+        reserved_bytes: 0,
+        limit_bytes: Some(0),
+    };
+    assert_eq!(
+        Response::decode(&none_allowed.encode()).unwrap(),
+        none_allowed
+    );
+    assert_ne!(unlimited.encode(), limited.encode());
+    assert_ne!(
+        Response::Quota {
+            stored_bytes: 0,
+            reserved_bytes: 0,
+            limit_bytes: None,
+        }
+        .encode(),
+        none_allowed.encode(),
+        "unlimited and a ceiling of zero must not share an encoding"
+    );
+
+    // The widest values the fields can carry, so a saturating read on either side
+    // is caught rather than silently reporting the wrong headroom.
+    let wide = Response::Quota {
+        stored_bytes: u64::MAX,
+        reserved_bytes: u64::MAX,
+        limit_bytes: Some(u64::MAX),
+    };
+    assert_eq!(Response::decode(&wide.encode()).unwrap(), wide);
+}

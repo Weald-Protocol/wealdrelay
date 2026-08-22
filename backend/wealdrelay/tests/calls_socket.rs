@@ -30,8 +30,8 @@ use wealdrelay::frame::{ErrorCode, Frame, MIN_PROTOCOL_VERSION};
 use wealdrelay::health::{Clock, RelayState};
 
 use support::{
-    config_for, config_for_calls, default_device, device_from, make_group, other_device, Client,
-    Running, Scratch,
+    config_for_calls, default_device, device_from, make_group, other_device, Client, Running,
+    Scratch,
 };
 
 const CLOCK: u64 = 1_700_000_000_000;
@@ -862,9 +862,13 @@ async fn a_sixth_participant_is_refused_and_the_five_keep_talking() {
 async fn a_relay_with_calls_off_refuses_both_frames_over_a_real_socket() {
     let scratch = Scratch::new("calls_off_socket").await;
     let blobs = tempfile::tempdir().unwrap();
-    // The default configuration, which is calls off: every relay that has not been
-    // sized for calls is this one.
-    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    // Calls off, stated rather than inherited: `WEALD_RELAY_CALLS` defaults to `on`
+    // now, so the posture this test is about has to be configured.
+    let relay = Running::start(
+        support::config_for_calls_off(&scratch, blobs.path()),
+        Clock::Fixed(CLOCK),
+    )
+    .await;
     let group = make_group(&relay.state, 0x4D).await;
 
     let mut ada = Client::connect(relay.address).await;

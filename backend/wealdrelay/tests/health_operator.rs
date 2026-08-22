@@ -165,6 +165,176 @@ async fn a_relay_with_the_bearer_and_no_database_answers_unavailable_and_not_zer
     );
 }
 
+// MARK: `POST /media/quota` (WEALD-L401)
+
+/// One POST against the private router, with a JSON body.
+async fn post_json(
+    state: &Arc<RelayState>,
+    uri: &str,
+    authorization: Option<&str>,
+    body: &str,
+) -> (axum::http::StatusCode, String) {
+    use tower::ServiceExt as _;
+    let mut request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(uri)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(value) = authorization {
+        request = request.header(axum::http::header::AUTHORIZATION, value);
+    }
+    let response = wealdrelay::health::private_router(Arc::clone(state))
+        .oneshot(
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("a request"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("a body");
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tokio::test]
+async fn the_quota_route_refuses_every_caller_without_the_operator_bearer() {
+    // The route writes a workspace's storage ceiling, so an unauthenticated caller
+    // that reached it could refuse somebody else's next upload. No database on this
+    // state at all, so anything that got past the bearer check would answer 503
+    // rather than 401 and this test would see the difference.
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    let body = r#"{"workspace":"ws-quota","limit_bytes":1}"#;
+    let wrong_bytes: String = {
+        let mut bytes = TOKEN.as_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x20;
+        String::from_utf8(bytes).expect("still utf8")
+    };
+    for offered in [
+        None,
+        Some(String::new()),
+        Some(TOKEN.to_string()),               // no scheme
+        Some(format!("Basic {TOKEN}")),        // the wrong scheme
+        Some(format!("bearer {TOKEN}")),       // the scheme is case sensitive here
+        Some("Bearer ".to_string()),           // empty
+        Some(format!("Bearer {TOKEN}x")),      // longer
+        Some(format!("Bearer {wrong_bytes}")), // same length, wrong bytes
+    ] {
+        let (status, answer) = post_json(&state, "/media/quota", offered.as_deref(), body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "{offered:?} was not refused"
+        );
+        assert!(answer.contains("operator token required"), "{answer}");
+    }
+
+    // And the bearer is the whole of what stands in front of it: with the right one
+    // the same request reaches the database it does not have.
+    let (status, answer) = post_json(
+        &state,
+        "/media/quota",
+        Some(&format!("Bearer {TOKEN}")),
+        body,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(answer.contains("no database"), "{answer}");
+}
+
+#[tokio::test]
+async fn the_quota_route_is_absent_where_no_operator_bearer_is_configured() {
+    // The self-hosted shape. There is no control plane there and nothing that would
+    // ever lower a ceiling for a test, so the honest answer is that it does not exist.
+    let state = Arc::new(RelayState::new(bare(&[]), None, None));
+    let (status, _) = post_json(
+        &state,
+        "/media/quota",
+        Some(&format!("Bearer {TOKEN}")),
+        r#"{"workspace":"ws-quota","limit_bytes":1}"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_quota_route_writes_the_ceiling_it_is_given_and_refuses_a_nonsense_one() {
+    // The point of the route: put the ceiling one object away so
+    // `quota/storage_exhausted` is reachable in seconds rather than after 25 GB of
+    // real uploading (WEALD-L401).
+    let scratch = Scratch::new("operator_quota").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(
+        config_with_operator(&scratch, blobs.path()),
+        Clock::Fixed(1),
+    )
+    .await;
+    let state = Arc::clone(&relay.state);
+    relay.shutdown().await;
+    let pool = state.database.as_ref().expect("a database").pool().clone();
+    let bearer = format!("Bearer {TOKEN}");
+
+    let (status, answer) = post_json(
+        &state,
+        "/media/quota",
+        Some(&bearer),
+        r#"{"workspace":"ws-quota","limit_bytes":4096}"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    assert_eq!(
+        wealdrelay::media::store::usage(&pool, "ws-quota")
+            .await
+            .expect("the row")
+            .limit_bytes,
+        Some(4096)
+    );
+
+    // Null is unlimited, which is the same row a relay with no
+    // `WEALD_RELAY_MAX_STORAGE_GB` writes, so the route can raise as well as lower.
+    let (status, answer) = post_json(
+        &state,
+        "/media/quota",
+        Some(&bearer),
+        r#"{"workspace":"ws-quota","limit_bytes":null}"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
+    assert_eq!(
+        wealdrelay::media::store::usage(&pool, "ws-quota")
+            .await
+            .expect("the row")
+            .limit_bytes,
+        None
+    );
+
+    // A negative ceiling and a missing workspace are refused rather than written:
+    // the reservation arithmetic is `greatest(..., 0)` throughout, so a negative
+    // limit would read as a ceiling nothing can ever be under.
+    for body in [
+        r#"{"workspace":"ws-quota","limit_bytes":-1}"#,
+        r#"{"workspace":"","limit_bytes":1}"#,
+    ] {
+        let (status, _) = post_json(&state, "/media/quota", Some(&bearer), body).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert_eq!(
+        wealdrelay::media::store::usage(&pool, "ws-quota")
+            .await
+            .expect("the row")
+            .limit_bytes,
+        None,
+        "a refused request wrote a ceiling"
+    );
+
+    scratch.drop_database().await;
+}
+
 // MARK: `/readyz` and what each caller is allowed to see (WEALD-295)
 
 #[tokio::test(flavor = "multi_thread")]
@@ -366,4 +536,57 @@ async fn a_relay_that_cannot_read_its_own_tables_answers_unavailable_without_lea
 
     relay.shutdown().await;
     scratch.drop_database().await;
+}
+
+// MARK: `/version` (WEALD-L352)
+
+#[tokio::test]
+async fn version_is_absent_where_no_operator_bearer_is_configured() {
+    // Same conditional mount as `/admitted`, for the same reason: a self-hoster
+    // has no control plane to ask, so the honest answer is 404 rather than a
+    // route that exists and refuses everything.
+    let state = Arc::new(RelayState::new(bare(&[]), None, None));
+    let (status, _) = ask_at(&state, "/version", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn version_refuses_a_wrong_bearer() {
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    let (status, _) = ask_at(&state, "/version", Some("Bearer wrong")).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    let (status, _) = ask_at(&state, "/version", None).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn version_reports_the_compiled_identity_without_a_database() {
+    // No database dialled, deliberately. A relay whose database is down must
+    // still be able to say which build is down, which is why this handler reads
+    // nothing but the process itself.
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    let (status, body) = ask_at(&state, "/version", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    let build = wealdrelay::BuildInfo::current();
+    assert_eq!(parsed["name"], build.name);
+    assert_eq!(parsed["version"], build.version);
+    let digest = wealdrelay::RunningDigest::resolve();
+    assert_eq!(parsed["digest"], digest.line());
+    assert_eq!(parsed["comparable"], digest.is_comparable());
+    // The two forms are never interchangeable: a self-hash must never be read as
+    // a published image digest and compared against a release.
+    let reported = parsed["digest"].as_str().expect("a digest string");
+    assert_eq!(
+        parsed["comparable"].as_bool().expect("a flag"),
+        reported.starts_with("sha256:"),
+    );
 }

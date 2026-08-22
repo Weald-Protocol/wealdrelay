@@ -337,24 +337,49 @@ dependency budget on having neither.
 
 | variable | shape | default |
 | --- | --- | --- |
-| `WEALD_RELAY_CALLS` | `on` \| `off` | `off` |
-| `WEALD_RELAY_MAX_CONCURRENT_CALLS` | a positive integer | none, and required when calls are on |
+| `WEALD_RELAY_CALLS` | `on` \| `off` | `on` |
+| `WEALD_RELAY_MAX_CONCURRENT_CALLS` | a positive integer | `DEFAULT_CONCURRENT_CALLS`, 8 |
 | `WEALD_RELAY_MAX_CONNECTIONS` | a positive integer \| `unlimited` | 256 |
 
 Every one of them is in `specs/backend/build/env-registry.json`, which is the
 single source of truth; the table above is a reading aid and the registry decides.
 
-`off` by default, unlike `WEALD_RELAY_LIVE`, and the asymmetry is the decision. A
-beat every twenty seconds is the ordinary shape of the app. A sustained media
-stream is capacity an operator has to have sized for, so it is opted into, and
-the act of opting in is the same act as stating the ceiling.
+**Changed 2026-08-21: calls are on by default.** This file said `off`, and said
+that the act of opting in was the same act as stating the ceiling. That was a
+coherent rule and it produced a fleet in which no instance carried a call at all:
+neither provisioner ever wrote the variable, so every relay a customer bought
+answered `version/protocol_unsupported` and the call button in the app could never
+ring anybody (`specs/launch-review-2026-08-11.md:36`). A feature reachable on no
+instance is an absence, not a posture, so the default is now `on` and the ceiling
+now has one too.
 
-`WEALD_RELAY_MAX_CONCURRENT_CALLS` has no default and deliberately never will.
-Call capacity is a sizing decision about one instance's bandwidth; a relay that
-guessed would be a relay whose ceiling nobody chose and whose operator meets it as
-a refusal during a call. Setting it with calls off is refused too, for the reason
-an empty value is refused: a setting the binary accepts and does not honour is one
-an operator reads back and believes.
+`WEALD_RELAY_MAX_CONCURRENT_CALLS` defaults to `DEFAULT_CONCURRENT_CALLS`, which is
+8 (`backend/wealdrelay/src/calls/mod.rs`): forty streams of relayed audio at the
+five-participant ceiling, inside the per-connection queue budget a modest box
+already holds. The old rule was that it had no default and never would, and the
+superseding reason is narrow: while calls were opt-in, the operator turning them on
+was the operator sizing them, and a missing ceiling was correctly fatal. With calls
+on by default that same refusal would be every relay in the fleet failing to boot.
+Call capacity is still a sizing decision, an operator who has made one states it
+here, and this number is then never consulted. Setting it with calls off is still
+refused, for the reason an empty value is refused: a setting the binary accepts and
+does not honour is one an operator reads back and believes.
+
+`off` remains a posture an operator adopts, and the two refusals that protected the
+old default still hold in the shapes that are still true: a ceiling beside
+`WEALD_RELAY_CALLS=off` is a boot refusal, and an explicit `WEALD_RELAY_CALLS=on`
+beside a declared second instance is a boot refusal. What is new is that an
+**inherited** `on` in a multi-instance deployment turns calls off and boots, because
+a default must never be the thing that stops a relay from starting; the client then
+reads what it reads from any instance whose operator chose `off`.
+
+A relay this control plane provisions carries calls without being told to, because
+it inherits the default like any other instance. `WEALD_CLOUD_RELAY_CALL_CEILING`
+remains the way an operator sizes the fleet rather than accepting 8: set, both
+`WEALD_RELAY_CALLS=on` and the ceiling are written into a Render service's
+environment and a packed cell's compose file together
+(`provisioner/render-resources.ts`, `provisioner/cell-config.ts`), reaching a cell
+on its next convergence and a service on its next environment write.
 
 A relay with calls off answers both frames with `version/protocol_unsupported`,
 which a version 3 client reads as calls being unavailable on this relay: the same

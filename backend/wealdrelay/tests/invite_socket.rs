@@ -1092,3 +1092,190 @@ async fn a_state_query_whose_genesis_lookup_fails_is_a_retry_and_not_a_refusal()
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// The last seat of a one-seat invite, and then the same `Bundles` request the
+/// joiner made while the invite was live (WEALD-L188).
+///
+/// Before the fix the commit spent the seat and nothing else: the invite stayed
+/// `'live'`, the sealed `GroupInfo` stayed on disk, and anyone who kept the link and
+/// its URL fragment could reopen the socket months later and be served ciphertext
+/// they still held the key for. `JOIN` is pre-authentication by design, so the only
+/// thing between that link and the bundles is the invite's own state.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_seat_spent_ends_the_invite_and_takes_the_bundles_with_it() {
+    let scratch = Scratch::new("invite_socket_spent").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let code = Code::from_bits(0x0c0c0c);
+    let record = issue(0xc7, code, 1);
+    seed(&relay.state, &record).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+
+    let mut joiner = connected(&relay).await;
+    let device = vec![0x66; 32];
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Reserve {
+                token: record.token.clone(),
+                code: code.grouped(),
+                nonce: vec![0x07; 16],
+                device: device.clone(),
+            }
+            .encode(),
+        })
+        .await;
+    assert!(matches!(joiner.recv_frame().await, Frame::Join { .. }));
+
+    // Served while the invite is live, so the assertion after the commit is about
+    // the state change and not about a bundle that was never there.
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Bundles {
+                token: record.token.clone(),
+                group: root(),
+            }
+            .encode(),
+        })
+        .await;
+    match joiner.recv_frame().await {
+        Frame::Join { body } => match Response::decode(&body).expect("a response") {
+            Response::Bundles(bundles) => assert_eq!(bundles.len(), 1),
+            other => panic!("expected bundles, got {other:?}"),
+        },
+        other => panic!("expected a Join answer, got {other:?}"),
+    }
+
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Commit {
+                token: record.token.clone(),
+                nonce: vec![0x07; 16],
+                device: device.clone(),
+                group: root(),
+            }
+            .encode(),
+        })
+        .await;
+    match joiner.recv_frame().await {
+        Frame::Join { body } => match Response::decode(&body).expect("a response") {
+            Response::Committed { receipt } => assert_eq!(receipt.len(), 32),
+            other => panic!("expected a receipt, got {other:?}"),
+        },
+        other => panic!("expected a Join answer, got {other:?}"),
+    }
+
+    let state: String = sqlx::query_scalar("select state from relay_invite where token = $1")
+        .bind(&record.token)
+        .fetch_one(pool)
+        .await
+        .expect("read the invite state");
+    assert_eq!(
+        state, "spent",
+        "the invite that sold its last seat is still redeemable"
+    );
+
+    let held: i64 = sqlx::query_scalar("select count(*) from relay_invite_bundle where token = $1")
+        .bind(&record.token)
+        .fetch_one(pool)
+        .await
+        .expect("count the retained bundles");
+    assert_eq!(held, 0, "a spent invite is still holding sealed GroupInfo");
+
+    // The former colleague's request, months later, on a fresh socket with nothing
+    // but the token.
+    let mut latecomer = connected(&relay).await;
+    latecomer
+        .send_frame(&Frame::Join {
+            body: Request::Bundles {
+                token: record.token.clone(),
+                group: root(),
+            }
+            .encode(),
+        })
+        .await;
+    match latecomer.recv_frame().await {
+        Frame::Join { body } => match Response::decode(&body).expect("a response") {
+            Response::Bundles(bundles) => assert!(
+                bundles.is_empty(),
+                "a spent invite served {} sealed bundles",
+                bundles.len()
+            ),
+            other => panic!("expected bundles, got {other:?}"),
+        },
+        other => panic!("expected a Join answer, got {other:?}"),
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// The same confidentiality claim for an invite nobody ever redeemed, ended by time
+/// rather than by exhaustion (WEALD-L188).
+///
+/// Two halves, and both matter. `bundles_for` refuses on the clock alone, before any
+/// sweep has run, so a missed transition is not a leak; then the janitor's pass runs
+/// the transition and the ciphertext is gone from disk rather than merely unserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_invite_serves_nothing_and_the_janitor_deletes_what_it_held() {
+    let scratch = Scratch::new("invite_socket_expired").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(CLOCK));
+    let relay = Running::start(
+        config_for(&scratch, blobs.path()),
+        Clock::Manual(std::sync::Arc::clone(&clock)),
+    )
+    .await;
+    let code = Code::from_bits(0x0d0d0d);
+    let record = issue(0xd7, code, 3);
+    seed(&relay.state, &record).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+
+    // Past the stated expiry, and nobody took a seat.
+    clock.store(record.expires + 1, std::sync::atomic::Ordering::Relaxed);
+
+    let mut latecomer = connected(&relay).await;
+    latecomer
+        .send_frame(&Frame::Join {
+            body: Request::Bundles {
+                token: record.token.clone(),
+                group: root(),
+            }
+            .encode(),
+        })
+        .await;
+    match latecomer.recv_frame().await {
+        Frame::Join { body } => match Response::decode(&body).expect("a response") {
+            Response::Bundles(bundles) => assert!(
+                bundles.is_empty(),
+                "an expired invite served {} sealed bundles before any sweep ran",
+                bundles.len()
+            ),
+            other => panic!("expected bundles, got {other:?}"),
+        },
+        other => panic!("expected a Join answer, got {other:?}"),
+    }
+
+    let summary = wealdrelay::janitor::pass(&relay.state).await;
+    assert_eq!(
+        summary.invites_expired, 1,
+        "the collector walked past an expired invite"
+    );
+    let state: String = sqlx::query_scalar("select state from relay_invite where token = $1")
+        .bind(&record.token)
+        .fetch_one(pool)
+        .await
+        .expect("read the invite state");
+    assert_eq!(state, "spent", "the expired invite is still redeemable");
+    let held: i64 = sqlx::query_scalar("select count(*) from relay_invite_bundle where token = $1")
+        .bind(&record.token)
+        .fetch_one(pool)
+        .await
+        .expect("count the retained bundles");
+    assert_eq!(
+        held, 0,
+        "an expired invite is still holding sealed GroupInfo"
+    );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

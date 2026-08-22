@@ -310,7 +310,8 @@ pub async fn scope_commit(
                 (extract(epoch from i.expires_at) * 1000)::double precision as invite_expires_ms \
          from relay_invite_reservation r join relay_invite i on i.token = r.token \
          where r.token = $1 and r.join_nonce = $2 and r.released_at is null \
-           and i.state = 'live'",
+           and (i.state = 'live' \
+                or (i.state = 'spent' and r.consumed_at is not null))",
     )
     .bind(token)
     .bind(nonce)
@@ -439,6 +440,30 @@ async fn consume(
         tx.rollback().await.map_err(db)?;
         return Err(StoreError::Database(error.to_string()));
     }
+
+    // The last seat and the end of the invite are one fact, so they land in one
+    // transaction (WEALD-L188). `remaining` is zero only when no seat is left to
+    // sell, and the reservation test covers the seats that are held but not yet
+    // spent: an invite with a live reservation outstanding is not exhausted, it is
+    // mid-join. Ending it here is what deletes the retained sealed `GroupInfo`,
+    // which otherwise outlives every possible redemption of the token.
+    let exhausted: bool = sqlx::query(
+        "select i.remaining = 0 and not exists ( \
+             select 1 from relay_invite_reservation r \
+             where r.token = $1 and r.consumed_at is null and r.released_at is null \
+         ) as exhausted \
+         from relay_invite i where i.token = $1 and i.state = 'live' for update",
+    )
+    .bind(token)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?
+    .map(|row| row.get::<bool, _>("exhausted"))
+    .unwrap_or(false);
+    if exhausted {
+        crate::invite::store::spend_in(&mut tx, token).await?;
+    }
+
     tx.commit().await.map_err(db)?;
     Ok(())
 }

@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use wealdrelay::health::{Clock, RelayState};
+use wealdrelay::media::gc;
 use wealdrelay::media::retention::{
     self, Authorization, ControlOutcome, ManifestOutcome, StoreError,
 };
@@ -397,6 +398,102 @@ async fn racing_two_valid_successors_always_leaves_one_control_one_conflict_and_
             "round {round}: the group is frozen"
         );
     }
+
+    scratch.drop_database().await;
+}
+
+/// WEALD-L183. A device the workspace admits, holding no group membership and no
+/// prior-epoch key material, mints a keypair and publishes an epoch-0
+/// `RetentionControl` for a group that already has one.
+///
+/// Before the fix this was two attacks in one frame. The forged genesis was not
+/// the settled record, so it took the successor-race path and froze the group,
+/// and `gc::eligible` then answered `Frozen` for every blob of that group
+/// forever: no policy, no tombstone and no sweep ran again. One frame per group
+/// id turned a whole workspace's retention off, and the deletions the product
+/// promises silently stopped happening. Against a group with no genesis yet, the
+/// same frame made the impostor the chain root instead.
+///
+/// A genesis is claimed once. A second one signed by a different verifier is
+/// refused, and refusal is the whole point: it must not freeze, because a freeze
+/// a non-member can set is the denial of service being fixed.
+#[tokio::test]
+async fn a_forged_genesis_control_from_a_non_member_is_refused_and_never_freezes_the_group() {
+    let (scratch, _blobs, state) = prepared("retention_forged_genesis").await;
+    let pool = pool_of(&state);
+    let group = workspace_with(&state, "ws-forged", 0x6f, &[device_from(0x71)]).await;
+
+    // The founder's chain, and one blob claimed under it, so there is real
+    // eligibility to compare against rather than the empty case.
+    let epoch0 = verifier_key(0x21);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    assert_eq!(
+        retention::apply_control(pool, &genesis).await.unwrap(),
+        ControlOutcome::Accepted
+    );
+    store::ensure_quota_row(pool, "ws-forged", None)
+        .await
+        .unwrap();
+    store::reserve(pool, "ws-forged", &group, &blob_hash(0xa1), 100, false, 900)
+        .await
+        .unwrap();
+    let manifest = signed_manifest(&group, 0, 1, None, vec![blob_hash(0xa1)], &epoch0);
+    assert!(matches!(
+        retention::apply_manifest(pool, "ws-forged", &manifest)
+            .await
+            .unwrap(),
+        ManifestOutcome::Accepted { .. }
+    ));
+    let before = gc::eligible(pool, "ws-forged", &group, &blob_hash(0xa1), 1_000, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(before, gc::Eligibility::Live);
+
+    // Mallory: enrolled in the workspace, in no way a member of this group, and
+    // the key she signs with is one she generated a moment ago.
+    let mallory = verifier_key(0xbe);
+    let forged = signed_control(&group, 0, &mallory, None, &mallory);
+    assert_eq!(
+        retention::apply_control(pool, &forged).await.unwrap(),
+        ControlOutcome::Invalid("group already has a genesis control")
+    );
+
+    // Refused, not recorded, and above all not frozen.
+    assert!(
+        !retention::is_frozen(pool, &group).await.unwrap(),
+        "a non-member must not be able to freeze a group"
+    );
+    let conflicts: i64 = sqlx::query_scalar(
+        "select count(*) from relay_retention_control_conflict where group_id = $1",
+    )
+    .bind(&group)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(conflicts, 0);
+
+    // The group's control is exactly the one the founder settled.
+    let settled: Vec<u8> = sqlx::query_scalar(
+        "select verifier from relay_retention_control where group_id = $1 and epoch = 0",
+    )
+    .bind(&group)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settled, epoch0.verifying_key().to_bytes().to_vec());
+
+    // And garbage collection answers what it answered before the frame arrived.
+    let after = gc::eligible(pool, "ws-forged", &group, &blob_hash(0xa1), 1_000, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert_ne!(after, gc::Eligibility::Frozen);
+
+    // The founder's own record, resent byte for byte, is still a retry.
+    assert_eq!(
+        retention::apply_control(pool, &genesis).await.unwrap(),
+        ControlOutcome::Accepted
+    );
 
     scratch.drop_database().await;
 }
@@ -1188,5 +1285,148 @@ async fn a_manifest_whose_claims_cannot_be_written_is_refused() {
         .execute(pool)
         .await
         .unwrap();
+    scratch.drop_database().await;
+}
+
+// MARK: The chain position a joiner resyncs against (WEALD-L355)
+
+/// The relay is the authority on where a group's manifest chain is, and it can
+/// now say so.
+///
+/// Before this, no response on the media wire carried the group's position, so a
+/// client had nothing but its own device log to derive `sequence` and
+/// `prev_manifest_hash` from. That is right for the device that founded the
+/// group and permanently wrong for every other one: a joiner's log is empty, it
+/// sends `sequence = 1` into a group already past it, `apply_manifest` refuses
+/// with "sequence does not advance by exactly one", and because the local log
+/// only advances on an ack it never gets, it sends the same refused record for
+/// the life of the group.
+#[tokio::test]
+async fn the_position_reports_the_group_chain_so_a_joiner_can_resync() {
+    let (scratch, _blobs, state) = prepared("retention_position").await;
+    let pool = pool_of(&state);
+    let group = workspace_with(&state, "ws-position", 0x66, &[device_from(0x71)]).await;
+
+    // A group with nothing at all: no control, no manifest. The digest, not the
+    // epoch, is what says "no chain", because epoch zero is a real epoch.
+    let empty = retention::position(pool, &group).await.unwrap();
+    assert_eq!(empty.control_digest, None);
+    assert_eq!(empty.next_sequence, retention::FIRST_MANIFEST_SEQUENCE);
+    assert_eq!(empty.prev_manifest_hash, None);
+    assert!(empty.blobs.is_empty());
+
+    let epoch0 = verifier_key(0x21);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    retention::apply_control(pool, &genesis).await.unwrap();
+
+    let founded = retention::position(pool, &group).await.unwrap();
+    assert_eq!(founded.control_epoch, 0);
+    assert_eq!(founded.control_digest, Some(genesis.digest()));
+    assert_eq!(founded.next_sequence, retention::FIRST_MANIFEST_SEQUENCE);
+
+    let first = signed_manifest(
+        &group,
+        0,
+        retention::FIRST_MANIFEST_SEQUENCE,
+        None,
+        vec![blob_hash(1), blob_hash(2)],
+        &epoch0,
+    );
+    let ManifestOutcome::Accepted { digest } =
+        retention::apply_manifest(pool, "ws-position", &first)
+            .await
+            .unwrap()
+    else {
+        panic!("the founder's first manifest must be accepted")
+    };
+
+    // What a joiner reads. Everything it needs and nothing it could have guessed:
+    // the sequence to name, the predecessor to name, the epoch to sign under, and
+    // the claim set it must not shrink.
+    let after = retention::position(pool, &group).await.unwrap();
+    assert_eq!(after.next_sequence, 2);
+    assert_eq!(after.prev_manifest_hash, Some(digest.clone()));
+    assert_eq!(after.control_epoch, 0);
+    assert_eq!(after.control_digest, Some(genesis.digest()));
+    assert_eq!(after.blobs, vec![blob_hash(1), blob_hash(2)]);
+
+    // The joiner's old behaviour, kept as the negative half: sequence 1 with no
+    // predecessor, which is what an empty device log produces.
+    let stale = signed_manifest(&group, 0, 1, None, vec![blob_hash(3)], &epoch0);
+    assert_eq!(
+        retention::apply_manifest(pool, "ws-position", &stale)
+            .await
+            .unwrap(),
+        ManifestOutcome::Invalid("sequence does not advance by exactly one".to_string())
+    );
+
+    // The same device, rebuilt from the reported position and carrying the claim
+    // set forward, is accepted.
+    let resynced = signed_manifest(
+        &group,
+        after.control_epoch,
+        after.next_sequence,
+        after.prev_manifest_hash.clone(),
+        {
+            let mut blobs = after.blobs.clone();
+            blobs.push(blob_hash(3));
+            blobs
+        },
+        &epoch0,
+    );
+    assert!(matches!(
+        retention::apply_manifest(pool, "ws-position", &resynced)
+            .await
+            .unwrap(),
+        ManifestOutcome::Accepted { .. }
+    ));
+
+    // And the founder's two blobs are still claimed, which is the third half of
+    // WEALD-L355: an omission is the only deletion signal the relay has, so a
+    // joiner publishing only what it can see would have un-claimed them.
+    let settled = retention::position(pool, &group).await.unwrap();
+    assert_eq!(
+        settled.blobs,
+        vec![blob_hash(1), blob_hash(2), blob_hash(3)]
+    );
+
+    scratch.drop_database().await;
+}
+
+/// The position reports the newest control, not the genesis one, so a joiner
+/// that lived through a rotation signs under the epoch the relay actually holds.
+#[tokio::test]
+async fn the_position_names_the_newest_control_epoch() {
+    let (scratch, _blobs, state) = prepared("retention_position_epoch").await;
+    let pool = pool_of(&state);
+    let group = workspace_with(&state, "ws-posepoch", 0x67, &[device_from(0x71)]).await;
+
+    let epoch0 = verifier_key(0x21);
+    let epoch1 = verifier_key(0x22);
+    let genesis = signed_control(&group, 0, &epoch0, None, &epoch0);
+    retention::apply_control(pool, &genesis).await.unwrap();
+    let rotated = signed_control(&group, 1, &epoch1, Some(genesis.digest()), &epoch0);
+    retention::apply_control(pool, &rotated).await.unwrap();
+
+    let position = retention::position(pool, &group).await.unwrap();
+    assert_eq!(position.control_epoch, 1);
+    assert_eq!(position.control_digest, Some(rotated.digest()));
+
+    // A joiner holding the keys for epochs 0 and 1 publishes the successor for
+    // epoch 2 by naming exactly this digest, which is the anchor that used to be
+    // available only to the device holding epoch zero.
+    let epoch2 = verifier_key(0x23);
+    let successor = signed_control(
+        &group,
+        2,
+        &epoch2,
+        Some(position.control_digest.clone().unwrap()),
+        &epoch1,
+    );
+    assert_eq!(
+        retention::apply_control(pool, &successor).await.unwrap(),
+        ControlOutcome::Accepted
+    );
+
     scratch.drop_database().await;
 }

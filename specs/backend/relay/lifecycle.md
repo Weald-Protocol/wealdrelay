@@ -92,6 +92,16 @@ the epoch rotations then kill the enrolment keys it retained. Reversing the two
 would leave a window in which a removed laptop rejoins every `everyone` group on
 its next sync.
 
+**The rotation preflight, before the revocation.** Every group the removal will
+rotate is resolved read-only before step 1 writes anything: this device holds a
+session for it, and at least one named principal resolves to a leaf index in it.
+A removal that cannot rotate every target group is refused with nothing written,
+because the alternative is what WEALD-L335 recorded from a live run: the first
+groups rotate, a later one cannot be resolved, and the workspace is left holding
+epochs it can no longer use with no receipt and no resume that can ever finish.
+Refusing before the revocation is the only point at which "the workspace is
+exactly as it was" is still true.
+
 **Partial removal.** Removing someone from one channel rather than the whole
 workspace runs the same sequence scoped to that channel's group. The access set
 is unchanged, because they remain a member of the workspace. It requires the

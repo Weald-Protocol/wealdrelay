@@ -78,13 +78,12 @@ fn config(extra: &[(&'static str, &'static str)]) -> Config {
     Config::resolve(&Values::from_pairs(pairs)).expect("configuration resolves")
 }
 
-/// The ordinary configuration for the ordering walk, with the call path on.
+/// The ordinary configuration for the ordering walk, with the call path on and
+/// sized.
 ///
-/// `WEALD_RELAY_CALLS` defaults to `off`, so the walk would otherwise assert that
-/// `CALL` and `MEDIA` in `Ready` are answered `protocol_unsupported`, which is
-/// true of a relay with calls off and says nothing about the ordering rule the
-/// walk exists to prove. The off posture is proved on its own, below, where it is
-/// the subject rather than an accident of a default.
+/// The ceiling is stated because the walk is about ordering: an instance sized by
+/// hand is the shape an operator who runs calls has. The off posture is proved on
+/// its own, below, where it is the subject rather than an accident of a default.
 fn full() -> Config {
     config(&[(keys::CALLS, "on"), (keys::MAX_CONCURRENT_CALLS, "3")])
 }
@@ -97,10 +96,13 @@ fn read_only() -> Config {
     ])
 }
 
-/// A relay whose operator has not turned calls on, which is every relay that has
-/// not been sized for them.
+/// A relay whose operator turned calls off.
+///
+/// Stated rather than inherited: `WEALD_RELAY_CALLS` defaults to `on`, so an empty
+/// configuration is a relay that carries calls, and this fixture is about the one
+/// that does not.
 fn calls_off() -> Config {
-    config(&[])
+    config(&[(keys::CALLS, "off")])
 }
 
 /// A `CONNECT` that will be accepted: the version this build speaks, one group,
@@ -1057,6 +1059,51 @@ fn read_only_refuses_send_locally_and_still_serves_readers() {
             payload: RECON_PAYLOAD.to_vec()
         }),
         "and so is reconciliation"
+    );
+}
+
+#[test]
+fn read_only_refuses_every_durable_write_frame_not_only_send() {
+    // WEALD-L158. `read_only` drains the instance and flips readiness, so an
+    // operator believes no rows are being written. Handshake commits, access-set
+    // rotations, recovery wraps, invite administration and key-package
+    // publication all insert rows, and all of them ran regardless.
+    let config = read_only();
+    let refusal = Reaction::Reply(vec![Frame::Error(FrameError::new(
+        ErrorCode::ServiceReadOnly,
+    ))]);
+
+    for tag in [
+        FrameTag::Handshake,
+        FrameTag::Access,
+        FrameTag::Wrap,
+        FrameTag::Invite,
+        FrameTag::Keys,
+    ] {
+        let mut session = session_in(State::Ready, &config);
+        let reaction = session.handle(sample(tag), NOW);
+        assert_eq!(reaction, refusal, "{tag:?} must be refused in read_only");
+        assert_eq!(
+            session.state(),
+            State::Ready,
+            "{tag:?}: a refused write does not end the connection"
+        );
+    }
+
+    // A fetch only reads the shelf, so the mode leaves it alone.
+    let mut session = session_in(State::Ready, &config);
+    assert!(
+        !matches!(
+            session.handle(
+                Frame::Keys(KeysBody::Fetch {
+                    device: vec![7; 32],
+                    count: 1
+                }),
+                NOW
+            ),
+            Reaction::Reply(_)
+        ),
+        "a key-package fetch is a read and keeps working"
     );
 }
 

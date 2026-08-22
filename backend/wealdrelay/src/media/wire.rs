@@ -471,6 +471,32 @@ pub enum Request {
     RetentionPolicy(RetentionPolicy),
     RetentionDestruction(RetentionDestruction),
     RetentionResolution(RetentionResolution),
+    /// Where one group's retention chain has actually got to, as the relay holds
+    /// it.
+    ///
+    /// The manifest chain is per **group**, but every client that has ever
+    /// published one derived its next sequence and predecessor digest from its own
+    /// device state. That is right for the device that founded the group and wrong
+    /// for every other one: a joiner starts with an empty local log, sends
+    /// `sequence = 1` with no predecessor, and `apply_manifest` refuses it for the
+    /// rest of the group's life, because the local log only advances on an ack that
+    /// never comes. No response on this wire carried the group's position, so the
+    /// client had nothing to resync against (WEALD-L355).
+    RetentionPosition {
+        group: Vec<u8>,
+    },
+    /// How much of its plan a workspace has already spent, as the relay holds it.
+    ///
+    /// The quota row is checked at `BLOB put` against the declared ciphertext
+    /// length and nowhere else, so before WEALD-L401 a client learned the ceiling
+    /// existed only by being refused at it: `relay_quota` was read inside `reserve`
+    /// and `claim` and reported on no frame at all. This is the read that lets the
+    /// files view warn first. Authorized like `Request::List`, by the group, and it
+    /// reports nothing a member of the same workspace could not already total up
+    /// from a listing.
+    Quota {
+        group: Vec<u8>,
+    },
 }
 
 const TAG_PUT: u64 = 1;
@@ -484,6 +510,8 @@ const TAG_RETENTION_POLICY: u64 = 8;
 const TAG_RETENTION_DESTRUCTION: u64 = 9;
 const TAG_LIST: u64 = 10;
 const TAG_RETENTION_RESOLUTION: u64 = 11;
+const TAG_RETENTION_POSITION: u64 = 12;
+const TAG_QUOTA: u64 = 13;
 
 impl Request {
     pub fn encode(&self) -> Vec<u8> {
@@ -552,6 +580,10 @@ impl Request {
             Self::RetentionPolicy(record) => (TAG_RETENTION_POLICY, record.encode()),
             Self::RetentionDestruction(record) => (TAG_RETENTION_DESTRUCTION, record.encode()),
             Self::RetentionResolution(record) => (TAG_RETENTION_RESOLUTION, record.encode()),
+            Self::RetentionPosition { group } => {
+                (TAG_RETENTION_POSITION, cbor::array(&[cbor::bytes(group)]))
+            }
+            Self::Quota { group } => (TAG_QUOTA, cbor::array(&[cbor::bytes(group)])),
         };
         cbor::array(&[cbor::uint(tag), body])
     }
@@ -649,6 +681,18 @@ impl Request {
                 reader.finish()?;
                 Self::RetentionDestruction(record)
             }
+            TAG_RETENTION_POSITION => {
+                reader.array(1)?;
+                let group = reader.bytes_of(HASH_BYTES)?;
+                reader.finish()?;
+                Self::RetentionPosition { group }
+            }
+            TAG_QUOTA => {
+                reader.array(1)?;
+                let group = reader.bytes_of(HASH_BYTES)?;
+                reader.finish()?;
+                Self::Quota { group }
+            }
             TAG_RETENTION_RESOLUTION => {
                 let record = RetentionResolution::decode_from(&mut reader)?;
                 reader.finish()?;
@@ -697,6 +741,38 @@ pub enum Response {
     },
     /// A `RetentionResolution` cleared the freeze it named.
     RetentionResolved,
+    /// The answer to ``Request::RetentionPosition``: the group's chain position.
+    ///
+    /// `control_digest` is `None` exactly when the group has no retention control
+    /// at all, which is the only case `control_epoch` may be ignored in; a stored
+    /// genesis control always has a digest. `next_sequence` is the sequence the
+    /// next manifest must name, so a group with no manifest answers
+    /// `FIRST_MANIFEST_SEQUENCE` and a client never has to know that constant.
+    /// `blobs` is the latest manifest's claim set, so a device that cannot replay
+    /// every historical `media.ref` can still publish a manifest that does not
+    /// silently un-claim what the group already holds.
+    RetentionPosition {
+        control_epoch: u64,
+        control_digest: Option<Vec<u8>>,
+        next_sequence: u64,
+        prev_manifest_hash: Option<Vec<u8>>,
+        blobs: Vec<Vec<u8>>,
+    },
+    /// The answer to ``Request::Quota``: the workspace's own `relay_quota` row.
+    ///
+    /// `stored_bytes` is what claimed objects charge and `reserved_bytes` is what
+    /// uploads in flight hold, and both are on the wire because the ceiling is
+    /// enforced against their sum: a client shown only `stored_bytes` would predict
+    /// room that a concurrent upload has already taken. `limit_bytes` is `None`
+    /// exactly when this relay was configured with no ceiling
+    /// (`WEALD_RELAY_MAX_STORAGE_GB` unset, `config::Limit::Unlimited`), which is
+    /// the self-hosted shape; `Some(0)` is a real ceiling of zero and a different
+    /// answer, so the field is a nullable uint rather than a sentinel.
+    Quota {
+        stored_bytes: u64,
+        reserved_bytes: u64,
+        limit_bytes: Option<u64>,
+    },
 }
 
 const RTAG_UPLOAD: u64 = 1;
@@ -710,6 +786,8 @@ const RTAG_MULTIPART_ABORTED: u64 = 8;
 const RTAG_RETENTION_ACK: u64 = 9;
 const RTAG_LISTING: u64 = 10;
 const RTAG_RETENTION_RESOLVED: u64 = 11;
+const RTAG_RETENTION_POSITION: u64 = 12;
+const RTAG_QUOTA: u64 = 13;
 
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
@@ -764,6 +842,37 @@ impl Response {
                 )]),
             ),
             Self::RetentionResolved => (RTAG_RETENTION_RESOLVED, cbor::array(&[])),
+            Self::RetentionPosition {
+                control_epoch,
+                control_digest,
+                next_sequence,
+                prev_manifest_hash,
+                blobs,
+            } => (
+                RTAG_RETENTION_POSITION,
+                cbor::array(&[
+                    cbor::uint(*control_epoch),
+                    cbor::optional_bytes(control_digest.as_deref()),
+                    cbor::uint(*next_sequence),
+                    cbor::optional_bytes(prev_manifest_hash.as_deref()),
+                    cbor::array(&blobs.iter().map(|b| cbor::bytes(b)).collect::<Vec<_>>()),
+                ]),
+            ),
+            Self::Quota {
+                stored_bytes,
+                reserved_bytes,
+                limit_bytes,
+            } => (
+                RTAG_QUOTA,
+                cbor::array(&[
+                    cbor::uint(*stored_bytes),
+                    cbor::uint(*reserved_bytes),
+                    match limit_bytes {
+                        Some(limit) => cbor::uint(*limit),
+                        None => cbor::NULL.to_vec(),
+                    },
+                ]),
+            ),
         };
         cbor::array(&[cbor::uint(tag), body])
     }
@@ -848,10 +957,49 @@ impl Response {
                 reader.finish()?;
                 Self::Listing { entries }
             }
+            RTAG_RETENTION_POSITION => {
+                reader.array(5)?;
+                let control_epoch = reader.uint()?;
+                let control_digest = reader.optional_bytes()?;
+                let next_sequence = reader.uint()?;
+                let prev_manifest_hash = reader.optional_bytes()?;
+                let count = reader.array_header()?;
+                if count > MAX_LIST {
+                    return Err(MediaWireError::TooManyEntries);
+                }
+                let mut blobs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    blobs.push(reader.bytes_of(HASH_BYTES)?);
+                }
+                reader.finish()?;
+                Self::RetentionPosition {
+                    control_epoch,
+                    control_digest,
+                    next_sequence,
+                    prev_manifest_hash,
+                    blobs,
+                }
+            }
             RTAG_RETENTION_RESOLVED => {
                 reader.array(0)?;
                 reader.finish()?;
                 Self::RetentionResolved
+            }
+            RTAG_QUOTA => {
+                reader.array(3)?;
+                let stored_bytes = reader.uint()?;
+                let reserved_bytes = reader.uint()?;
+                let limit_bytes = if reader.optional_is_null()? {
+                    None
+                } else {
+                    Some(reader.uint()?)
+                };
+                reader.finish()?;
+                Self::Quota {
+                    stored_bytes,
+                    reserved_bytes,
+                    limit_bytes,
+                }
             }
             other => return Err(MediaWireError::UnknownTag(other)),
         })

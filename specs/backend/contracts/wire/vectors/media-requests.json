@@ -65,6 +65,13 @@
     "note": "The listing request, which shares tag 10 with the listing response and is encoded by `WorkspaceFileListing` rather than by `MediaWire`, because a listing is a view's question. Same wire, same decoder, so it belongs in the same corpus.",
     "fields": {"workspace": "6d702d61", "group": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"},
     "encoded": "820a82446d702d6158209a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"
+  },
+  {
+    "id": "quota-typical",
+    "tag": 13,
+    "note": "The storage quota read, which is one field: the group, because the group is what the relay authorizes and the workspace is what it charges. Added for WEALD-L401 so a client can warn before an upload is refused rather than after.",
+    "fields": {"group": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"},
+    "encoded": "820d8158209a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"
   }
   ]
 }

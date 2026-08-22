@@ -999,7 +999,23 @@ async fn redeem(
         | Request::Record { token, .. }
         | Request::Commit { token, .. } => token.clone(),
     };
-    let Ok(Some(record)) = store::fetch(pool, &token).await else {
+    let fetched = store::fetch(pool, &token).await.ok().flatten();
+
+    // The `Record` step answers before this refusal, deliberately (WEALD-L152).
+    //
+    // Every other step needs the record to do anything, so a token that does not
+    // resolve gets the one flat refusal. `Record` is different: its whole
+    // specified behaviour is to answer an empty body for a token that is absent,
+    // unreadable, revoked, spent or expired, indistinguishable from a live token
+    // with no record. Gating it on the fetch made the refusal a
+    // token-existence oracle on an unauthenticated, budget-free path: a real
+    // token answered `Frame::Join`, a guessed one answered `UNAVAILABLE`, and
+    // brute-force enumeration became verifiable.
+    if matches!(request, Request::Record { .. }) {
+        return record_step(sender, state, fetched);
+    }
+
+    let Some(record) = fetched else {
         // Absent, unreadable, or a body that does not decode. One answer, because
         // the difference between them is exactly what this endpoint refuses to tell.
         return refuse(sender);
@@ -1048,52 +1064,26 @@ async fn redeem(
                 Err(error) => queue_all(sender, vec![Frame::Error(FrameError::new(error.code()))]),
             }
         }
-        Request::Record { .. } => match store::fetch(pool, &token).await {
-            // Live and unexpired only. This arm is reachable before any
-            // authentication and burns no code-attempt budget, so serving a body
-            // for a revoked, spent or expired token would answer "this token is
-            // real" to anyone holding a leaked one, and the body carries the
-            // `code_hash` that offline brute force needs. A dead invite is
-            // answered exactly like one that never existed.
-            Ok(Some(record))
-                if record.state == store::State::Live && state.now_ms() < record.invite.expires =>
-            {
-                queue_all(
+        // Answered above, before the record is known to exist, so that the
+        // refusal is not an existence oracle. Unreachable here.
+        Request::Record { .. } => refuse(sender),
+        Request::Bundles { group, .. } => {
+            match store::bundles_for(pool, &token, &group, state.now_ms() as i64).await {
+                // Ciphertext, served back. The relay holds no key for any of it: the
+                // private half of `update_pub` is derived by the joiner from bytes that
+                // travelled in a URL fragment.
+                Ok(bundles) => queue_all(
                     sender,
                     vec![Frame::Join {
-                        body: Response::Record { body: record.body }.encode(),
+                        body: Response::Bundles(bundles).encode(),
                     }],
-                )
+                ),
+                Err(_) => queue_all(
+                    sender,
+                    vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+                ),
             }
-            // An empty body for a token that does not exist, and the same empty body
-            // for one that does: this path stays uninformative about which tokens are
-            // real, which is the whole reason the refusals here are flat.
-            Ok(_) => queue_all(
-                sender,
-                vec![Frame::Join {
-                    body: Response::Record { body: Vec::new() }.encode(),
-                }],
-            ),
-            Err(_) => queue_all(
-                sender,
-                vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
-            ),
-        },
-        Request::Bundles { group, .. } => match store::bundles_for(pool, &token, &group).await {
-            // Ciphertext, served back. The relay holds no key for any of it: the
-            // private half of `update_pub` is derived by the joiner from bytes that
-            // travelled in a URL fragment.
-            Ok(bundles) => queue_all(
-                sender,
-                vec![Frame::Join {
-                    body: Response::Bundles(bundles).encode(),
-                }],
-            ),
-            Err(_) => queue_all(
-                sender,
-                vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
-            ),
-        },
+        }
         Request::Commit {
             nonce,
             device,
@@ -1122,6 +1112,38 @@ async fn redeem(
             }
         }
     }
+}
+
+/// The `Record` step's answer, which never depends on whether the token exists.
+///
+/// A live, unexpired invite gets its stored record, exactly as its issuer signed
+/// it. Everything else, absent, unreadable, revoked, spent or expired, gets the
+/// same empty body: this path is pre-AUTH and burns no code-attempt budget, and
+/// the record carries `code_hash`, the Argon2id hash of the one-time code, so a
+/// distinguishable answer would both confirm a guessed token and hand out the
+/// material for an offline attack on a revoked invite's code.
+fn record_step(
+    sender: &OutboundSender,
+    state: &Arc<RelayState>,
+    fetched: Option<crate::invite::store::Record>,
+) -> bool {
+    use crate::invite::redeem::Response;
+    use crate::invite::store;
+
+    let body = match fetched {
+        Some(record)
+            if record.state == store::State::Live && state.now_ms() < record.invite.expires =>
+        {
+            record.body
+        }
+        _ => Vec::new(),
+    };
+    queue_all(
+        sender,
+        vec![Frame::Join {
+            body: Response::Record { body }.encode(),
+        }],
+    )
 }
 
 /// Store one MLS handshake message and hand it to everybody else in the group.
@@ -1255,7 +1277,7 @@ async fn key_packages(
     if queue_all(sender, vec![answer.frame]) {
         return true;
     }
-    // The fetch consumed the packages in the statement that selected them, so a
+    // The fetch deleted the packages in the statement that selected them, so a
     // queue that refused the answer has destroyed one-time keys that reached
     // nobody. The shelf is finite and a peer can repeat the fetch, so without
     // this the whole shelf walks away and the device stops being addable while
@@ -1263,7 +1285,9 @@ async fn key_packages(
     // consumed.
     if !answer.restore.is_empty() {
         if let Some(database) = &state.database {
-            if let Err(error) = crate::keys::store::restore(database.pool(), &answer.restore).await
+            let workspace = answer.restore_workspace.clone().unwrap_or_default();
+            if let Err(error) =
+                crate::keys::store::restore(database.pool(), &workspace, &answer.restore).await
             {
                 tracing::warn!(
                     error = %error,

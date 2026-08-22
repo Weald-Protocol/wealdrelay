@@ -540,9 +540,31 @@ async fn a_blob_is_eligible_only_when_every_condition_media_md_names_holds() {
     // A frozen group garbage-collects nothing at all. This is the whole outcome
     // of the successor race: a removed member's forged branch stalls the cleanup
     // job instead of governing it.
+    // The race is run at epoch one, where it lives: WEALD-L183 refuses a second
+    // genesis rather than freezing on it, because an epoch-zero impostor proves
+    // possession of nothing while a rotation impostor holds the prior verifier.
+    let genesis = signed_control(&group, 0, &epoch, None, &epoch);
     retention::apply_control(
         pool,
-        &signed_control(&group, 0, &verifier_key(0xee), None, &verifier_key(0xee)),
+        &signed_control(
+            &group,
+            1,
+            &verifier_key(0x22),
+            Some(genesis.digest()),
+            &epoch,
+        ),
+    )
+    .await
+    .unwrap();
+    retention::apply_control(
+        pool,
+        &signed_control(
+            &group,
+            1,
+            &verifier_key(0xee),
+            Some(genesis.digest()),
+            &epoch,
+        ),
     )
     .await
     .unwrap();

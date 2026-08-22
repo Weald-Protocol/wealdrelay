@@ -43,8 +43,21 @@ use std::collections::BTreeSet;
 
 use super::{
     fingerprint, ids_of, items_in, Id, Item, Message, Mode, Range, IDLIST_LIMIT, INFINITY,
-    MAX_IDS_PER_RANGE, SPLIT_FACTOR,
+    MAX_IDS_PER_RANGE, MAX_RANGES, SPLIT_FACTOR,
 };
+
+/// The ranges this span may spend, given what is left of the message budget.
+///
+/// Every remaining span owes at least one range, so a span may split only into what
+/// is left after reserving those. The floor of one is what makes the arithmetic safe
+/// on the last span and on an incoming message already at `MAX_RANGES`.
+fn span_budget(built: usize, spans_remaining: usize) -> usize {
+    let reserved = spans_remaining.saturating_sub(1);
+    MAX_RANGES
+        .saturating_sub(built)
+        .saturating_sub(reserved)
+        .max(1)
+}
 
 /// What the relay decided about one round.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +125,33 @@ pub fn initiate(items: &[Item]) -> Message {
 /// obvious implementation and it degrades to a linear scan on exactly the history
 /// that has had a compaction run over it.
 fn split(items: &[Item], upper: u64) -> Vec<Range> {
-    let bucket = items.len().div_ceil(SPLIT_FACTOR).max(1);
+    split_bounded(items, upper, SPLIT_FACTOR)
+}
+
+/// `split`, with a ceiling on how many ranges it may return.
+///
+/// The ceiling is what keeps a reply inside `MAX_RANGES`. Splitting multiplies: one
+/// incoming span becomes up to `SPLIT_FACTOR` ranges, so a legal incoming message
+/// carrying `MAX_RANGES` disagreeing spans used to answer with eight thousand, which
+/// the peer's own decoder refuses as `TooManyRanges`. The input is deterministic, so
+/// every retry produced the identical oversized message and the group could never
+/// reconcile again (WEALD-L178). Coarsening the split instead costs rounds and keeps
+/// the exchange expressible: a budget of two still halves the differing region, so
+/// each round still divides what it does not settle.
+fn split_bounded(items: &[Item], upper: u64, budget: usize) -> Vec<Range> {
+    let factor = SPLIT_FACTOR.min(budget.max(1));
+    // A budget of one cannot divide anything, so naming the ids is the only progress
+    // available: an id list is what the peer diffs, so envelopes move next round
+    // rather than a fingerprint being re-asserted. Above the wire bound on an id
+    // list the range is not expressible either way and the fingerprint stands, which
+    // is the case a round cap on the socket answers (WEALD-351).
+    if factor == 1 {
+        if items.len() <= MAX_IDS_PER_RANGE {
+            return vec![Range::new(upper, Mode::IdList(ids_of(items)))];
+        }
+        return vec![Range::new(upper, Mode::Fingerprint(fingerprint(items)))];
+    }
+    let bucket = items.len().div_ceil(factor).max(1);
     let mut ranges = Vec::new();
     let mut index = 0usize;
     while index < items.len() {
@@ -172,7 +211,10 @@ pub fn respond(local: &[Item], incoming: &Message) -> Response {
     let mut ranges = Vec::new();
     let mut push: BTreeSet<Id> = BTreeSet::new();
 
-    for (lower, upper, mode) in incoming.spans() {
+    let spans = incoming.spans();
+    let total = spans.len();
+    for (index, (lower, upper, mode)) in spans.into_iter().enumerate() {
+        let budget = span_budget(ranges.len(), total - index);
         let mine = items_in(local, lower, upper);
         match mode {
             // Already settled by the peer. Answered in kind rather than
@@ -187,7 +229,7 @@ pub fn respond(local: &[Item], incoming: &Message) -> Response {
                 } else if mine.len() <= IDLIST_LIMIT {
                     ranges.push(Range::new(upper, Mode::IdList(ids_of(mine))));
                 } else {
-                    ranges.extend(split(mine, upper));
+                    ranges.extend(split_bounded(mine, upper, budget));
                 }
             }
             Mode::IdList(theirs) => {
@@ -216,7 +258,7 @@ pub fn respond(local: &[Item], incoming: &Message) -> Response {
                     // at all while costing a full scan and a multi-megabyte encode
                     // every retry. Splitting narrows the disagreement instead, and
                     // the round after this one lands in the bounded arm.
-                    ranges.extend(split(mine, upper));
+                    ranges.extend(split_bounded(mine, upper, budget));
                 }
             }
         }
@@ -239,7 +281,10 @@ pub fn advance(local: &[Item], incoming: &Message) -> ClientStep {
     let mut send: BTreeSet<Id> = BTreeSet::new();
     let mut anything_to_say = false;
 
-    for (lower, upper, mode) in incoming.spans() {
+    let spans = incoming.spans();
+    let total = spans.len();
+    for (index, (lower, upper, mode)) in spans.into_iter().enumerate() {
+        let budget = span_budget(ranges.len(), total - index);
         let mine = items_in(local, lower, upper);
         match mode {
             Mode::Skip => ranges.push(Range::new(upper, Mode::Skip)),
@@ -252,7 +297,7 @@ pub fn advance(local: &[Item], incoming: &Message) -> ClientStep {
                     ranges.push(Range::new(upper, Mode::IdList(ids_of(mine))));
                 } else {
                     anything_to_say = true;
-                    ranges.extend(split(mine, upper));
+                    ranges.extend(split_bounded(mine, upper, budget));
                 }
             }
             Mode::IdList(theirs) => {
@@ -286,7 +331,7 @@ pub fn advance(local: &[Item], incoming: &Message) -> ClientStep {
                     // every retry. Splitting narrows the disagreement instead and
                     // the next round lands in the bounded arm above.
                     anything_to_say = true;
-                    ranges.extend(split(mine, upper));
+                    ranges.extend(split_bounded(mine, upper, budget));
                 }
             }
         }

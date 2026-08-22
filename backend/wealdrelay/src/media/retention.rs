@@ -52,10 +52,37 @@ pub enum ControlOutcome {
 ///
 /// Epoch 0 is the genesis case: `media.md` says it "is emitted by the group
 /// creator with the first epoch's verifier", so its authority is the verifier
-/// signing for itself, which is exactly the possession proof a group's founder
-/// has and nobody else does. Every later epoch must be signed by the *prior*
-/// epoch's verifier and must name that control's digest, which is the chain
-/// `groups.md`'s epoch rotation and this module's freeze rule both depend on.
+/// signing for itself. That self-signature is a possession proof and nothing
+/// more, and WEALD-L183 is the record of what it is not: any party who can
+/// reach this function can mint a keypair and sign for it, so on its own it
+/// binds the record to a key rather than to the group. Two things bind it to
+/// the group, and both are required.
+///
+/// The first is the caller's: `media::handle_control` admits the frame only
+/// from a device the workspace's *current access set* names
+/// (`access::store::Admission::InSet`), never from a provisional grant and
+/// never from a device an offboarding commit dropped. The relay holds no
+/// per-group roster by construction (`wire.md`: "the relay serves any group in
+/// the workspace to any device in the access set, because proving group
+/// membership to the relay would leak the membership graph"), so the access set
+/// is the group's access set as far as this process can ever know.
+///
+/// The second is here: a genesis control is the chain's root and a root is
+/// claimed once. A second, differently signed epoch-0 record is refused
+/// outright and, crucially, does **not** freeze. Freezing on a genesis conflict
+/// was a permanent denial of service any admitted device could trigger against
+/// any group id in its workspace, one frame per group, and the freeze it set
+/// disabled every retention policy, tombstone and sweep for that group. There
+/// is no legitimate second genesis: unlike a successor race, where both
+/// claimants proved possession of the prior epoch's verifier and the relay
+/// genuinely cannot tell them apart, an epoch-0 claimant proved possession of
+/// nothing the group ever asserted. The settled row stands and the impostor is
+/// told the record is malformed.
+///
+/// Every later epoch must be signed by the *prior* epoch's verifier and must
+/// name that control's digest, which is the chain `groups.md`'s epoch rotation
+/// and this module's freeze rule both depend on. Those conflicts still freeze,
+/// which is what `media.md`'s successor-race section asks for.
 pub async fn apply_control(
     pool: &PgPool,
     record: &RetentionControl,
@@ -96,6 +123,11 @@ pub async fn apply_control(
             record,
         ) {
             return Ok(ControlOutcome::Accepted);
+        }
+        if record.epoch == 0 {
+            return Ok(ControlOutcome::Invalid(
+                "group already has a genesis control",
+            ));
         }
         return record_conflict_and_freeze(pool, record).await;
     }
@@ -147,6 +179,13 @@ pub async fn apply_control(
         record,
     ) {
         return Ok(ControlOutcome::Accepted);
+    }
+    // Same rule as the pre-insert branch, for the same reason: losing a genesis
+    // race to a different verifier is a refusal, not a freeze.
+    if record.epoch == 0 {
+        return Ok(ControlOutcome::Invalid(
+            "group already has a genesis control",
+        ));
     }
     record_conflict_and_freeze(pool, record).await
 }
@@ -416,6 +455,16 @@ pub enum ManifestOutcome {
 /// previously claimed hash is exactly the "omission" `media.md`'s deletion rule
 /// reads, which `gc::eligible` checks by re-reading the latest manifest rather
 /// than by anything recorded here.
+/// The sequence a group's **first** manifest must name.
+///
+/// One, not zero. Named rather than written into the expression it is used in
+/// because the client has to agree with it exactly and disagreed silently: a first
+/// manifest numbered zero is refused, `handle_manifest` reports that as
+/// `reject/malformed_header`, and two tickets (WEALD-L333, WEALD-L336) were then
+/// spent on the header codec, which had always agreed.
+/// `Sources/Sync/RetentionManifest.swift` is the other half.
+pub const FIRST_MANIFEST_SEQUENCE: u64 = 1;
+
 pub async fn apply_manifest(
     pool: &PgPool,
     workspace: &str,
@@ -443,7 +492,9 @@ pub async fn apply_manifest(
     }
 
     let latest = latest_manifest(pool, &record.group).await?;
-    let expected_sequence = latest.as_ref().map_or(1, |m| m.sequence + 1);
+    let expected_sequence = latest
+        .as_ref()
+        .map_or(FIRST_MANIFEST_SEQUENCE, |m| m.sequence + 1);
     if record.sequence != expected_sequence {
         let reason = reject("sequence does not advance by exactly one");
         reject_manifest(pool, record, &reason).await?;
@@ -505,6 +556,56 @@ pub struct LatestManifest {
     pub sequence: u64,
     pub digest: Vec<u8>,
     pub blobs: Vec<Vec<u8>>,
+}
+
+/// Where a group's retention chain has got to, as the relay holds it.
+///
+/// The two chains are answered together for the reason `latest_control` answers
+/// its two facts together: a client that asked separately would have to reason
+/// about a control that rotated between the two calls, and the whole point of
+/// this record is that the relay, not the client, is the authority on the
+/// position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPosition {
+    /// The newest epoch a `RetentionControl` exists for, and its digest. `None`
+    /// digest means the group has no control chain at all, which is the one case
+    /// `control_epoch` says nothing.
+    pub control_epoch: u64,
+    pub control_digest: Option<Vec<u8>>,
+    /// The sequence the next manifest must name.
+    pub next_sequence: u64,
+    /// The digest that next manifest must name as its predecessor.
+    pub prev_manifest_hash: Option<Vec<u8>>,
+    /// The claim set the latest manifest named, so a client can publish a superset
+    /// rather than silently un-claiming blobs it never saw.
+    pub blobs: Vec<Vec<u8>>,
+}
+
+/// Read a group's chain position.
+///
+/// This exists because `apply_manifest` refuses a manifest whose sequence does
+/// not advance by exactly one, `handle_manifest` collapses that to
+/// `reject/malformed_header`, and `RetentionManifestLog` derived the sequence
+/// from purely local device state. A joiner therefore sent `sequence = 1`
+/// forever and was refused forever (WEALD-L355). Nothing here is content: an
+/// epoch, two digests, a counter, and the ciphertext hashes the same caller can
+/// already read back with `Request::List`.
+pub async fn position(pool: &PgPool, group: &[u8]) -> Result<ChainPosition, StoreError> {
+    let control = latest_control(pool, group).await?;
+    let control_digest = match &control {
+        Some((epoch, _)) => control_at(pool, group, *epoch).await?.map(|c| c.digest),
+        None => None,
+    };
+    let latest = latest_manifest(pool, group).await?;
+    Ok(ChainPosition {
+        control_epoch: control.map(|(epoch, _)| epoch).unwrap_or(0),
+        control_digest,
+        next_sequence: latest
+            .as_ref()
+            .map_or(FIRST_MANIFEST_SEQUENCE, |m| m.sequence + 1),
+        prev_manifest_hash: latest.as_ref().map(|m| m.digest.clone()),
+        blobs: latest.map(|m| m.blobs).unwrap_or_default(),
+    })
 }
 
 pub async fn latest_manifest(

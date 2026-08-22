@@ -84,7 +84,7 @@ const JITTER_DIVISOR: u64 = 10;
 pub const STORAGE_LISTING_EVERY: u64 = 96;
 
 /// What one pass did, for the log line and for a test to assert on.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Pass {
     /// (workspace, group) pairs examined by the two per-group media passes.
     pub scopes: u32,
@@ -100,12 +100,23 @@ pub struct Pass {
     pub recovery_wraps_dropped: u64,
     /// Bootstrap handoff ciphertexts dropped past their window.
     pub handoffs_dropped: u64,
+    /// Key packages dropped because their stated lifetime had passed. Nothing
+    /// else removes them, and the shelf cap counts only live rows (WEALD-L155).
+    pub key_packages_expired: u64,
     /// Invite seats returned by expiring an abandoned reservation.
     pub invite_seats_released: u64,
+    /// Invites ended because their stated expiry had passed, each of which deletes
+    /// the sealed `GroupInfo` the invite was still holding.
+    pub invites_expired: u64,
     /// Scopes the storage-listing sweep actually listed, which is a billed Class A
     /// operation each. Zero on the passes between `STORAGE_LISTING_EVERY`, and the
     /// number an operator reads to see what the sweep costs.
     pub storage_listings: u32,
+    /// What the retention warning threshold found this pass, if the operator set
+    /// one. Never a deletion: `specs/backend/relay/lifecycle.md:293` gives this
+    /// variable the warning half of the three-way split, and the relay "never
+    /// drops an envelope on its own initiative".
+    pub retention_overdue: crate::retention_notice::Overdue,
     /// Whether a set restore marker stopped the storage-listing sweep from running
     /// at all this pass. The operator's signal that the suppression is live, and
     /// the field a test asserts on rather than reading a log line.
@@ -195,8 +206,15 @@ pub async fn pass_with(state: &RelayState, list_storage: bool) -> Pass {
                     .collect();
                 workspaces.dedup();
                 for workspace in &workspaces {
-                    let report =
-                        crate::media::gc::sweep_unclaimed(pool, storage, workspace, now_ms).await;
+                    let report = crate::media::gc::sweep_unclaimed_after(
+                        pool,
+                        storage,
+                        workspace,
+                        now_ms,
+                        i64::try_from(state.config.media_unclaimed_grace_seconds)
+                            .unwrap_or(crate::media::gc::UNCLAIMED_GRACE_SECONDS),
+                    )
+                    .await;
                     summary.blobs_deleted += report.deleted;
                     summary.bytes_released += report.deleted_bytes;
                 }
@@ -245,11 +263,36 @@ pub async fn pass_with(state: &RelayState, list_storage: bool) -> Pass {
     // Capacity is decremented on reserve and only this pass returns it, so an
     // abandoned setup that never calls `release_expired` burns a seat forever
     // instead of freeing it ten minutes after the reservation lapsed.
+    match crate::keys::store::sweep_expired(pool).await {
+        Ok(dropped) => summary.key_packages_expired = dropped,
+        Err(error) => tracing::warn!(error = %error, "could not sweep expired key packages"),
+    }
     match crate::invite::reserve::release_expired(pool, now_ms as i64).await {
         Ok(freed) => summary.invite_seats_released = freed,
         Err(error) => {
             tracing::warn!(error = %error, "could not release expired invite reservations")
         }
+    }
+    // After the release, so a reservation that lapsed in the same interval is
+    // returned before the invite it belongs to is ended. Nothing else runs the
+    // invite's own expiry, so without this pass a stated seven-day invite keeps its
+    // sealed `GroupInfo` on disk forever (WEALD-L188).
+    match crate::invite::store::sweep_expired(pool, now_ms as i64).await {
+        Ok(ended) => summary.invites_expired = ended,
+        Err(error) => tracing::warn!(error = %error, "could not sweep expired invites"),
+    }
+    // Last, and a measurement rather than a sweep. The operator set a window and
+    // until now nothing in the binary read it (WEALD-L180), so a relay printed the
+    // number back from `--check-config` and never said another word about it.
+    summary.retention_overdue =
+        crate::retention_notice::overdue(pool, state.config.retention_days, now_ms).await;
+    if !summary.retention_overdue.is_empty() {
+        tracing::warn!(
+            envelopes = summary.retention_overdue.envelopes,
+            workspaces = summary.retention_overdue.workspaces,
+            oldest_days = summary.retention_overdue.oldest_days,
+            "envelopes are older than WEALD_RELAY_RETENTION_DAYS; retention warns, it never deletes"
+        );
     }
     summary
 }
@@ -298,6 +341,8 @@ pub async fn run(state: Arc<RelayState>) {
         let recovery_wraps_dropped = summary.recovery_wraps_dropped;
         let handoffs_dropped = summary.handoffs_dropped;
         let invite_seats_released = summary.invite_seats_released;
+        let key_packages_expired = summary.key_packages_expired;
+        let invites_expired = summary.invites_expired;
         let storage_listing_suppressed = summary.storage_listing_suppressed;
         tracing::info!(
             scopes,
@@ -308,6 +353,8 @@ pub async fn run(state: Arc<RelayState>) {
             recovery_wraps_dropped,
             handoffs_dropped,
             invite_seats_released,
+            invites_expired,
+            key_packages_expired,
             storage_listings,
             storage_listing_suppressed,
             "collector pass"

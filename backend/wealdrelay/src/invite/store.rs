@@ -318,6 +318,100 @@ pub async fn mark_spent(pool: &PgPool, token: &[u8]) -> Result<bool, StoreError>
 
 async fn terminate(pool: &PgPool, token: &[u8], terminal: &str) -> Result<bool, StoreError> {
     let mut tx = pool.begin().await.map_err(db)?;
+    let Some((workspace_id, hashes)) = terminate_in(&mut tx, token, terminal).await? else {
+        return Ok(false);
+    };
+
+    // Explicit rule, wire.md: revoking an invite voids every grant derived from it
+    // immediately and closes matching open connections. Inside the same transaction
+    // as the state change (WEALD-L153): a failure on the second of three hashes used
+    // to commit the terminal state and then report `Backpressure`, leaving the invite
+    // gone from every admin surface while the remaining devices kept live grants.
+    for hash in &hashes {
+        crate::access::store::revoke_grant_in(&mut tx, &workspace_id, hash)
+            .await
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+    }
+    tx.commit().await.map_err(db)?;
+    Ok(true)
+}
+
+/// End an invite as `spent` inside a transaction the caller already holds, and
+/// delete the sealed `GroupInfo` it was still serving (WEALD-L188).
+///
+/// Deliberately lighter than `terminate`. Exhaustion is not revocation: the devices
+/// that redeemed the seats keep the grants they earned, so no grant is voided; and
+/// no tombstone is written, because a tombstone is the record that makes a
+/// revocation stick and writing one here would refuse the duplicate `Commit` retry
+/// of the very reservation that spent the last seat. What ends is the invite's
+/// ability to admit anyone else, and with it the retained ciphertext, which is the
+/// only thing a former joiner holding the link and its URL fragment could still
+/// open. Taking the caller's transaction is the point: the last seat being spent and
+/// the invite ending are one fact, and a second transaction would leave a window in
+/// which a fully-redeemed invite still served its bundles.
+pub(crate) async fn spend_in(
+    tx: &mut sqlx::PgConnection,
+    token: &[u8],
+) -> Result<bool, StoreError> {
+    let changed =
+        sqlx::query("update relay_invite set state = 'spent' where token = $1 and state = 'live'")
+            .bind(token)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+    if changed == 0 {
+        return Ok(false);
+    }
+    sqlx::query("delete from relay_invite_bundle where token = $1")
+        .bind(token)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    Ok(true)
+}
+
+/// End every live invite whose stated expiry has passed.
+///
+/// The janitor's caller. An expiry that only a reader enforces leaves the sealed
+/// bundles on disk forever, so the sweep runs the same transition exhaustion runs:
+/// an invite that simply ran out of time does not retract the memberships it already
+/// granted, and it does not need a tombstone to stay unredeemable, because every
+/// redeeming path already refuses a state that is not `live`.
+pub async fn sweep_expired(pool: &PgPool, now_ms: i64) -> Result<u64, StoreError> {
+    let tokens: Vec<Vec<u8>> = sqlx::query(
+        "select token from relay_invite \
+         where state = 'live' \
+           and expires_at <= to_timestamp($1::double precision / 1000.0) \
+         order by token asc",
+    )
+    .bind(now_ms as f64)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?
+    .iter()
+    .map(|row| row.get::<Vec<u8>, _>("token"))
+    .collect();
+
+    let mut ended = 0u64;
+    for token in &tokens {
+        let mut tx = pool.begin().await.map_err(db)?;
+        if spend_in(&mut tx, token).await? {
+            tx.commit().await.map_err(db)?;
+            ended += 1;
+        }
+    }
+    Ok(ended)
+}
+
+/// The revocation transition itself: tombstone, state, reservations, ciphertext.
+/// Grants are the caller's business, because revocation voids them and exhaustion
+/// (`spend_in`) does not.
+async fn terminate_in(
+    tx: &mut sqlx::PgConnection,
+    token: &[u8],
+    terminal: &str,
+) -> Result<Option<(String, Vec<Vec<u8>>)>, StoreError> {
     let row = sqlx::query(
         "select workspace_id, expires_at from relay_invite where token = $1 for update",
     )
@@ -330,7 +424,7 @@ async fn terminate(pool: &PgPool, token: &[u8], terminal: &str) -> Result<bool, 
         // back when it falls out of scope, so an explicit call here would add a
         // failure path that only fires when the rollback itself fails, which is a
         // state no test can stage and no reader can act on.
-        return Ok(false);
+        return Ok(None);
     };
     let workspace_id: String = row.get("workspace_id");
 
@@ -381,16 +475,7 @@ async fn terminate(pool: &PgPool, token: &[u8], terminal: &str) -> Result<bool, 
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    tx.commit().await.map_err(db)?;
-
-    // Explicit rule, wire.md: revoking an invite voids every grant derived from it
-    // immediately and closes matching open connections.
-    for hash in &hashes {
-        crate::access::store::revoke_grant(pool, &workspace_id, hash)
-            .await
-            .map_err(|error| StoreError::Database(error.to_string()))?;
-    }
-    Ok(true)
+    Ok(Some((workspace_id, hashes)))
 }
 
 /// The device hashes a tombstone remembers, so a grant can be found after the
@@ -488,17 +573,29 @@ pub async fn refresh_bundle(
 /// The retained candidates for one scope, newest first.
 ///
 /// Opaque bytes out. The relay has served them; it has not looked at them.
+/// The state gate is this function's own, not the caller's (WEALD-L188). `JOIN` is
+/// pre-authentication by design, so anyone holding a leaked link can ask; a
+/// revoked, spent or expired invite therefore has to answer nothing here even if
+/// the transition that should have deleted these rows was missed. Empty rather than
+/// an error, so the path stays as uninformative about which tokens are real as the
+/// `Record` arm above it.
 pub async fn bundles_for(
     pool: &PgPool,
     token: &[u8],
     group: &[u8],
+    now_ms: i64,
 ) -> Result<Vec<EncBundle>, StoreError> {
     let rows = sqlx::query(
-        "select group_id, epoch, ct from relay_invite_bundle \
-         where token = $1 and group_id = $2 order by uploaded_at desc, epoch desc",
+        "select b.group_id, b.epoch, b.ct from relay_invite_bundle b \
+         join relay_invite i on i.token = b.token \
+         where b.token = $1 and b.group_id = $2 \
+           and i.state = 'live' \
+           and i.expires_at > to_timestamp($3::double precision / 1000.0) \
+         order by b.uploaded_at desc, b.epoch desc",
     )
     .bind(token)
     .bind(group)
+    .bind(now_ms as f64)
     .fetch_all(pool)
     .await
     .map_err(db)?;

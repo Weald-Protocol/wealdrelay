@@ -281,13 +281,14 @@ async fn an_undelivered_fetch_is_restored_to_the_shelf() {
         .await
         .expect("fetch");
     assert_eq!(served.len(), 2);
-    let ids: Vec<i64> = served.iter().map(|s| s.id).collect();
     assert!(store::fetch(pool, WORKSPACE, &device, 2)
         .await
         .expect("fetch")
         .is_empty());
 
-    store::restore(pool, &ids).await.expect("restore");
+    store::restore(pool, WORKSPACE, &served)
+        .await
+        .expect("restore");
     let again = store::fetch_served(pool, WORKSPACE, &device, 2)
         .await
         .expect("fetch");
@@ -298,6 +299,76 @@ async fn an_undelivered_fetch_is_restored_to_the_shelf() {
         HashSet::from([package(1), package(2)]),
         "the same packages come back, not new ones"
     );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// WEALD-L155. A handed-out package is deleted, not marked. The module's own
+/// contract says the relay deletes what it hands out, and the rows are cleartext
+/// leaf key material, so a row surviving the handout is retention the module
+/// says does not happen. Asserted on the table, not on `outstanding`, which
+/// counts only live rows and so cannot see the leak.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_package_leaves_no_row_behind() {
+    let scratch = Scratch::new("keys_delete_on_handout").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&default_device());
+
+    store::publish(pool, WORKSPACE, &device, &[package(3), package(4)])
+        .await
+        .expect("publish");
+    let served = store::fetch(pool, WORKSPACE, &device, 2)
+        .await
+        .expect("fetch");
+    assert_eq!(served.len(), 2);
+
+    let rows: i64 = sqlx::query_scalar(
+        "select count(*) from relay_key_package where workspace_id = $1 and device_hash = $2",
+    )
+    .bind(WORKSPACE)
+    .bind(blake3::hash(&device).as_bytes().to_vec())
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(rows, 0, "a served package is deleted, not left consumed");
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// WEALD-L155. Nothing swept expired packages either, so a shelf that was never
+/// fetched from grew forever. One collector pass removes them.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_collector_pass_removes_an_expired_package() {
+    let scratch = Scratch::new("keys_sweep_expired").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = pool(&relay).await;
+    let device = key_bytes(&other_device());
+
+    sqlx::query(
+        // `created_at` is set too: the schema checks `expires_at > created_at`, so a
+        // row that expired yesterday must have been created before that.
+        "insert into relay_key_package (workspace_id, device_hash, package, created_at, expires_at) \
+         values ($1, $2, $3, now() - interval '3 days', now() - interval '1 day')",
+    )
+    .bind(WORKSPACE)
+    .bind(blake3::hash(&device).as_bytes().to_vec())
+    .bind(package(9))
+    .execute(pool)
+    .await
+    .expect("insert expired");
+
+    let dropped = store::sweep_expired(pool).await.expect("sweep");
+    assert!(dropped >= 1, "the expired package is swept");
+    let rows: i64 = sqlx::query_scalar("select count(*) from relay_key_package")
+        .fetch_one(pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0);
 
     relay.shutdown().await;
     scratch.drop_database().await;

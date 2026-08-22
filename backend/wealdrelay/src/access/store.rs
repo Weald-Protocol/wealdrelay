@@ -846,13 +846,28 @@ pub async fn revoke_grant(
     workspace: &str,
     device_hash: &[u8],
 ) -> Result<bool, StoreError> {
+    let mut conn = pool.acquire().await.map_err(db)?;
+    revoke_grant_in(&mut conn, workspace, device_hash).await
+}
+
+/// The same void, on a transaction the caller already holds (WEALD-L153).
+///
+/// Revoking an invite and voiding the grants derived from it are one fact, so the
+/// invite store runs this inside its own transaction: a failure rolls the terminal
+/// state back with it, and no window exists in which the invite is gone from the
+/// admin's list while a device it admitted still holds a live grant.
+pub async fn revoke_grant_in(
+    tx: &mut sqlx::PgConnection,
+    workspace: &str,
+    device_hash: &[u8],
+) -> Result<bool, StoreError> {
     let done = sqlx::query(
         "update relay_provisional_grant set voided_at = now(), voided_reason = 'revoked' \
          where workspace_id = $1 and device_hash = $2 and voided_at is null",
     )
     .bind(workspace)
     .bind(device_hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
     Ok(done.rows_affected() > 0)

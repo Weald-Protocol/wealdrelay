@@ -2,9 +2,12 @@
 // Copyright 2026 Dicyanin Labs
 //! The provider: OpenMLS's crypto, randomness and storage, assembled for one workspace.
 //!
-//! `specs/backend/relay/mls-binding.md`: "OpenMLS's storage provider trait is implemented
-//! against SQLite, in the same per-workspace database as the search index, encrypted at
-//! rest with a Keychain key bound to the device."
+//! `specs/backend/relay/mls-binding.md` requires this database to be encrypted at rest
+//! with a Keychain key bound to the device. That is NOT true of this file today: what is
+//! opened below is a plain SQLite database, with no SQLCipher and no key pragma, so the
+//! MLS signing key and all group ratchet state are readable by anything that can read
+//! the file. Do not describe this store as encrypted at rest anywhere — in a comment, a
+//! spec, or a published claim — until encryption actually lands.
 //!
 //! The trait implementation itself is `openmls_sqlite_storage`, maintained by the OpenMLS
 //! project. That is a deliberate choice and the same one the spec makes about OpenMLS: the
@@ -29,8 +32,10 @@ use crate::status::{Error, Result};
 ///
 /// JSON, and the reason is auditability rather than size. A stored group is the thing an
 /// incident investigation reads, and a self-describing encoding is one an investigator can
-/// read with `sqlite3` and `jq` at three in the morning. The rows are inside an encrypted
-/// database either way, so the encoding is not carrying any confidentiality.
+/// read with `sqlite3` and `jq` at three in the morning. The database is a plain file
+/// today (see the module header), so this encoding IS carrying confidentiality it should
+/// not have to; that is one more reason encryption at rest has to land, not a property
+/// to rely on.
 #[derive(Default)]
 pub struct JsonCodec;
 

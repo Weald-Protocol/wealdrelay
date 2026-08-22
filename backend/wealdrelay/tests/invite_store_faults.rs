@@ -25,7 +25,7 @@ mod support;
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row as _};
 use wealdrelay::health::{Clock, RelayState};
 use wealdrelay::invite::code::Code;
 use wealdrelay::invite::reserve::{self, Verdict};
@@ -228,7 +228,7 @@ async fn every_read_answers_come_back_rather_than_answering_absent() {
     is_told_to_come_back(outcome, "live_tokens");
 
     let outcome = without_table(pool, "relay_invite_bundle", async {
-        store::bundles_for(pool, &record.token, &root()).await
+        store::bundles_for(pool, &record.token, &root(), NOW).await
     })
     .await;
     is_told_to_come_back(outcome, "bundles_for");
@@ -572,7 +572,7 @@ async fn a_closed_pool_answers_come_back_on_every_entry_point() {
         "tombstoned_hashes",
     );
     is_told_to_come_back(
-        store::bundles_for(pool, &record.token, &root()).await,
+        store::bundles_for(pool, &record.token, &root(), NOW).await,
         "bundles_for",
     );
     is_told_to_come_back(
@@ -1151,6 +1151,82 @@ async fn a_seat_is_not_spent_when_the_provisional_grant_cannot_be_written() {
         .expect("read"),
         Verdict::Reserved { .. }
     ));
+
+    scratch.drop_database().await;
+}
+
+/// A failed grant void rolls the revocation back with it (WEALD-L153).
+///
+/// Three devices hold provisional grants from one invite. The void of the second
+/// fails. Before the fix the transaction had already committed, so the invite was
+/// terminal and gone from the admin's list while devices two and three kept live
+/// grants, and the admin was told `Backpressure`, whose contract is to resend bytes
+/// for work that already landed. Now the whole transition is one transaction: the
+/// answer is still `Database`, but the invite is untouched and every grant is live,
+/// so the retry the error asks for is a real retry.
+#[tokio::test]
+async fn a_failed_grant_void_leaves_neither_a_terminal_invite_nor_a_live_grant() {
+    let (scratch, _blobs, state) = prepared("revoke_grant_fault").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(7);
+    let record = issue(0xc7, code, 3);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+
+    let devices: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0x90 + i; 32]).collect();
+    for (i, device) in devices.iter().enumerate() {
+        assert!(matches!(
+            reserve::reserve(
+                pool,
+                &record.token,
+                &code.grouped(),
+                &nonce(i as u8 + 1),
+                device,
+                &[0x82; 32],
+                NOW,
+            )
+            .await
+            .expect("read"),
+            Verdict::Reserved { .. }
+        ));
+    }
+
+    refuse(pool, "relay_provisional_grant", "update").await;
+    is_told_to_come_back(store::revoke(pool, &record.token).await, "revoke");
+    stop_refusing(pool, "relay_provisional_grant", "update").await;
+
+    // The invite never left the board.
+    assert_eq!(
+        store::live_tokens(pool, WORKSPACE).await.unwrap(),
+        vec![record.token.clone()]
+    );
+    assert!(store::tombstoned_hashes(pool, &record.token)
+        .await
+        .unwrap()
+        .is_none());
+    // And not one grant was voided, so no device was half-revoked.
+    let voided: i64 = sqlx::query(
+        "select count(*) as n from relay_provisional_grant \
+         where workspace_id = $1 and voided_at is not null",
+    )
+    .bind(WORKSPACE)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(voided, 0);
+
+    // The retry the error asked for now does the whole thing.
+    assert!(store::revoke(pool, &record.token).await.unwrap());
+    let live: i64 = sqlx::query(
+        "select count(*) as n from relay_provisional_grant \
+         where workspace_id = $1 and voided_at is null",
+    )
+    .bind(WORKSPACE)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get("n");
+    assert_eq!(live, 0);
 
     scratch.drop_database().await;
 }

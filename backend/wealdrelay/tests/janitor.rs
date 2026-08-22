@@ -29,8 +29,8 @@ use wealdrelay::media::{retention, store};
 use wealdrelay::storage::{BlobKey, Store};
 
 use support::{
-    blob_hash, config_for, device_from, make_group_in, signed_control, signed_manifest,
-    verifier_key, Running, Scratch,
+    blob_hash, config_for, config_with, device_from, make_group_in, signed_control,
+    signed_manifest, verifier_key, Running, Scratch,
 };
 
 const NOW: u64 = 1_800_000_000_000;
@@ -43,9 +43,15 @@ struct Harness {
 
 impl Harness {
     async fn new(label: &str) -> Self {
+        Self::with(label, config_for).await
+    }
+
+    /// The same harness with a configuration of the caller's choosing, for the two
+    /// proofs that are about a setting rather than about a sweep.
+    async fn with(label: &str, configure: impl Fn(&Scratch, &std::path::Path) -> Config) -> Self {
         let scratch = Scratch::new(label).await;
         let blobs = tempfile::tempdir().unwrap();
-        let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(NOW)).await;
+        let relay = Running::start(configure(&scratch, blobs.path()), Clock::Fixed(NOW)).await;
         let state = Arc::clone(&relay.state);
         relay.shutdown().await;
         Self {
@@ -545,6 +551,40 @@ fn the_collector_interval_defaults_and_refuses_zero() {
     );
 }
 
+/// The unclaimed grace is an operator setting with the promised default, and zero
+/// is legal because a probe instance is exactly the deployment that wants an
+/// unfinalized reservation collectable on the next pass.
+#[test]
+fn the_unclaimed_grace_defaults_to_the_promised_day_and_accepts_zero() {
+    let base = [
+        (keys::HOSTNAME, "relay.acme.com"),
+        (keys::DATABASE_URL, "postgres://weald@localhost/weald_relay"),
+        (keys::STORAGE_URL, "file:///var/lib/wealdrelay/blobs"),
+    ];
+    let resolved = Config::resolve(&Values::from_pairs(base)).expect("the default resolves");
+    assert_eq!(
+        resolved.media_unclaimed_grace_seconds,
+        wealdrelay::media::gc::UNCLAIMED_GRACE_SECONDS as u64,
+        "the default is the 24 hours media.md promises"
+    );
+
+    let named = Config::resolve(&Values::from_pairs(
+        base.into_iter()
+            .chain([(keys::MEDIA_UNCLAIMED_GRACE_SECONDS, "0")]),
+    ))
+    .expect("zero resolves");
+    assert_eq!(named.media_unclaimed_grace_seconds, 0);
+
+    assert!(
+        Config::resolve(&Values::from_pairs(
+            base.into_iter()
+                .chain([(keys::MEDIA_UNCLAIMED_GRACE_SECONDS, "a day")]),
+        ))
+        .is_err(),
+        "a word is not a number of seconds"
+    );
+}
+
 /// A restore marker stops the storage-listing sweep for the passes it names, and
 /// stops nothing else.
 ///
@@ -612,6 +652,196 @@ async fn a_restore_marker_suppresses_the_listing_sweep_pass_by_pass() {
     assert_eq!(
         wealdrelay::media::restore::remaining(pool).await.unwrap(),
         Some(2)
+    );
+
+    harness.finish().await;
+}
+
+// MARK: The forced pass
+
+/// One request against the private router, without binding a port. The same shape
+/// `health_operator.rs` uses, kept local because this suite needs a POST with a
+/// body and that one does not.
+async fn post(
+    state: &Arc<RelayState>,
+    uri: &str,
+    authorization: Option<&str>,
+    body: &str,
+) -> (axum::http::StatusCode, String) {
+    use tower::ServiceExt as _;
+    let mut request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(uri)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(value) = authorization {
+        request = request.header(axum::http::header::AUTHORIZATION, value);
+    }
+    let response = wealdrelay::health::private_router(Arc::clone(state))
+        .oneshot(
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("a request"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("a body");
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+const OPERATOR: &str = "operator-bearer-for-the-forced-sweep";
+
+/// The proof that closes the multiplayer scenario "a file nobody attached
+/// disappears" (mp.30 in `.claude/skills/multiplayer-scenarios/scenarios.json`).
+///
+/// The behaviour is real and its window is a day, so no probe against a running
+/// relay could ever see it: the collector's own clock is a quarter hour and the
+/// grace it enforces is 24 hours. Two operator surfaces make it observable in one
+/// session, and this test drives both exactly as an operator would. The grace is
+/// shortened by `WEALD_RELAY_MEDIA_UNCLAIMED_GRACE_SECONDS` and the pass is forced
+/// by `POST /gc/sweep` with the operator bearer. The claimed object in the same
+/// workspace is the half that makes the deletion mean anything.
+#[tokio::test]
+async fn a_forced_pass_with_a_short_grace_deletes_only_the_unclaimed_object() {
+    let harness = Harness::with("janitor_forced", |scratch, blobs| {
+        config_with(
+            scratch,
+            blobs,
+            [
+                (keys::MEDIA_UNCLAIMED_GRACE_SECONDS, "0".to_string()),
+                (keys::OPERATOR_TOKEN, OPERATOR.to_string()),
+            ],
+        )
+    })
+    .await;
+    let pool = harness.pool();
+    let ada = device_from(0x71);
+    let group = make_group_in(
+        &harness.state,
+        "ws-jan9",
+        0x59,
+        std::slice::from_ref(&ada),
+        std::slice::from_ref(&ada),
+    )
+    .await;
+    let epoch = verifier_key(0x29);
+    retention::apply_control(pool, &signed_control(&group, 0, &epoch, None, &epoch))
+        .await
+        .unwrap();
+    store::ensure_quota_row(pool, "ws-jan9", None)
+        .await
+        .unwrap();
+
+    // The attachment somebody sent: reserved, stored, and named by a valid manifest.
+    let claimed = blob_hash(0xc1);
+    reserved_blob(&harness, "ws-jan9", &group, &claimed, b"attached").await;
+    retention::apply_manifest(
+        pool,
+        "ws-jan9",
+        &signed_manifest(&group, 0, 1, None, vec![claimed.clone()], &epoch),
+    )
+    .await
+    .unwrap();
+
+    // The upload nobody ever claimed: reserved and stored seconds ago, which is
+    // why the shortened grace is the whole point. Nothing here backdates a row.
+    let unclaimed = blob_hash(0xc2);
+    reserved_blob(&harness, "ws-jan9", &group, &unclaimed, b"orphan").await;
+
+    // The bearer first, because a route that runs the collector for anybody who can
+    // reach the private port is worse than no route.
+    let (status, body) = post(&harness.state, "/gc/sweep", None, "{}").await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert!(body.contains("operator token required"), "{body}");
+    assert!(
+        harness
+            .storage()
+            .head(&key("ws-jan9", &group, &unclaimed))
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused request deleted something"
+    );
+
+    let (status, body) = post(
+        &harness.state,
+        "/gc/sweep",
+        Some(&format!("Bearer {OPERATOR}")),
+        "{\"storage_listing\":false}",
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let summary: serde_json::Value = serde_json::from_str(&body).expect("a pass summary");
+    assert_eq!(summary["blobs_deleted"], 1, "{body}");
+    assert_eq!(
+        summary["storage_listings"], 0,
+        "the caller asked for no listing"
+    );
+
+    assert!(
+        harness
+            .storage()
+            .head(&key("ws-jan9", &group, &unclaimed))
+            .await
+            .unwrap()
+            .is_none(),
+        "the unclaimed object is still in the bucket"
+    );
+    assert!(
+        harness
+            .storage()
+            .head(&key("ws-jan9", &group, &claimed))
+            .await
+            .unwrap()
+            .is_some(),
+        "the claimed object was collected, which is data loss"
+    );
+    assert_eq!(
+        store::claimed_hashes(pool, "ws-jan9", &group)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the claimed reservation is still charged and nothing else is"
+    );
+
+    harness.finish().await;
+}
+
+/// The default is the promise. A relay nobody configured leaves an upload from a
+/// minute ago alone, so the shortened grace above is a setting and not a change of
+/// behaviour.
+#[tokio::test]
+async fn the_default_grace_leaves_a_fresh_unclaimed_upload_alone() {
+    let harness = Harness::new("janitor_grace_default").await;
+    let pool = harness.pool();
+    let group = make_group_in(
+        &harness.state,
+        "ws-jan10",
+        0x5a,
+        &[device_from(0x71)],
+        &[device_from(0x71)],
+    )
+    .await;
+    store::ensure_quota_row(pool, "ws-jan10", None)
+        .await
+        .unwrap();
+    let hash = blob_hash(0xc3);
+    reserved_blob(&harness, "ws-jan10", &group, &hash, b"fresh").await;
+
+    let summary = wealdrelay::janitor::pass(&harness.state).await;
+
+    assert_eq!(summary.blobs_deleted, 0);
+    assert!(
+        harness
+            .storage()
+            .head(&key("ws-jan10", &group, &hash))
+            .await
+            .unwrap()
+            .is_some(),
+        "the default grace collected an upload that is seconds old"
     );
 
     harness.finish().await;

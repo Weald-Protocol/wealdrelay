@@ -573,9 +573,13 @@ progress), build step 25 (the app launch gate, unstarted, and waiting on 20), an
 live milestones 14, 15 and 16.
 
 So the sequencing advice is narrower than it was and it is still real: **the
-relay half of calls is built and the feature is off by default**
-(`WEALD_RELAY_CALLS=off`), which is what makes building it now safe rather than
-premature. No instance carries a call until an operator sizes one, no client
-above the socket exists yet, and nothing about steps 35 and 36 touches the launch
+relay half of calls is built**, and as of 2026-08-21 it is on by default
+(`WEALD_RELAY_CALLS=on`, `calls/mod.rs DEFAULT_CONCURRENT_CALLS`), which supersedes
+the line this paragraph carried while it was opt-in. The reason for the change is
+the reason the opt-in was wrong in practice: no provisioner ever set the variable,
+so every relay a customer bought answered `version/protocol_unsupported`
+(`specs/launch-review-2026-08-11.md:36`), and a feature nobody can reach is an
+absence rather than a posture. `off` is still available to an operator who wants
+it. No client above the socket exists yet, and nothing about steps 35 and 36 touches the launch
 gate's path. The client half, steps 37 to 39, is the part that should wait for
 the launch gate, because that is the part a customer can see.

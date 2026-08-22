@@ -1032,20 +1032,34 @@ async fn the_record_step_serves_the_issuer_s_own_bytes_and_an_empty_body_for_a_t
         other => panic!("the record step was refused: {other:?}"),
     }
 
-    // A token that does not exist: refused flatly, like every other unknown token
-    // on this path.
-    joiner
-        .send_frame(&Frame::Join {
-            body: RedeemRequest::Record {
-                token: vec![0xff; 16],
-            }
-            .encode(),
-        })
-        .await;
-    match joiner.recv_frame().await {
-        Frame::Error(error) => assert_eq!(error.code, wealdrelay::invite::UNAVAILABLE),
-        other => panic!("an unknown token was answered: {other:?}"),
+    // A token that does not exist, and a token that was revoked: byte-identical
+    // empty answers, and neither is the refusal a live token would not have got
+    // (WEALD-L152). An `UNAVAILABLE` here would confirm which guessed tokens are
+    // real, before AUTH and against no attempt budget.
+    let revoked = issue(&root_key, 0xe2, Code::from_bits(0x0f0f_0f0f_0f0f_0f0f));
+    store::create(&pool, WORKSPACE, &revoked, CLOCK as i64)
+        .await
+        .expect("stored");
+    store::revoke(&pool, &revoked.token).await.expect("revoked");
+
+    let mut answers = Vec::new();
+    for token in [vec![0xff; 16], revoked.token.clone()] {
+        joiner
+            .send_frame(&Frame::Join {
+                body: RedeemRequest::Record { token }.encode(),
+            })
+            .await;
+        match joiner.recv_frame().await {
+            Frame::Join { body } => answers.push(body),
+            other => panic!("the record step answered {other:?}"),
+        }
     }
+    assert_eq!(answers[0], answers[1]);
+    let RedeemResponse::Record { body } = RedeemResponse::decode(&answers[0]).expect("a response")
+    else {
+        panic!("the record step answered with something else");
+    };
+    assert!(body.is_empty());
 
     relay.shutdown().await;
     scratch.drop_database().await;

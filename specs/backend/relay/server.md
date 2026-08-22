@@ -360,6 +360,18 @@ authentication boundary, and frozen-group prefixes are correlation handles the
 public/private split exists to withhold (WEALD-295). A deployment with no
 operator token configured serves only the verdict.
 
+**Version.** `GET /version` answers the compiled identity and the running digest
+to a request carrying the operator bearer, mounted beside `/admitted` on both
+listeners and absent on a relay with no operator token. It reads nothing but the
+process, so a relay whose database is down can still say which build is down.
+The body is `{name, version, digest, comparable}`, where `digest` is
+`RunningDigest::line` and `comparable` is true only for the published image form:
+a self-hash is a true statement about a binary that no release can be matched
+against, and a caller must never compare it to a pin. Before WEALD-L352 nothing
+served this, `instances.running_digest` recorded only what an upgrade intended,
+and the only statement anybody could make about a live workspace's version was an
+inference from the pin the provisioner read at create time.
+
 ## Sizing
 
 Measured against a synthetic 30-person workspace with 12 concurrent agents.
