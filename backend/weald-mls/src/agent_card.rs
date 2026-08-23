@@ -36,7 +36,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::agent_cbor::{self as cbor, CborError, Reader};
 
 /// `AGENT_PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 pub const AGENT_ID_WIDTH: usize = 32;
 pub const CARD_HASH_WIDTH: usize = 32;
@@ -62,9 +62,10 @@ pub mod key {
     pub const EXPIRES_AT: u64 = 13;
     pub const ORG: u64 = 14;
     pub const SIG: u64 = 15;
+    pub const CODE: u64 = 16;
 
     /// The decoder's allow-list. Every key, and nothing else.
-    pub const SCHEMA: [u64; 15] = [
+    pub const SCHEMA: [u64; 16] = [
         V,
         AGENT_ID,
         HOST_KIND,
@@ -80,6 +81,7 @@ pub mod key {
         EXPIRES_AT,
         ORG,
         SIG,
+        CODE,
     ];
 }
 
@@ -91,6 +93,7 @@ pub enum Capability {
     ChatReply,
     ReadChannel,
     ReadTicket,
+    CodePullRequest,
 }
 
 impl Capability {
@@ -99,6 +102,7 @@ impl Capability {
             Capability::ChatReply => "chat.reply",
             Capability::ReadChannel => "read.channel",
             Capability::ReadTicket => "read.ticket",
+            Capability::CodePullRequest => "code.pullrequest",
         }
     }
 
@@ -110,6 +114,7 @@ impl Capability {
             "chat.reply" => Some(Capability::ChatReply),
             "read.channel" => Some(Capability::ReadChannel),
             "read.ticket" => Some(Capability::ReadTicket),
+            "code.pullrequest" => Some(Capability::CodePullRequest),
             _ => None,
         }
     }
@@ -177,6 +182,26 @@ pub struct Org {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRepository {
+    pub repository_id: u64,
+    pub repo_ref: String,
+    pub base_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestPolicy {
+    pub argv: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code {
+    pub repos: Vec<CodeRepository>,
+    pub installation_id: u64,
+    pub test: Option<TestPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCard {
     pub v: u64,
     pub agent_id: Vec<u8>,
@@ -191,6 +216,7 @@ pub struct AgentCard {
     pub issued_at: u64,
     pub expires_at: u64,
     pub org: Option<Org>,
+    pub code: Option<Code>,
     pub sig: Vec<u8>,
 }
 
@@ -215,6 +241,11 @@ pub enum CardError {
     ListNotCanonical(&'static str),
     EmptyAlias,
     AliasNotLowercased(String),
+    CodeBlockMismatch,
+    CodeRepositoriesInvalid,
+    RepositoryRefInvalid(String),
+    BranchInvalid(String),
+    TestPolicyInvalid,
     /// `sig` does not verify under `owner_principal`, or `owner_principal` is not a
     /// key at all.
     SignatureInvalid,
@@ -240,6 +271,11 @@ impl CardError {
             CardError::ListNotCanonical(_) => "codec.list.order",
             CardError::EmptyAlias => "codec.alias.empty",
             CardError::AliasNotLowercased(_) => "codec.alias.case",
+            CardError::CodeBlockMismatch => "codec.code.mismatch",
+            CardError::CodeRepositoriesInvalid => "codec.code.repos",
+            CardError::RepositoryRefInvalid(_) => "codec.repo.ref",
+            CardError::BranchInvalid(_) => "codec.branch.ref",
+            CardError::TestPolicyInvalid => "codec.test.policy",
             CardError::SignatureInvalid => "codec.signature.invalid",
         }
     }
@@ -285,6 +321,23 @@ impl std::fmt::Display for CardError {
                 f,
                 "alias '{alias}' is not lowercased; mentions resolve case-insensitively"
             ),
+            CardError::CodeBlockMismatch => write!(
+                f,
+                "code block must be present exactly with code.pullrequest"
+            ),
+            CardError::CodeRepositoriesInvalid => write!(
+                f,
+                "code repositories must contain 1...100 unique ids and refs in id order"
+            ),
+            CardError::RepositoryRefInvalid(value) => {
+                write!(f, "repository ref '{value}' is not canonical owner/name")
+            }
+            CardError::BranchInvalid(value) => {
+                write!(f, "base branch '{value}' is not a valid Git ref")
+            }
+            CardError::TestPolicyInvalid => {
+                write!(f, "direct-exec test policy is outside its closed bounds")
+            }
             CardError::SignatureInvalid => write!(
                 f,
                 "the card's signature does not verify under its own ownerPrincipal"
@@ -383,7 +436,38 @@ fn body_pairs(card: &AgentCard) -> Vec<(u64, Vec<u8>)> {
             ]),
         ));
     }
+    if let Some(code) = &card.code {
+        pairs.push((key::CODE, encode_code(code)));
+    }
     pairs
+}
+
+fn encode_code(code: &Code) -> Vec<u8> {
+    let repos = code
+        .repos
+        .iter()
+        .map(|repo| {
+            let mut fields = vec![cbor::uint(repo.repository_id), cbor::text(&repo.repo_ref)];
+            if let Some(branch) = &repo.base_branch {
+                fields.push(cbor::text(branch));
+            }
+            cbor::array(&fields)
+        })
+        .collect::<Vec<_>>();
+    let mut fields = vec![cbor::array(&repos), cbor::uint(code.installation_id)];
+    if let Some(test) = &code.test {
+        fields.push(cbor::array(&[
+            cbor::array(
+                &test
+                    .argv
+                    .iter()
+                    .map(|arg| cbor::text(arg))
+                    .collect::<Vec<_>>(),
+            ),
+            cbor::uint(test.timeout_seconds),
+        ]));
+    }
+    cbor::array(&fields)
 }
 
 // ------------------------------------------------------------------- decoding
@@ -441,6 +525,13 @@ pub fn decode(data: &[u8]) -> Result<AgentCard> {
             present: org.is_some(),
         });
     }
+    let code = cbor::optional_slot(&slots, key::CODE)
+        .map(decode_code)
+        .transpose()?;
+    let has_code_capability = capabilities.contains(&Capability::CodePullRequest);
+    if has_code_capability != code.is_some() {
+        return Err(CardError::CodeBlockMismatch);
+    }
 
     let card = AgentCard {
         v: cbor::in_slot(&slots, key::V, |r| r.uint())?,
@@ -456,6 +547,7 @@ pub fn decode(data: &[u8]) -> Result<AgentCard> {
         issued_at: cbor::in_slot(&slots, key::ISSUED_AT, |r| r.uint())?,
         expires_at: cbor::in_slot(&slots, key::EXPIRES_AT, |r| r.uint())?,
         org,
+        code,
         sig: cbor::in_slot(&slots, key::SIG, |r| r.bytes())?,
     };
 
@@ -467,6 +559,131 @@ pub fn decode(data: &[u8]) -> Result<AgentCard> {
         return Err(CardError::CardHashMismatch { stored, computed });
     }
     Ok(card)
+}
+
+fn decode_code(data: &[u8]) -> Result<Code> {
+    let mut r = Reader::new(data);
+    let count = r.array_count()?;
+    if count != 2 && count != 3 {
+        return Err(CborError::WrongArrayCount {
+            expected: 2,
+            got: count,
+        }
+        .into());
+    }
+    let repo_count = r.array_count()?;
+    if !(1..=100).contains(&repo_count) {
+        return Err(CardError::CodeRepositoriesInvalid);
+    }
+    let mut repos = Vec::with_capacity(repo_count);
+    for _ in 0..repo_count {
+        let fields = r.array_count()?;
+        if fields != 2 && fields != 3 {
+            return Err(CborError::WrongArrayCount {
+                expected: 2,
+                got: fields,
+            }
+            .into());
+        }
+        let repository_id = r.uint()?;
+        let repo_ref = r.text()?;
+        if !valid_repo_ref(&repo_ref) {
+            return Err(CardError::RepositoryRefInvalid(repo_ref));
+        }
+        let base_branch = if fields == 3 { Some(r.text()?) } else { None };
+        if let Some(branch) = &base_branch {
+            if !valid_branch(branch) {
+                return Err(CardError::BranchInvalid(branch.clone()));
+            }
+        }
+        repos.push(CodeRepository {
+            repository_id,
+            repo_ref,
+            base_branch,
+        });
+    }
+    if !repos
+        .windows(2)
+        .all(|w| w[0].repository_id < w[1].repository_id)
+    {
+        return Err(CardError::CodeRepositoriesInvalid);
+    }
+    let mut refs = std::collections::HashSet::new();
+    if !repos
+        .iter()
+        .all(|repo| refs.insert(repo.repo_ref.to_ascii_lowercase()))
+    {
+        return Err(CardError::CodeRepositoriesInvalid);
+    }
+    let installation_id = r.uint()?;
+    let test = if count == 3 {
+        let fields = r.array_count()?;
+        if fields != 2 {
+            return Err(CborError::WrongArrayCount {
+                expected: 2,
+                got: fields,
+            }
+            .into());
+        }
+        let argc = r.array_count()?;
+        if !(1..=32).contains(&argc) {
+            return Err(CardError::TestPolicyInvalid);
+        }
+        let mut argv = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            let arg = r.text()?;
+            if arg.is_empty() || arg.len() > 1024 {
+                return Err(CardError::TestPolicyInvalid);
+            }
+            argv.push(arg);
+        }
+        let timeout_seconds = r.uint()?;
+        if !(1..=900).contains(&timeout_seconds) {
+            return Err(CardError::TestPolicyInvalid);
+        }
+        Some(TestPolicy {
+            argv,
+            timeout_seconds,
+        })
+    } else {
+        None
+    };
+    r.require_end()?;
+    Ok(Code {
+        repos,
+        installation_id,
+        test,
+    })
+}
+
+fn valid_repo_ref(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+    let mut parts = value.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !owner.is_empty()
+        && owner.len() <= 39
+        && !repo.is_empty()
+        && owner
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'.' | b'_' | b'-')))
+        && repo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn valid_branch(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['/', '.', '-'])
+        && !value.ends_with(['/', '.'])
+        && !["..", "@{", "//", "\\", " ", "~", "^", ":", "?", "*", "["]
+            .iter()
+            .any(|bad| value.contains(bad))
+        && value.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
 /// `sig` verifies under `owner_principal` over `signing_input`.
@@ -580,6 +797,7 @@ mod tests {
             issued_at: 1_760_000_000,
             expires_at: 1_790_000_000,
             org,
+            code: None,
             sig: vec![],
         }
     }
@@ -669,8 +887,8 @@ mod tests {
         assert_eq!(encode(&card), encode(&card));
         let keys: Vec<u64> = slots_of(&encode(&card)).iter().map(|(k, _)| *k).collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]));
-        // Every slot but `org`.
-        assert_eq!(keys.len(), key::SCHEMA.len() - 1);
+        // Every slot but the two optional blocks.
+        assert_eq!(keys.len(), key::SCHEMA.len() - 2);
         assert!(!keys.contains(&key::ORG));
     }
 
@@ -735,10 +953,10 @@ mod tests {
     #[test]
     fn a_key_outside_the_schema_is_refused() {
         let mut pairs = slots_of(&encode(&user_card()));
-        pairs.push((16, cbor::text("a system prompt")));
+        pairs.push((17, cbor::text("a system prompt")));
         assert_eq!(
             decode(&cbor::map(&pairs)).unwrap_err(),
-            CardError::Cbor(CborError::UnknownKey(16))
+            CardError::Cbor(CborError::UnknownKey(17))
         );
     }
 
@@ -751,7 +969,7 @@ mod tests {
                 .collect();
             // `org` is the one slot a user card does not carry, so removing it is a
             // no-op rather than a refusal.
-            if missing == key::ORG {
+            if missing == key::ORG || missing == key::CODE {
                 assert!(decode(&cbor::map(&pairs)).is_ok());
                 continue;
             }

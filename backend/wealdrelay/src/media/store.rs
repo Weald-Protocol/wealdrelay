@@ -761,12 +761,31 @@ pub async fn complete_multipart(pool: &PgPool, session_id: Uuid) -> Result<(), S
 }
 
 pub async fn abort_multipart(pool: &PgPool, session_id: Uuid) -> Result<(), StoreError> {
-    sqlx::query("update relay_blob_multipart set aborted_at = now() where session_id = $1")
+    sqlx::query(
+        "update relay_blob_multipart set aborted_at = now() \
+         where session_id = $1 and aborted_at is null",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Forget the part rows of a session whose part objects are provably gone.
+///
+/// The rows are what make an aborted session still selectable by
+/// `stale_multipart_sessions` (WEALD-L404): the abort marker alone cannot say
+/// whether the objects behind it were deleted, so the marker that ends retries
+/// is the absence of part rows, written only after every delete confirmed.
+/// Returns how many rows it dropped.
+pub async fn forget_recorded_parts(pool: &PgPool, session_id: Uuid) -> Result<u64, StoreError> {
+    let done = sqlx::query("delete from relay_blob_multipart_part where session_id = $1")
         .bind(session_id)
         .execute(pool)
         .await
         .map_err(db)?;
-    Ok(())
+    Ok(done.rows_affected())
 }
 
 /// Whether a session was already aborted, read from the multipart row alone.
@@ -794,10 +813,22 @@ pub async fn multipart_is_aborted(pool: &PgPool, session_id: Uuid) -> Result<boo
 
 /// Every multipart session past its expiry with no completion: aborted, its
 /// reservation released, alongside the plain unclaimed-upload sweep.
+///
+/// An already-aborted session stays selectable while it still has part rows,
+/// because the abort marker says nothing about whether the part objects behind
+/// it were actually deleted. The client-driven abort path deletes the objects
+/// with `let _ =` and marks the session aborted regardless, so without this a
+/// single failed delete there orphaned those objects under the synthetic
+/// `_multipart` key space that no other sweep walks. The janitor drops the part
+/// rows only once every delete confirmed, so a swept session leaves for good
+/// and an unswept one is retried next interval (WEALD-L404).
 pub async fn stale_multipart_sessions(pool: &PgPool) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
     let rows = sqlx::query(
         "select session_id, reservation_id from relay_blob_multipart \
-         where completed_at is null and aborted_at is null and expires_at < now()",
+         where completed_at is null and expires_at < now() \
+           and (aborted_at is null \
+                or exists (select 1 from relay_blob_multipart_part p \
+                            where p.session_id = relay_blob_multipart.session_id))",
     )
     .fetch_all(pool)
     .await

@@ -625,6 +625,7 @@ mod tests {
             "codec.mapkeys.order",
             "codec.key.unknown",
             "codec.key.missing",
+            "codec.depth",
             "codec.capability.unknown",
             "codec.hostkind.unknown",
             "codec.availability.unknown",

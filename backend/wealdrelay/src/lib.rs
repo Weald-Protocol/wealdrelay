@@ -404,6 +404,11 @@ pub fn describe_config(resolved: &config::Config, values: &config::Values) -> St
         },
     );
     row(keys::CALLS, resolved.calls_label().to_string());
+    // A downgrade nobody can read back is indistinguishable from an old image and
+    // from an operator's choice, which is the whole of WEALD-L643.
+    if let Some(reason) = resolved.calls_off_reason_label() {
+        row("CALLS_OFF_REASON", reason.to_string());
+    }
     row(
         keys::MAX_CONCURRENT_CALLS,
         match resolved.max_concurrent_calls {

@@ -295,6 +295,14 @@ pub async fn handle(
         Ok(request) => request,
         Err(_) => return Frame::Error(FrameError::new(ErrorCode::MalformedHeader)),
     };
+    // `read_only` refuses every durable write from session state, before any
+    // database round trip (the WEALD-L158 invariant). The frame table cannot do
+    // this for `BLOB` because the payload is opaque there, so it is done here,
+    // above the pool, and only for the requests that write (WEALD-L403). Reads
+    // are what the mode exists to keep serving, so they fall through.
+    if session.refuses_writes() && request.is_write() {
+        return Frame::Error(FrameError::new(ErrorCode::ServiceReadOnly));
+    }
     let Some(pool) = state.database.as_ref().map(|db| db.pool()) else {
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     };
@@ -1125,9 +1133,17 @@ async fn handle_quota(
     if !rate.allow_request(device, state.now_ms()).await {
         return Frame::Error(FrameError::new(ErrorCode::RateLimited).retry_after(60));
     }
-    if let Err(error) = store::ensure_quota_row(pool, &workspace, limit_bytes(state)).await {
-        tracing::warn!(error = %error, "media: could not ensure quota row for a quota read");
-        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    // The row is written before it is read, but not on a quiesced instance: the
+    // `read_only` gate above lets a quota read through because it is a read, and
+    // `ensure_quota_row`'s `INSERT .. ON CONFLICT` is the one write hiding behind
+    // one. Skipped rather than refused, so the mode keeps answering the question it
+    // exists to keep answering; a workspace with no row yet reports `limit_bytes:
+    // None`, exactly as it did before its first upload (WEALD-L453).
+    if !session.refuses_writes() {
+        if let Err(error) = store::ensure_quota_row(pool, &workspace, limit_bytes(state)).await {
+            tracing::warn!(error = %error, "media: could not ensure quota row for a quota read");
+            return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+        }
     }
     match store::usage(pool, &workspace).await {
         Ok(usage) => Frame::Blob {

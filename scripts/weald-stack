@@ -23,6 +23,11 @@
 # "broken". Nothing here pretends a component exists.
 set -euo pipefail
 
+# WEALD-L421: enrol/redeem refuse bootstrap secrets in argv by default. This
+# harness drives a loopback relay on a machine that is already the operator's, so
+# the leak has nobody to leak to and the escape is taken explicitly.
+export WEALD_ALLOW_ARGV_SECRETS=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"

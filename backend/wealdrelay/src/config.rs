@@ -442,6 +442,17 @@ pub struct Config {
     /// the one combination `enforce_calls` permits: a number is required whenever
     /// the feature is on, so nothing downstream has a default to fall back to.
     pub max_concurrent_calls: Option<u64>,
+    /// Why calls are off when nobody asked for them to be.
+    ///
+    /// `enforce_calls` downgrades an inherited `on` to `off` in a deployment that
+    /// declared a second process, so as not to stop a relay from booting over a
+    /// default. That downgrade used to leave no trace, and a client reading
+    /// `version/protocol_unsupported` could not tell an operator's choice from a
+    /// silent downgrade from a cell running an older image (WEALD-L643). The
+    /// reason is reported by `--check-config` and `/readyz` so the three are
+    /// distinguishable from outside the box. `None` whenever the posture is the
+    /// one the environment actually asked for.
+    pub calls_off_reason: Option<&'static str>,
     pub max_connections: Limit,
     /// Upgrade to `AUTH_ACK`, in milliseconds. Never zero: `positive` refuses it,
     /// because a zero handshake deadline is a relay that refuses every client and
@@ -904,6 +915,17 @@ impl Config {
         }
     }
 
+    /// Why the call path is off, when the answer is not "the operator said so".
+    ///
+    /// `None` when calls are on, and when they are off because the environment
+    /// said off. `Some` only for a downgrade this process performed itself.
+    pub fn calls_off_reason_label(&self) -> Option<&'static str> {
+        match self.calls {
+            CallMode::On => None,
+            CallMode::Off => self.calls_off_reason,
+        }
+    }
+
     /// The three rules that make the call configuration answerable rather than
     /// guessed: a ceiling exists exactly when calls do, and calls are refused in a
     /// deployment that has declared a second process.
@@ -946,6 +968,7 @@ impl Config {
             // from an instance whose operator chose it.
             self.calls = CallMode::Off;
             self.max_concurrent_calls = None;
+            self.calls_off_reason = Some("downgraded_multi_process");
         }
         Ok(())
     }
@@ -1114,6 +1137,8 @@ impl Config {
                 &[("on", CallMode::On), ("off", CallMode::Off)],
             )?,
             max_concurrent_calls: positive(values, keys::MAX_CONCURRENT_CALLS)?,
+            // Set by `enforce_calls`, which is the only code that can downgrade.
+            calls_off_reason: None,
             // A number rather than `Unlimited` by default, which is the whole
             // point of closing the gap: the previous behaviour was unlimited and
             // it is the behaviour being replaced. Two hundred and fifty six

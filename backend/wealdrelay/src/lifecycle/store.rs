@@ -56,17 +56,25 @@ pub async fn missing_envelopes(
     group: &[u8],
     wanted: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, StoreError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One statement, not one round trip per hash: a manifest may name up to
+    // `MAX_SNAPSHOTS` (4096) snapshots, and a sequential loop made a single
+    // frame cost thousands of sequential queries against the relay's small
+    // shared pool, which one member could repeat at socket speed (WEALD-L264).
+    let held: Vec<Vec<u8>> = sqlx::query_scalar(
+        "select hash from relay_envelope where group_id = $1 and hash = any($2)",
+    )
+    .bind(group)
+    .bind(wanted)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let held: std::collections::HashSet<&[u8]> = held.iter().map(|h| h.as_slice()).collect();
     let mut missing = Vec::new();
     for hash in wanted {
-        let found: Option<i64> = sqlx::query_scalar(
-            "select 1::bigint from relay_envelope where group_id = $1 and hash = $2",
-        )
-        .bind(group)
-        .bind(hash)
-        .fetch_optional(pool)
-        .await
-        .map_err(db)?;
-        if found.is_none() {
+        if !held.contains(hash.as_slice()) {
             missing.push(hash.clone());
         }
     }

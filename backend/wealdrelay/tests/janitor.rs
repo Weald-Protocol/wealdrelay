@@ -65,6 +65,10 @@ impl Harness {
         self.state.database.as_ref().expect("a database").pool()
     }
 
+    fn blobs(&self) -> &std::path::Path {
+        self._blobs.path()
+    }
+
     fn storage(&self) -> &Store {
         self.state.storage.as_ref().expect("a store")
     }
@@ -845,4 +849,191 @@ async fn the_default_grace_leaves_a_fresh_unclaimed_upload_alone() {
     );
 
     harness.finish().await;
+}
+
+/// WEALD-L404: a pass whose part deletes fail leaves the session stale, so the
+/// next healthy pass is the retry.
+///
+/// The abort used to be recorded first, and `stale_multipart_sessions` demands
+/// `aborted_at is null`, so one storage outage dropped those sessions out of the
+/// only selector that could ever reach their part objects again. The parts live
+/// under the synthetic `_multipart` workspace, which neither gc sweep walks, so
+/// they were orphaned in the bucket permanently while the summary still counted
+/// the pass as a successful abort.
+#[tokio::test]
+async fn a_failed_part_delete_keeps_the_multipart_session_eligible() {
+    let harness = Harness::new("janitor_multipart_retry").await;
+    let pool = harness.pool();
+    let group = make_group_in(
+        &harness.state,
+        "ws-jan9",
+        0x59,
+        &[device_from(0x79)],
+        &[device_from(0x79)],
+    )
+    .await;
+    store::ensure_quota_row(pool, "ws-jan9", None)
+        .await
+        .unwrap();
+
+    let hash = blob_hash(0xb9);
+    let reserved = store::reserve(pool, "ws-jan9", &group, &hash, 4096, false, 900)
+        .await
+        .unwrap();
+    let store::Reserved::Active { reservation_id } = reserved else {
+        panic!("expected a reservation, got {reserved:?}");
+    };
+    let session_id = store::create_multipart(pool, reservation_id, "upload-jan9", 1024, 60)
+        .await
+        .unwrap();
+    store::record_part(pool, session_id, 1, 1024).await.unwrap();
+    let part = wealdrelay::media::part_key_for(session_id, 1);
+    harness.storage().put(&part, &[0x11; 16]).await.unwrap();
+    sqlx::query("update relay_blob_multipart set expires_at = now() - interval '1 hour'")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // The injected outage: the directory holding the part object is made
+    // read-only, so `remove_file` fails the way an unreachable bucket would.
+    let part_directory = find_part_directory(harness.blobs());
+    let original = std::fs::metadata(&part_directory).unwrap().permissions();
+    let mut locked = original.clone();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut locked, 0o555);
+    std::fs::set_permissions(&part_directory, locked).unwrap();
+
+    let summary = wealdrelay::janitor::pass(&harness.state).await;
+
+    assert_eq!(
+        summary.multipart_aborted, 0,
+        "a pass that cleaned nothing does not report an abort"
+    );
+    assert_eq!(
+        store::stale_multipart_sessions(pool).await.unwrap().len(),
+        1,
+        "the session is still a candidate for the next pass"
+    );
+    assert!(
+        harness.storage().get(&part).await.is_ok(),
+        "the part object survived the failed pass"
+    );
+
+    std::fs::set_permissions(&part_directory, original).unwrap();
+
+    let summary = wealdrelay::janitor::pass(&harness.state).await;
+
+    assert_eq!(
+        summary.multipart_aborted, 1,
+        "the healthy pass is the retry"
+    );
+    assert!(
+        harness.storage().get(&part).await.is_err(),
+        "and it removed the part object"
+    );
+    assert!(
+        store::stale_multipart_sessions(pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an aborted session is never a candidate again"
+    );
+
+    harness.finish().await;
+}
+
+/// A session already marked aborted whose part objects survived is still swept.
+///
+/// The client-driven abort path (`media::mod::handle_multipart_abort`) deletes
+/// the part objects with `let _ =` and marks the session aborted regardless, so
+/// one failed delete there left objects nothing could ever reach: the janitor's
+/// selector used to demand `aborted_at is null`. The marker that ends retries is
+/// now the absence of part rows, so this session stays selectable and a healthy
+/// pass removes the object (WEALD-L404).
+#[tokio::test]
+async fn an_aborted_session_with_surviving_parts_is_still_swept() {
+    let harness = Harness::new("janitor_multipart_aborted_orphan").await;
+    let pool = harness.pool();
+    let group = make_group_in(
+        &harness.state,
+        "ws-jan10",
+        0x5a,
+        &[device_from(0x7a)],
+        &[device_from(0x7a)],
+    )
+    .await;
+    store::ensure_quota_row(pool, "ws-jan10", None)
+        .await
+        .unwrap();
+
+    let hash = blob_hash(0xba);
+    let reserved = store::reserve(pool, "ws-jan10", &group, &hash, 4096, false, 900)
+        .await
+        .unwrap();
+    let store::Reserved::Active { reservation_id } = reserved else {
+        panic!("expected a reservation, got {reserved:?}");
+    };
+    let session_id = store::create_multipart(pool, reservation_id, "upload-jan10", 1024, 60)
+        .await
+        .unwrap();
+    store::record_part(pool, session_id, 1, 1024).await.unwrap();
+    let part = wealdrelay::media::part_key_for(session_id, 1);
+    harness.storage().put(&part, &[0x22; 16]).await.unwrap();
+    // Exactly what the client path leaves behind when its delete failed: the row
+    // aborted, the part object still in the bucket.
+    sqlx::query(
+        "update relay_blob_multipart set aborted_at = now(), \
+         expires_at = now() - interval '1 hour'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store::stale_multipart_sessions(pool).await.unwrap().len(),
+        1,
+        "an aborted session with part rows is still a candidate"
+    );
+
+    let _ = wealdrelay::janitor::pass(&harness.state).await;
+
+    assert!(
+        harness.storage().get(&part).await.is_err(),
+        "the orphaned part object was deleted"
+    );
+    assert!(
+        store::recorded_parts(pool, session_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "and the part rows are gone, so it never comes back"
+    );
+    assert!(
+        store::stale_multipart_sessions(pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a swept session leaves the candidate list for good"
+    );
+
+    harness.finish().await;
+}
+
+/// The one directory under the blob root holding a `_multipart` part object.
+fn find_part_directory(root: &std::path::Path) -> std::path::PathBuf {
+    fn walk(at: &std::path::Path, found: &mut Option<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if found.is_none() {
+                *found = Some(path.parent().unwrap().to_path_buf());
+            }
+        }
+    }
+    let mut found = None;
+    walk(root, &mut found);
+    found.expect("a part object was written under the blob root")
 }

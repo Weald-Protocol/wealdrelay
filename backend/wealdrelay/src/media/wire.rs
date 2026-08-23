@@ -514,6 +514,32 @@ const TAG_RETENTION_POSITION: u64 = 12;
 const TAG_QUOTA: u64 = 13;
 
 impl Request {
+    /// Does answering this request write durably, or reserve quota that a write
+    /// will consume?
+    ///
+    /// Read by `media::handle` so a `read_only` instance can refuse the write
+    /// half of `BLOB` from session state, above the pool, while the reads the
+    /// mode exists to keep serving fall through (WEALD-L403).
+    pub fn is_write(&self) -> bool {
+        match self {
+            Self::Get { .. } | Self::List { .. } | Self::RetentionPosition { .. } => false,
+            // A read of the workspace's own totals, so the quiesced instance keeps
+            // answering it. `handle_quota` skips its `ensure_quota_row` write when
+            // the session refuses writes, which is what kept that `INSERT .. ON
+            // CONFLICT` from slipping through this arm (WEALD-L453).
+            Self::Quota { .. } => false,
+            Self::Put { .. }
+            | Self::MultipartPart { .. }
+            | Self::MultipartComplete { .. }
+            | Self::MultipartAbort { .. }
+            | Self::RetentionControl(_)
+            | Self::RetentionManifest(_)
+            | Self::RetentionPolicy(_)
+            | Self::RetentionDestruction(_)
+            | Self::RetentionResolution(_) => true,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let (tag, body) = match self {
             Self::Put {

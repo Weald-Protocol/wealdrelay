@@ -76,6 +76,11 @@ pub enum CborError {
     UnknownKey(u64),
     /// A schema slot the decode required and the map did not carry.
     MissingKey(u64),
+    /// An item nested deeper than any legitimate payload. The structural skip
+    /// used to recurse one stack frame per level with no ceiling, so a member's
+    /// signed body chose its own recursion depth and overflowed the stack
+    /// (WEALD-L257).
+    TooDeep,
 }
 
 impl CborError {
@@ -95,6 +100,7 @@ impl CborError {
             CborError::MapKeysNotAscending { .. } => "codec.mapkeys.order",
             CborError::UnknownKey(_) => "codec.key.unknown",
             CborError::MissingKey(_) => "codec.key.missing",
+            CborError::TooDeep => "codec.depth",
         }
     }
 }
@@ -132,6 +138,11 @@ impl fmt::Display for CborError {
                 write!(f, "CBOR map carries key {k}, which is outside the schema")
             }
             CborError::MissingKey(k) => write!(f, "CBOR map is missing required key {k}"),
+            CborError::TooDeep => write!(
+                f,
+                "CBOR item nests deeper than the {} levels this codec walks",
+                Reader::MAX_SKIP_DEPTH
+            ),
         }
     }
 }
@@ -340,7 +351,26 @@ impl<'a> Reader<'a> {
     }
 
     /// Walk one whole item of any type this subset carries.
+    ///
+    /// The depth budget is the whole point (WEALD-L257): every array and map
+    /// level used to cost one stack frame with no ceiling, and one byte of input
+    /// (`0x81`, a single-item array) bought one level, so a body well inside the
+    /// 1 MiB frame ceiling could exhaust any stack this process runs on. The cap
+    /// is far above anything the agent schemas produce — a card or invoke is one
+    /// map of scalars, byte strings and one shallow list — and far below what a
+    /// stack survives. It matches `CBOR.Reader.maxSkipDepth` in Swift, because
+    /// the reason vocabulary is the cross-language contract and both codecs must
+    /// refuse the same bytes with the same word.
+    pub const MAX_SKIP_DEPTH: usize = 32;
+
     fn skip_item(&mut self) -> Result<()> {
+        self.skip_item_bounded(0)
+    }
+
+    fn skip_item_bounded(&mut self, depth: usize) -> Result<()> {
+        if depth > Self::MAX_SKIP_DEPTH {
+            return Err(CborError::TooDeep);
+        }
         let (major, argument, next) = self.head()?;
         match major {
             0 => {
@@ -355,14 +385,14 @@ impl<'a> Reader<'a> {
             4 => {
                 self.offset = next;
                 for _ in 0..argument {
-                    self.skip_item()?;
+                    self.skip_item_bounded(depth + 1)?;
                 }
             }
             5 => {
                 self.offset = next;
                 for _ in 0..argument {
-                    self.skip_item()?;
-                    self.skip_item()?;
+                    self.skip_item_bounded(depth + 1)?;
+                    self.skip_item_bounded(depth + 1)?;
                 }
             }
             7 => {
@@ -644,6 +674,38 @@ mod tests {
         let mut r = Reader::new(&nested);
         assert_eq!(r.raw_value().unwrap(), nested);
         r.require_end().unwrap();
+    }
+
+    /// A depth bomb under a valid schema key is refused with the depth reason
+    /// before any type check runs, at a nesting no stack could have survived
+    /// (WEALD-L257). One byte per level means 100_000 levels fits inside the
+    /// relay's 1 MiB frame ceiling, which is exactly how a member's signed body
+    /// used to choose its own recursion depth.
+    #[test]
+    fn a_depth_bomb_is_refused_not_walked() {
+        let levels = 100_000;
+        let mut bomb = Vec::with_capacity(levels + 1);
+        bomb.extend(std::iter::repeat_n(0x81, levels - 1));
+        bomb.push(0x80);
+        let encoded = map(&[(11, bomb)]);
+        let mut reader = Reader::new(&encoded);
+        assert_eq!(
+            reader.schema_map(&[11]).unwrap_err().reason(),
+            "codec.depth"
+        );
+    }
+
+    /// The honest boundary: nesting at the cap decodes. A cap that refused
+    /// legitimate structure would be its own outage.
+    #[test]
+    fn nesting_at_the_cap_still_decodes() {
+        let mut honest = array(&[uint(1)]);
+        for _ in 1..Reader::MAX_SKIP_DEPTH {
+            honest = array(&[honest]);
+        }
+        let encoded = map(&[(11, honest)]);
+        let slots = Reader::new(&encoded).schema_map(&[11]).unwrap();
+        assert_eq!(slots.len(), 1);
     }
 
     #[test]

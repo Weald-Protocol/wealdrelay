@@ -47,7 +47,7 @@ pub const DETAIL_BYTE_LIMIT: usize = 512;
 /// to *interpret* a reason, only to refuse one that is not in the set, and a
 /// twenty-six case enum whose only operation is set membership would be twenty-six
 /// places for the set to drift from the Swift copy.
-pub const LIFECYCLE_REASONS: [&str; 26] = [
+pub const LIFECYCLE_REASONS: [&str; 39] = [
     "version.unsupported",
     "profile.stale",
     "scope.notmember",
@@ -74,6 +74,19 @@ pub const LIFECYCLE_REASONS: [&str; 26] = [
     "provider.model",
     "provider.transport",
     "provider.malformed",
+    "repo.unbound",
+    "branch.protected",
+    "config.untrusted",
+    "egress.refused",
+    "budget.reached",
+    "source.unsupported",
+    "patch.invalid",
+    "base.stale",
+    "tests.failed",
+    "github.auth",
+    "github.ratelimited",
+    "github.transport",
+    "runner.unavailable",
 ];
 
 pub mod key {
@@ -86,8 +99,9 @@ pub mod key {
     pub const DETAIL: u64 = 7;
     pub const RESULT_MESSAGE_ID: u64 = 8;
     pub const SIG: u64 = 9;
+    pub const PHASE: u64 = 10;
 
-    pub const SCHEMA: [u64; 9] = [
+    pub const SCHEMA: [u64; 10] = [
         V,
         INVOCATION_ID,
         STATE,
@@ -97,7 +111,41 @@ pub mod key {
         DETAIL,
         RESULT_MESSAGE_ID,
         SIG,
+        PHASE,
     ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Claiming,
+    Checkout,
+    Planning,
+    Editing,
+    Testing,
+    Pushing,
+}
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claiming => "claiming",
+            Self::Checkout => "checkout",
+            Self::Planning => "planning",
+            Self::Editing => "editing",
+            Self::Testing => "testing",
+            Self::Pushing => "pushing",
+        }
+    }
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "claiming" => Some(Self::Claiming),
+            "checkout" => Some(Self::Checkout),
+            "planning" => Some(Self::Planning),
+            "editing" => Some(Self::Editing),
+            "testing" => Some(Self::Testing),
+            "pushing" => Some(Self::Pushing),
+            _ => None,
+        }
+    }
 }
 
 pub mod lease_key {
@@ -183,6 +231,7 @@ pub struct AgentLifecycle {
     pub reason: Option<String>,
     pub detail: Option<String>,
     pub result_message_id: Option<Vec<u8>>,
+    pub phase: Option<Phase>,
     pub sig: Vec<u8>,
 }
 
@@ -211,6 +260,11 @@ pub enum LifecycleError {
         present: bool,
     },
     DetailTooLong(usize),
+    UnknownPhase(String),
+    PhaseMismatch {
+        state: State,
+        present: bool,
+    },
     /// A lease whose `expires_at` is not after its `acquired_at`.
     EmptyWindow {
         acquired_at: u64,
@@ -234,6 +288,8 @@ impl LifecycleError {
             LifecycleError::ReasonMismatch { .. } => "codec.reason.mismatch",
             LifecycleError::ResultMismatch { .. } => "codec.result.mismatch",
             LifecycleError::DetailTooLong(_) => "codec.detail.toolong",
+            LifecycleError::UnknownPhase(_) => "codec.phase.unknown",
+            LifecycleError::PhaseMismatch { .. } => "codec.phase.mismatch",
             LifecycleError::EmptyWindow { .. } => "codec.lease.window",
             LifecycleError::SignatureInvalid => "codec.signature.invalid",
         }
@@ -272,6 +328,10 @@ impl std::fmt::Display for LifecycleError {
                     f,
                     "detail is {bytes} bytes and the bound is {DETAIL_BYTE_LIMIT}"
                 )
+            }
+            LifecycleError::UnknownPhase(raw) => write!(f, "'{raw}' is not a lifecycle phase"),
+            LifecycleError::PhaseMismatch { state, .. } => {
+                write!(f, "{state} carries phase and only running may")
             }
             LifecycleError::EmptyWindow {
                 acquired_at,
@@ -323,6 +383,9 @@ fn body_pairs(record: &AgentLifecycle) -> Vec<(u64, Vec<u8>)> {
     if let Some(result) = &record.result_message_id {
         pairs.push((key::RESULT_MESSAGE_ID, cbor::bytes(result)));
     }
+    if let Some(phase) = record.phase {
+        pairs.push((key::PHASE, cbor::text(phase.as_str())));
+    }
     pairs
 }
 
@@ -348,6 +411,49 @@ pub fn decode(data: &[u8]) -> Result<AgentLifecycle> {
         return Err(LifecycleError::ReasonMismatch {
             state,
             present: reason.is_some(),
+        });
+    }
+    if let Some(raw) = &reason {
+        let legal = if raw == "repo.unbound" {
+            state == State::Declined
+        } else if matches!(
+            raw.as_str(),
+            "branch.protected"
+                | "config.untrusted"
+                | "egress.refused"
+                | "budget.reached"
+                | "source.unsupported"
+                | "patch.invalid"
+                | "base.stale"
+                | "tests.failed"
+                | "github.auth"
+                | "github.ratelimited"
+                | "github.transport"
+                | "runner.unavailable"
+        ) {
+            state == State::Failed
+        } else {
+            state.requires_reason()
+        };
+        if !legal {
+            return Err(LifecycleError::ReasonMismatch {
+                state,
+                present: true,
+            });
+        }
+    }
+
+    let phase = match cbor::optional_slot(&slots, key::PHASE) {
+        Some(_) => {
+            let raw = cbor::in_slot(&slots, key::PHASE, |r| r.text())?;
+            Some(Phase::parse(&raw).ok_or(LifecycleError::UnknownPhase(raw))?)
+        }
+        None => None,
+    };
+    if phase.is_some() && state != State::Running {
+        return Err(LifecycleError::PhaseMismatch {
+            state,
+            present: true,
         });
     }
 
@@ -386,6 +492,7 @@ pub fn decode(data: &[u8]) -> Result<AgentLifecycle> {
         reason,
         detail,
         result_message_id,
+        phase,
         sig: cbor::in_slot(&slots, key::SIG, |r| r.bytes())?,
     })
 }
@@ -508,6 +615,7 @@ mod tests {
             } else {
                 None
             },
+            phase: None,
             sig: vec![],
         }
     }
@@ -725,7 +833,7 @@ mod tests {
         assert_eq!(decode(&trailing).unwrap_err().reason(), "codec.trailing");
 
         let mut extra = slots_of(&encoded);
-        extra.push((10, cbor::uint(1)));
+        extra.push((11, cbor::uint(1)));
         assert_eq!(
             decode(&cbor::map(&extra)).unwrap_err().reason(),
             "codec.key.unknown"
@@ -895,14 +1003,15 @@ mod tests {
 
     /// The vocabulary this crate refuses against is the one Swift declares.
     ///
-    /// Twenty-six reasons, and the count is the guard: a reason added on one side and
+    /// Thirty-nine reasons, and the count is the guard: a reason added on one side and
     /// not the other would let a record decode in one language and not in the other,
     /// which is the divergence the whole corpus exists to prevent.
     #[test]
     fn agent_lifecycle_reason_vocabulary_is_closed_and_complete() {
-        assert_eq!(LIFECYCLE_REASONS.len(), 26);
+        assert_eq!(LIFECYCLE_REASONS.len(), 39);
         assert!(LIFECYCLE_REASONS.contains(&"deadline.passed"));
         assert!(LIFECYCLE_REASONS.contains(&"provider.malformed"));
+        assert!(LIFECYCLE_REASONS.contains(&"runner.unavailable"));
         assert!(!LIFECYCLE_REASONS.iter().any(|r| r.starts_with("codec.")));
         let mut sorted = LIFECYCLE_REASONS.to_vec();
         sorted.sort_unstable();

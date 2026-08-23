@@ -122,6 +122,11 @@ pub struct Readiness {
     /// that this relay does not carry them, rather than reading their operator's
     /// environment file or concluding the network is broken.
     pub calls: &'static str,
+    /// Why calls are off when this process turned them off itself, rather than
+    /// the environment asking for it. Absent whenever the posture is the one that
+    /// was configured. `specs/backend/relay/calls.md`, WEALD-L643.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calls_off_reason: Option<&'static str>,
     /// The four operator counters the call path produces. Capacity, never
     /// identity: not one of them is per call, per group or per principal, because
     /// a labelled count here would be exactly the metadata `crate::hub` refuses to
@@ -531,6 +536,7 @@ impl RelayState {
             release,
             push: self.push.health().as_str(),
             calls: self.config.calls_label(),
+            calls_off_reason: self.config.calls_off_reason_label(),
             call_stats: CallStats {
                 open: self.calls.open_calls().await as u64,
                 media_shed: self.calls.shed(),

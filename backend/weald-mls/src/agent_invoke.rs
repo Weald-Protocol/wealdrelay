@@ -75,9 +75,10 @@ pub mod key {
     pub const CAPABILITY: u64 = 11;
     pub const DEADLINE: u64 = 12;
     pub const SIG: u64 = 13;
+    pub const REPO_REF: u64 = 14;
 
     /// The decoder's allow-list. Every key, and nothing else.
-    pub const SCHEMA: [u64; 13] = [
+    pub const SCHEMA: [u64; 14] = [
         V,
         INVOCATION_ID,
         IDEMPOTENCY_KEY,
@@ -91,6 +92,7 @@ pub mod key {
         CAPABILITY,
         DEADLINE,
         SIG,
+        REPO_REF,
     ];
 }
 
@@ -105,6 +107,7 @@ pub struct AgentInvoke {
     pub scope: Vec<u8>,
     pub thread_ref: Option<Vec<u8>>,
     pub ticket_ref: Option<String>,
+    pub repo_ref: Option<String>,
     pub requester: Vec<u8>,
     pub capability: Capability,
     pub deadline: u64,
@@ -197,6 +200,9 @@ fn body_pairs(invoke: &AgentInvoke) -> Vec<(u64, Vec<u8>)> {
     if let Some(ticket_ref) = &invoke.ticket_ref {
         pairs.push((key::TICKET_REF, cbor::text(ticket_ref)));
     }
+    if let Some(repo_ref) = &invoke.repo_ref {
+        pairs.push((key::REPO_REF, cbor::text(repo_ref)));
+    }
     pairs.push((key::REQUESTER, cbor::bytes(&invoke.requester)));
     pairs.push((key::CAPABILITY, cbor::text(invoke.capability.as_str())));
     pairs.push((key::DEADLINE, cbor::uint(invoke.deadline)));
@@ -225,6 +231,10 @@ pub fn decode(data: &[u8]) -> Result<AgentInvoke> {
         Some(_) => Some(cbor::in_slot(&slots, key::TICKET_REF, |r| r.text())?),
         None => None,
     };
+    let repo_ref = match cbor::optional_slot(&slots, key::REPO_REF) {
+        Some(_) => Some(cbor::in_slot(&slots, key::REPO_REF, |r| r.text())?),
+        None => None,
+    };
 
     Ok(AgentInvoke {
         v: cbor::in_slot(&slots, key::V, |r| r.uint())?,
@@ -246,6 +256,7 @@ pub fn decode(data: &[u8]) -> Result<AgentInvoke> {
         scope: cbor::in_slot(&slots, key::SCOPE, |r| r.bytes_exact(SCOPE_WIDTH))?,
         thread_ref,
         ticket_ref,
+        repo_ref,
         requester: cbor::in_slot(&slots, key::REQUESTER, |r| r.bytes())?,
         capability,
         deadline: cbor::in_slot(&slots, key::DEADLINE, |r| r.uint())?,
@@ -362,6 +373,7 @@ mod tests {
             scope: scope_bytes(),
             thread_ref: None,
             ticket_ref: None,
+            repo_ref: None,
             requester: requester_key().verifying_key().to_bytes().to_vec(),
             capability: Capability::ChatReply,
             deadline: 1_760_000_300,
@@ -470,7 +482,7 @@ mod tests {
     #[test]
     fn agent_invoke_refuses_an_unknown_key() {
         let mut slots = slots_of(&encode(&invoke()));
-        slots.push((14, cbor::text("a system prompt")));
+        slots.push((15, cbor::text("a system prompt")));
         assert_eq!(
             decode(&relay(slots)).unwrap_err().reason(),
             "codec.key.unknown"

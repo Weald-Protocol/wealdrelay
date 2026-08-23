@@ -95,6 +95,18 @@ pub const LIVE_FRAMES_PER_MINUTE: u32 = 900;
 /// startup burst rather than a stream.
 pub const KEYS_FRAMES_PER_MINUTE: u32 = 30;
 
+/// `WAKE` frames one connection may send per minute.
+///
+/// Registering, clearing and querying a push handle are all startup-shaped acts,
+/// not a stream: a device mints a handle, states it once, and states it again only
+/// when the ringer re-mints. Every form defers to `Work::WakeRegistration`, which
+/// spends two Postgres round trips (the workspace salt, then the row), so an
+/// unbudgeted socket drove the shared pool at socket speed and starved every
+/// co-member and co-tenant frame behind it. Budgeted separately from `KEYS` so a
+/// roster prefetch and a handle registration cannot spend each other's allowance
+/// (WEALD-L452).
+pub const WAKE_FRAMES_PER_MINUTE: u32 = 30;
+
 /// `JOIN` frames one connection may send per minute.
 ///
 /// The only pre-authentication frame, so the only budget that bounds a peer which
@@ -161,6 +173,25 @@ pub const SUB_FRAMES_PER_MINUTE: u32 = 300;
 /// above a request-and-response client that holds one round outstanding per group
 /// and far below a peer beating on a timer.
 pub const RECON_FRAMES_PER_MINUTE: u32 = 600;
+
+/// `BLOB` frames per minute for one connection.
+///
+/// The media request behind the frame runs `authorize_group`, `ensure_quota_row`
+/// and, for a put, a transaction holding `select ... for update` on the
+/// workspace's single quota row. The per-device media rate limiter is consulted
+/// only by some requests and only after a query has already run, so an
+/// unbudgeted `BLOB` is one admitted device serialising every media operation in
+/// its workspace at socket speed (WEALD-L403).
+pub const BLOB_FRAMES_PER_MINUTE: u32 = 120;
+
+/// `DROP` frames per minute for one connection.
+///
+/// A compaction instruction reads the retention chain and checks a manifest
+/// against the group's envelopes before it is ever authorized, so an unbudgeted
+/// `DROP` is one member driving that fanout at socket speed against the relay's
+/// small shared pool (WEALD-L264). Compaction is a housekeeping instruction, so
+/// the allowance matches `ACCESS` and `KEYS` rather than the streaming frames.
+pub const DROP_FRAMES_PER_MINUTE: u32 = 30;
 
 /// The window every per-connection frame budget is counted over.
 pub const FRAME_BUDGET_WINDOW_MS: u64 = 60_000;
@@ -388,6 +419,9 @@ pub struct Session {
     live: LiveMode,
     live_budget: FrameBudget,
     keys_budget: FrameBudget,
+    /// `WAKE` frames per minute. Every form of the frame is charged, because
+    /// every form costs the same two Postgres round trips (WEALD-L452).
+    wake_budget: FrameBudget,
     /// `HANDSHAKE` frames per minute, budgeted separately from `SEND`'s device
     /// allowance because the two share no counter: `send_budget::charge` runs in
     /// the `Work::Accept` arm only, so nothing bounded this path at all.
@@ -407,6 +441,12 @@ pub struct Session {
     /// lets one admitted device starve every other member of the workspace.
     sub_budget: FrameBudget,
     recon_budget: FrameBudget,
+    /// `BLOB` frames per minute: the media request behind the frame is durable
+    /// database work that no other gate paces (WEALD-L403).
+    blob_budget: FrameBudget,
+    /// `DROP` frames per minute: a compaction instruction costs a chain read and
+    /// a manifest check before it is authorized (WEALD-L264).
+    drop_budget: FrameBudget,
     /// `JOIN` frames per minute. The only budget charged before authentication,
     /// and the only one an unauthenticated peer can spend.
     join_budget: FrameBudget,
@@ -447,12 +487,15 @@ impl Session {
             live: config.live,
             live_budget: FrameBudget::default(),
             keys_budget: FrameBudget::default(),
+            wake_budget: FrameBudget::default(),
             handshake_budget: FrameBudget::default(),
             access_budget: FrameBudget::default(),
             wrap_budget: FrameBudget::default(),
             invite_budget: FrameBudget::default(),
             sub_budget: FrameBudget::default(),
             recon_budget: FrameBudget::default(),
+            blob_budget: FrameBudget::default(),
+            drop_budget: FrameBudget::default(),
             join_budget: FrameBudget::default(),
             calls: config.calls,
             call_budget: FrameBudget::default(),
@@ -531,7 +574,11 @@ impl Session {
 
     /// The only workspace this ready session may operate in.
     /// True while the operator has quiesced this instance for writes.
-    fn refuses_writes(&self) -> bool {
+    ///
+    /// Public because the write half of `BLOB` is only knowable after the media
+    /// payload is decoded, which happens in `media::handle` rather than in the
+    /// frame table (WEALD-L403).
+    pub fn refuses_writes(&self) -> bool {
         matches!(self.write_mode, WriteMode::ReadOnly)
     }
 
@@ -925,6 +972,20 @@ impl Session {
                         ))]);
                     }
                 }
+                // Charged after the permanently-wrong refusals above and before the
+                // deferral, because the deferral is what costs the pool: the salt
+                // read and the row write are two round trips against the shared
+                // eight connection pool per frame. `Clear` and `Query` are charged
+                // too: they are the same two-round-trip shape and were the last
+                // mutating and pool-touching forms with no ceiling at all
+                // (WEALD-L452).
+                if !self.wake_budget.charge(now_ms, WAKE_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(WAKE_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::WakeRegistration { body })
             }
             // `Ready` only, like every other group-addressed frame. A call frame
@@ -1058,12 +1119,40 @@ impl Session {
                 })
             }
             (State::Ready, Frame::Blob { payload }) => {
+                // Charged before the work is deferred, like every sibling arm.
+                // The payload is opaque here, so the write half of `read_only` is
+                // answered inside `media::handle` before any pool is touched;
+                // what this arm owes is the rate bound (WEALD-L403).
+                if !self.blob_budget.charge(now_ms, BLOB_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(BLOB_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::BlobTicket { payload })
             }
             // Ready only, like every other group-addressed frame. A compaction
             // instruction names a group, and the group has to be checked against a
             // workspace this session has actually authenticated into.
             (State::Ready, Frame::Drop { payload }) => {
+                // A compaction instruction deletes envelopes: a durable write
+                // (WEALD-L158).
+                if let Some(refusal) = self.read_only_refusal() {
+                    return refusal;
+                }
+                // Charged before the work is deferred, like every sibling arm: the
+                // instruction reads the retention chain and checks the manifest
+                // against the group's envelopes before the signature is even
+                // authorized, so an unbudgeted `DROP` is one member driving that
+                // fanout at socket speed (WEALD-L264).
+                if !self.drop_budget.charge(now_ms, DROP_FRAMES_PER_MINUTE) {
+                    return Reaction::Reply(vec![Frame::Error(
+                        FrameError::new(ErrorCode::RateLimited)
+                            .retry_after(60)
+                            .detail(u64::from(DROP_FRAMES_PER_MINUTE).to_be_bytes()),
+                    )]);
+                }
                 Reaction::Defer(Work::DropBefore { payload })
             }
             // `BYE` is accepted in any live state: a client that changes its mind

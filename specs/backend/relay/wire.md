@@ -343,11 +343,17 @@ traffic is the `LIVE` frame, where the routing and shedding decisions are visibl
 and the content is not. The kind number stays allocated forever, unused, pointing
 at `specs/backend/relay/presence.md`.
 
-Two numbering spaces exist and a reader should be warned: this table is the
-protocol's kind space, and `EnvelopeKind` in `Sources/Sync/EnvelopePayload.swift`
-is the client's, with `chatEntry = 1` against `0x0010 chat.message` here. Neither
-is renumbered, because both are on a wire and renumbering either would silently
-reinterpret every record already written under the old value.
+Two numbering spaces existed and a reader should know which one is on the wire:
+this table's protocol column, and `EnvelopeKind` in
+`Sources/Sync/EnvelopePayload.swift`, the client's. Neither is renumbered
+retroactively, because both have been written to live logs and renumbering
+either would silently reinterpret every record already stored under the old
+value. The shipped client is the incumbent writer, so the client's number space
+(`EnvelopeKind.rawValue`) is what every current writer puts in the payload
+wrapper's kind slot: the agent gateway (`backend/weald-agent-gateway`) writes
+exactly these values and maps this table's spellings (0x0010, 0x0090-0x0093) to
+the same canonical kinds on read, so a record sealed by an implementation that
+followed the table still opens as its kind rather than being dropped.
 
 The map, which was warned about for six steps and never written until step 31:
 
@@ -941,6 +947,10 @@ off is not the default.
 | `HANDSHAKE` frames per connection per minute | 120 | The most expensive durable write in the protocol per frame, and the one nothing bounded: the arm deferred straight to the publish work, and the `SEND` device allowance is charged in the accept path only, so it never applied here. Each frame takes the group row for update, appends up to 512 KiB to a log nothing compacts and no retention sweep touches, and fans the whole message out to every subscriber, so an unbudgeted flood serialises every real committer in the group behind one row lock while growing a table the relay has no operation to shrink. A real client publishes one message per commit it makes, and bursts only when a bulk membership change commits once per group. Refused with `quota/rate_limited` before the work is deferred, so a refused frame takes no lock and writes no row, on a socket that stays up. |
 | `SUB` frames per connection per minute | 300 | Above the 256 groups a connection may hold, deliberately and with room to spare, because a cold start subscribes every group at once and a ceiling at the group limit would present as a network fault on the largest legitimate workspace. What it refuses is the other shape: a loop re-subscribing one group, where every frame costs an authorization query plus a replay of that group's log from `from_seq`. Refused with `quota/rate_limited` on a socket that stays up, before the subscription is recorded, so a refused frame reaches no database and leaves no session state. |
 | `RECON` frames per connection per minute | 600 | The most expensive frame in the protocol per byte, so the one an unbudgeted loop amplifies furthest: each round costs an authorization query, an item scan over the reconciliation window, an envelope read and a span reopen. It cannot be as tight as `LIVE` because reconciliation is iterative by design and a client catching up a large group drives many rounds, each cut to what its outbound queue will take. Ten a second is far above a client that holds one round outstanding per group and waits for the answer, and far below a peer beating on a timer. |
+| `ACCESS` frames per connection per minute | 30 | An access-set rotation hashes every principal and reads the prior set before the signature is looked at, so an unbudgeted frame is one admitted device pipelining maximal rosters at line rate. A real client rotates on a membership change. |
+| `WRAP` frames per connection per minute | 30 | A recovery wrap inserts one row of up to 256 KiB per fresh tag, into a table no janitor sweep shrinks, so it was the one durable write with no budget and no ceiling: one admitted device or leaked credential could grow the workspace's Postgres until the disk filled. A real client publishes one wrap per recovery key. Charged before the work is deferred, so a refused frame takes no row lock and writes no row, and refused with `quota/rate_limited` on a socket that stays up (WEALD-L253). |
+| `BLOB` frames per connection per minute | 120 | Every media request costs an authorization query, a quota row read or insert, and, for a put, a transaction holding `select ... for update` on the workspace's single quota row. The per-device media rate limiter is consulted only by some requests and only after a query has already run, so the frame budget is what bounds the rest. The write half is refused from session state in `read_only` before any pool is touched; reads still serve (WEALD-L403). |
+| `DROP` frames per connection per minute | 30 | A compaction instruction reads the retention chain and checks a manifest naming up to 4096 snapshots against the group's envelopes before it is authorized, so an unbudgeted frame let one member drive that fanout at socket speed against the relay's small shared pool. The manifest check is one statement, not one round trip per hash. Compaction is housekeeping, so the allowance matches `ACCESS` (WEALD-L264). |
 | `MEDIA` `ct` | 1500 bytes | One Ethernet MTU, which is four hundred times a 20 ms AAC-ELD frame. It bounds an attacker rather than fitting a codec. |
 | `MEDIA` frames per stream per second | 60 | Against a codec producing fifty, so a client that jitters a frame across a window boundary is not punished and one at ten times the rate is. Refused with `quota/group_ingress_limited`, and the refusal is reported at most once a second because answering every frame of a flood is an amplifier (`calls.md`). |
 | `MEDIA` bytes per connection per minute | 1 MiB | A 24 kbps stream is about 190 KiB a minute including overhead, so this admits one stream comfortably and refuses a connection pushing a file down the media path. |

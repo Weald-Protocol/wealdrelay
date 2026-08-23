@@ -171,22 +171,70 @@ pub async fn pass_with(state: &RelayState, list_storage: bool) -> Pass {
         match crate::media::store::stale_multipart_sessions(pool).await {
             Ok(sessions) => {
                 for (session_id, _reservation_id) in sessions {
+                    // The part objects are the one thing the unclaimed pass cannot
+                    // reach: parts live under the synthetic `_multipart` workspace
+                    // (`media::part_key`) and that pass walks real workspaces, so
+                    // without this they outlive every collector.
+                    //
+                    // So the deletes come first and the abort is what records that
+                    // they landed. Marking the row aborted before the deletes
+                    // dropped the session out of `stale_multipart_sessions`
+                    // forever (its selector demands `aborted_at is null`), so one
+                    // storage outage orphaned those part objects permanently
+                    // rather than leaving the next interval to retry them.
+                    let parts = match crate::media::store::recorded_parts(pool, session_id).await {
+                        Ok(parts) => parts,
+                        Err(error) => {
+                            tracing::warn!(
+                                %session_id,
+                                error = %error,
+                                "could not list the recorded parts of a stale multipart session"
+                            );
+                            continue;
+                        }
+                    };
+                    let mut every_part_gone = true;
+                    for part_number in parts {
+                        if let Err(error) = storage
+                            .delete(&crate::media::part_key_for(session_id, part_number))
+                            .await
+                        {
+                            every_part_gone = false;
+                            tracing::warn!(
+                                %session_id,
+                                part_number,
+                                error = %error,
+                                "could not delete a stale multipart part object"
+                            );
+                        }
+                    }
+                    if !every_part_gone {
+                        // Left un-aborted and with its part rows intact on
+                        // purpose: the session stays stale, so the next pass is
+                        // the retry, and a pass that cleaned nothing does not
+                        // report a success-shaped count.
+                        continue;
+                    }
+                    // Every object confirmed gone, so the part rows can go, and
+                    // it is their absence that finally ends the retries: an
+                    // aborted session with part rows is still selectable, which
+                    // is what makes the client-driven abort path's swallowed
+                    // delete failures reachable by a later pass too.
+                    if let Err(error) =
+                        crate::media::store::forget_recorded_parts(pool, session_id).await
+                    {
+                        tracing::warn!(
+                            %session_id,
+                            error = %error,
+                            "could not forget the recorded parts of a swept multipart session"
+                        );
+                        continue;
+                    }
                     if crate::media::store::abort_multipart(pool, session_id)
                         .await
                         .is_ok()
                     {
                         summary.multipart_aborted += 1;
-                    }
-                    // The part objects are the one thing the unclaimed pass cannot
-                    // reach: parts live under the synthetic `_multipart` workspace
-                    // (`media::part_key`) and that pass walks real workspaces, so
-                    // without this they outlive every collector.
-                    if let Ok(parts) = crate::media::store::recorded_parts(pool, session_id).await {
-                        for part_number in parts {
-                            let _ = storage
-                                .delete(&crate::media::part_key_for(session_id, part_number))
-                                .await;
-                        }
                     }
                 }
             }

@@ -1190,6 +1190,29 @@ fn a_multi_instance_deployment_boots_with_calls_off_rather_than_refusing_the_def
     .expect("an inherited default never refuses a boot");
     assert_eq!(config.calls, CallMode::Off);
     assert_eq!(config.max_concurrent_calls, None);
+    // WEALD-L643: the downgrade must be readable from outside the box, or a client
+    // holding `version/protocol_unsupported` cannot tell it from an operator's
+    // choice or from a cell running an image that predates calls.
+    assert_eq!(
+        config.calls_off_reason_label(),
+        Some("downgraded_multi_process")
+    );
+}
+
+#[test]
+fn calls_off_reports_no_reason_when_the_environment_asked_for_off() {
+    // A reason on a posture nobody downgraded would send an operator hunting for
+    // a fault that is a setting.
+    let chosen = resolve_with(&[
+        (keys::REDIS_URL, "redis://localhost:6379"),
+        (keys::LIVE, "off"),
+        (keys::CALLS, "off"),
+    ])
+    .expect("calls off resolves alongside a second instance");
+    assert_eq!(chosen.calls_off_reason_label(), None);
+    let on = Config::resolve(&Values::from_pairs(minimal())).expect("minimal config resolves");
+    assert_eq!(on.calls, CallMode::On);
+    assert_eq!(on.calls_off_reason_label(), None);
 }
 
 // MARK: The connection cap
