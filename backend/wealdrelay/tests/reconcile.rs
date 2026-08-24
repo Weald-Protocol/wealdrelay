@@ -388,8 +388,12 @@ async fn a_subscription_larger_than_the_send_queue_can_finish_by_reconciliation(
     assert_eq!(head, 257);
     let mut local = Local::default();
     for _ in 0..wealdrelay::session::SEND_QUEUE_BOUND - 1 {
-        let Frame::Push { envelope } = reader.recv_frame().await else {
-            panic!("expected the bounded cursor backfill");
+        let frame = reader.recv_frame().await;
+        let Frame::Push { envelope } = frame else {
+            // Named, because a bare "expected a push" told a CI failure nothing:
+            // the run that failed had already delivered part of the backfill, and
+            // which frame arrived instead is the whole diagnosis.
+            panic!("expected the bounded cursor backfill, got {frame:?}");
         };
         local.apply(Envelope::decode(&envelope).unwrap()).unwrap();
     }

@@ -31,14 +31,14 @@ Every path below starts from an artifact we published. This one does not, and it
 is the one that makes the others checkable: a relay you built from source is a
 relay whose behaviour you can read.
 
-**Status, and read this before you follow any command here.** No relay release
-has been published yet. Until the first one is, the repository below is private,
-the Homebrew tap does not exist, `get.weald.team` does not resolve, and the
-image tag in `compose/docker-compose.yml` cannot be pulled. The configuration,
-operations and networking halves of this guide are accurate and stable; the
-acquire-and-verify half describes artifacts that are not out yet. This notice
-comes down with the first published, signed, digest-pinned release, and not
-before.
+**Status, 2026-08-23, and read this before you follow any command here.**
+Releases are published. `wealdrelay-v0.1.28` is the newest, its image is
+`ghcr.io/weald-protocol/wealdrelay@sha256:956c288b...`, and that is what the
+compose bundle pulls (`specs/backend/build/container-image.md`). Two things named
+below are still not out: the Homebrew tap, whose formula is a checked-in
+placeholder, and `get.weald.team`, which does not resolve yet, so
+`deploy/install.sh` has to be run from a checkout or from the release asset URL it
+prints. Everything else on this page works today.
 
 ```sh
 git clone https://github.com/Weald-Protocol/wealdrelay.git

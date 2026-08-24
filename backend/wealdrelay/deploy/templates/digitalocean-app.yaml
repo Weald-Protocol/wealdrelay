@@ -20,10 +20,12 @@ services:
     http_port: 8443
     image:
       registry_type: GHCR
-      registry: hunterh37
-      repository: weald-relay
-      # Pinned to a digest at release time.
-      tag: latest
+      registry: weald-protocol
+      repository: wealdrelay
+      # A release tag, never a moving one: no `:latest` is ever published
+      # (specs/backend/build/container-image.md). Replace with the tag you
+      # verified, and prefer a digest where the provider accepts one.
+      tag: wealdrelay-v0.1.28
     health_check:
       http_path: /healthz
       initial_delay_seconds: 10
