@@ -1026,6 +1026,10 @@ pub fn private_router(state: Arc<RelayState>) -> Router {
                 get(version).layer(axum::Extension(OperatorToken(token.clone()))),
             )
             .route(
+                "/metrics",
+                get(metrics).layer(axum::Extension(OperatorToken(token.clone()))),
+            )
+            .route(
                 "/gc/restore-marker",
                 post(set_restore_marker)
                     .delete(clear_restore_marker)
@@ -1108,6 +1112,38 @@ async fn admitted(
         )
             .into_response(),
     }
+}
+
+/// `GET /metrics`: the readiness snapshot as Prometheus text.
+///
+/// Behind the operator bearer and on the private listener only, for the reason
+/// written on `private_router` and repeated in `crate::metrics`: refusal counters
+/// and pool saturation are exactly what somebody probing for a relay under load
+/// would want, and a network boundary is not an authentication boundary.
+///
+/// It answers 200 whether or not the relay is ready, unlike `/readyz`. A scrape
+/// is not a health check: a 503 here would make a scraper drop the sample, and
+/// the sample from an unready relay is the one an incident is reconstructed from.
+/// Readiness is carried as `weald_relay_ready` instead, so it can be alerted on
+/// like any other series.
+async fn metrics(
+    State(state): State<Arc<RelayState>>,
+    axum::Extension(OperatorToken(expected)): axum::Extension<OperatorToken>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !operator_authorized(&expected, &headers) {
+        return (StatusCode::UNAUTHORIZED, "operator token required\n").into_response();
+    }
+    let readiness = state.readiness().await;
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            crate::metrics::CONTENT_TYPE,
+        )],
+        crate::metrics::render(&readiness),
+    )
+        .into_response()
 }
 
 /// What `GET /version` answers: what this binary is, and what it believes it is

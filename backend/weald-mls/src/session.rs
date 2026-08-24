@@ -575,6 +575,34 @@ impl Session {
         leaves
     }
 
+    /// The leaf indices currently in the group with the credential at each one,
+    /// sorted by leaf.
+    ///
+    /// `members()` throws the credential away, and every caller above had to guess
+    /// which principal a leaf belonged to from a signed side channel: a claim it
+    /// published about itself, a replayed handshake log, or, at the very bottom,
+    /// counting leaves and inferring the odd one out. A device admitted by an
+    /// external commit publishes no `Add` on the admin's side, so none of those had
+    /// anything to read and a removal stopped at `epochsRotated` for ever
+    /// (WEALD-L335). The group's own ratchet tree has known this the whole time.
+    ///
+    /// The credential bytes are the same value ``identity`` returns for self, so a
+    /// caller compares them directly against the principal it means to remove.
+    pub fn member_identities(&self) -> Vec<(u32, Vec<u8>)> {
+        let mut pairs: Vec<(u32, Vec<u8>)> = self
+            .group
+            .members()
+            .map(|member| {
+                (
+                    member.index.u32(),
+                    member.credential.serialized_content().to_vec(),
+                )
+            })
+            .collect();
+        pairs.sort_unstable_by_key(|pair| pair.0);
+        pairs
+    }
+
     /// The ratchet tree, for a joiner that needs it out of band.
     pub fn ratchet_tree(&self) -> Result<Vec<u8>> {
         // Through the same ceiling as every other outgoing message, because this one

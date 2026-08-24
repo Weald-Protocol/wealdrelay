@@ -634,6 +634,30 @@ mod tests {
         Reader::new(data).schema_map(&key::SCHEMA).unwrap()
     }
 
+    #[test]
+    fn agent_phase_errors_and_illegal_coding_reasons_are_covered() {
+        assert!(LifecycleError::UnknownPhase("unknown".into())
+            .to_string()
+            .contains("unknown"));
+        assert!(LifecycleError::PhaseMismatch {
+            state: State::Accepted,
+            present: true,
+        }
+        .to_string()
+        .contains("accepted"));
+
+        let mut illegal = unsigned(State::Declined);
+        illegal.reason = Some("branch.protected".into());
+        let bytes = encode(&signed(illegal, &host_key()));
+        assert!(matches!(
+            decode(&bytes),
+            Err(LifecycleError::ReasonMismatch {
+                state: State::Declined,
+                present: true,
+            })
+        ));
+    }
+
     fn unsigned_lease() -> AgentLease {
         AgentLease {
             v: PROTOCOL_VERSION,

@@ -2050,7 +2050,7 @@ async fn a_bucket_that_fails_at(step: FailAt) -> String {
                          <Error><Code>{code}</Code><Message>gone</Message></Error>"
                     );
                     let response = format!(
-                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
@@ -2065,7 +2065,7 @@ async fn a_bucket_that_fails_at(step: FailAt) -> String {
                 // Measuring a part that is still there: a length and nothing else.
                 if measuring {
                     let _ = socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5242880\r\n\r\n")
+                        .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5242880\r\n\r\n")
                         .await;
                     let _ = socket.flush().await;
                     return;
@@ -2112,7 +2112,7 @@ async fn a_bucket_that_fails_at(step: FailAt) -> String {
                     "200 OK"
                 };
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;

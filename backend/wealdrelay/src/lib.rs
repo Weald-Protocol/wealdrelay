@@ -36,6 +36,7 @@ pub mod log;
 pub mod log_budget;
 pub mod logging;
 pub mod media;
+pub mod metrics;
 pub mod negentropy;
 pub mod profile;
 pub mod push;

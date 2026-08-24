@@ -590,3 +590,133 @@ async fn version_reports_the_compiled_identity_without_a_database() {
         reported.starts_with("sha256:"),
     );
 }
+
+// MARK: /metrics
+
+#[tokio::test]
+async fn metrics_is_absent_where_no_operator_bearer_is_configured() {
+    // The self-hosted shape again. Refusal counters and pool saturation are
+    // exactly what a caller probing for a relay under load would want, and there
+    // is no scraper of ours in a deployment with no control plane.
+    let state = Arc::new(RelayState::new(bare(&[]), None, None));
+    let (status, _) = ask_at(&state, "/metrics", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn metrics_refuses_a_wrong_bearer_and_an_absent_one() {
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    for offered in [None, Some("Bearer nonsense"), Some(TOKEN)] {
+        let (status, body) = ask_at(&state, "/metrics", offered).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "offered {offered:?}"
+        );
+        // Nothing about the relay's load leaks through the refusal.
+        assert!(!body.contains("weald_relay_"), "offered {offered:?}");
+    }
+}
+
+#[tokio::test]
+async fn metrics_answers_two_hundred_even_when_the_relay_is_not_ready() {
+    // A relay with no database is not ready. `/readyz` says 503 there, and it is
+    // right to: an orchestrator must not route to it. A scrape is not a health
+    // check, and a 503 would make a scraper drop the one sample an incident is
+    // reconstructed from, so readiness travels as a series instead.
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    let (status, body) = ask_at(&state, "/metrics", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body.contains("weald_relay_ready 0"), "{body}");
+
+    let (readyz, _) = ask_at(&state, "/readyz", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(readyz, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn metrics_carries_the_refusal_counters_and_no_identity() {
+    let state = Arc::new(RelayState::new(
+        bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+        None,
+        None,
+    ));
+    let (status, body) = ask_at(&state, "/metrics", Some(&format!("Bearer {TOKEN}"))).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // The counter the launch review asked for by name, plus the ones an incident
+    // is read beside it.
+    for series in [
+        "weald_relay_connections_refused_total",
+        "weald_relay_connections_closed_handshake_deadline_total",
+        "weald_relay_connections_closed_idle_deadline_total",
+        "weald_relay_connections",
+        "weald_relay_db_pool_in_use",
+        "weald_relay_oversized_outbound_frames_total",
+        "weald_relay_frozen_groups",
+    ] {
+        assert!(body.contains(series), "missing {series} in:\n{body}");
+        assert!(
+            body.contains(&format!("# TYPE {series} ")),
+            "{series} has no type"
+        );
+    }
+
+    // Capacity, never identity. The only labelled series is the build info, and
+    // the only labels on it are the two build strings.
+    for (index, line) in body.lines().enumerate() {
+        if line.starts_with('#') || !line.contains('{') {
+            continue;
+        }
+        assert!(
+            line.starts_with("weald_relay_build_info{"),
+            "line {index} carries labels and is not build info: {line}"
+        );
+    }
+    for forbidden in [
+        "group",
+        "principal",
+        "device",
+        "handle",
+        "source",
+        "call_id",
+    ] {
+        assert!(
+            !body.contains(&format!("{forbidden}=")),
+            "a {forbidden} label reached the exposition:\n{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_escapes_a_label_value_that_would_break_the_parse() {
+    // The build strings are ours, which is the assumption that fails the day a
+    // git description carries a quote. One broken label takes down the whole
+    // scrape rather than one series.
+    let rendered = wealdrelay::metrics::render(&{
+        let state = Arc::new(RelayState::new(
+            bare(&[(keys::OPERATOR_TOKEN, TOKEN)]),
+            None,
+            None,
+        ));
+        let mut readiness = state.readiness().await;
+        readiness.version = "1.0.0\"; evil=\"".to_string();
+        readiness
+    });
+    let line = rendered
+        .lines()
+        .find(|line| line.starts_with("weald_relay_build_info{"))
+        .expect("a build info line");
+    assert!(line.contains("\\\""), "the quote was not escaped: {line}");
+    assert!(
+        !line.contains("evil=\""),
+        "an injected label survived: {line}"
+    );
+}

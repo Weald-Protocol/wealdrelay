@@ -1512,3 +1512,90 @@ async fn the_state_query_answers_from_the_admitted_workspace_and_not_a_named_str
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// WEALD-459, formerly WEALD-L138. `publish_for` resolved a rotation from the
+/// first named group that named any workspace, while admission binds the session
+/// to the workspace that actually carries the device. A member naming a foreign
+/// group id first was therefore judged against that stranger's prior set, chain
+/// and authorizers, and refused `writer_not_in_access_set` on every attempt: the
+/// group list is stable across reconnects, so the workspace could never rotate
+/// its access set and therefore could never off-board a device.
+///
+/// The negative proof the ticket asks for: admit into B over a `CONNECT` naming
+/// `[g_A, g_B]`, publish a valid rotation of B, and assert it is accepted and
+/// that B's head advances.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_is_judged_against_the_admitted_workspace_and_not_a_named_stranger() {
+    let scratch = Scratch::new("accessrotate_cross").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let pool = relay.state.database.as_ref().expect("a database").pool();
+
+    // B, where the rotating device is a genuine authorizer.
+    let own_group = bare_group(&relay.state, 0x9e).await;
+    let salt = salt_of(&relay.state).await;
+    let genesis = set_for(
+        &salt,
+        0,
+        vec![0u8; 32],
+        &[&default_device(), &other_device()],
+        &default_device(),
+    );
+    store::publish(pool, WORKSPACE, &genesis, &genesis.encode())
+        .await
+        .expect("the genesis set");
+
+    // A, a workspace this device is not in, whose group id it merely knows. It is
+    // named first, which is the ordering the old resolution lost on.
+    let foreign_group = support::make_group_in(
+        &relay.state,
+        "ws-stranger",
+        0x9f,
+        std::slice::from_ref(&device_from(0xb1)),
+        std::slice::from_ref(&device_from(0xb1)),
+    )
+    .await;
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake(vec![foreign_group.clone(), own_group.clone()], CLOCK)
+        .await;
+
+    // A real off-boarding: version 1 of B's set, dropping the other device.
+    let removal = set_for(
+        &salt,
+        1,
+        genesis.digest().to_vec(),
+        &[&default_device()],
+        &default_device(),
+    );
+    ada.send_frame(&Frame::Access {
+        body: removal.encode(),
+    })
+    .await;
+    match ada.recv_frame().await {
+        Frame::Access { body } => assert_eq!(
+            body,
+            removal.digest().to_vec(),
+            "the rotation was judged against another workspace's set"
+        ),
+        other => panic!("a valid rotation of the admitted workspace was refused: {other:?}"),
+    }
+
+    // And B's head is the one that moved, not A's.
+    let head = store::current(pool, WORKSPACE)
+        .await
+        .expect("read B's current set")
+        .prior
+        .expect("B has a set");
+    assert_eq!(head.version, 1, "B's head did not advance");
+    assert_eq!(head.digest, removal.digest().to_vec());
+    let stranger = store::current(pool, "ws-stranger")
+        .await
+        .expect("read A's current set")
+        .prior
+        .expect("A has a set");
+    assert_eq!(stranger.version, 0, "the rotation was applied to A");
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

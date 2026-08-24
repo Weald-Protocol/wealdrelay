@@ -700,6 +700,52 @@ pub unsafe extern "C" fn weald_mls_members(
     ) as i32
 }
 
+/// The leaf indices currently in the group with the credential at each leaf.
+///
+/// The buffer is a flat sequence of records, each one a little-endian `u32` leaf
+/// index, a little-endian `u32` credential byte count, then that many credential
+/// bytes. `count_out` receives the number of records, not the number of bytes, so a
+/// caller that only wants the count never has to walk the buffer.
+///
+/// Separate from ``weald_mls_members`` rather than replacing it: the leaf-only call
+/// has callers that do not want to carry credentials across the boundary, and this
+/// one is for the removal path, which cannot proceed without them (WEALD-L335).
+///
+/// # Safety
+/// `out` is a writable ``Buffer``, freed by the caller with ``weald_mls_buffer_free``.
+#[no_mangle]
+pub unsafe extern "C" fn weald_mls_member_identities(
+    handle: GroupHandle,
+    out: *mut Buffer,
+    count_out: *mut usize,
+) -> i32 {
+    guard(
+        |count| {
+            if !count_out.is_null() {
+                // Safety: checked non-null.
+                unsafe { *count_out = count }
+            }
+        },
+        || {
+            // Safety: the caller's contract.
+            let session = unsafe { Handle::borrow(handle)? };
+            let pairs = session.member_identities();
+            let mut bytes =
+                Vec::with_capacity(pairs.iter().map(|pair| 8 + pair.1.len()).sum::<usize>());
+            for (leaf, identity) in &pairs {
+                bytes.extend_from_slice(&leaf.to_le_bytes());
+                // A credential longer than `u32::MAX` cannot exist: it arrived inside
+                // a message already bounded by the wire ceiling.
+                bytes.extend_from_slice(&(identity.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(identity);
+            }
+            // Safety: forwarded.
+            unsafe { put(out, bytes)? };
+            Ok(pairs.len())
+        },
+    ) as i32
+}
+
 /// Free a group handle.
 ///
 /// # Safety

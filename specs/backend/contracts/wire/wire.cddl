@@ -278,10 +278,7 @@ DmWelcomeBody = {                        ; kind 0x0022
 ; a separately named cleartext control frame so the relay can validate its
 ; version chain and revoke an authenticated device without reading workspace
 ; content. See specs/backend/relay/wire.md.
-AccessPublishFrame = {
-  0 => 9,                                ; ACCESS frame type
-  1 => AccessSet
-}
+AccessPublishFrame = [6, [AccessSet]]      ; tag 6 = ACCESS
 
 AccessSet = {
   1 => group-id,                          ; workspace root group
@@ -318,6 +315,16 @@ MediaRetainBody = {                      ; kind 0x0080
 ; ---------------------------------------------------------------------------
 ; Transport frames. WebSocket over TLS, port 443, v1. Transport-agnostic so
 ; QUIC can be added later without touching anything above layer 1.
+;
+; CORRECTED (2026-08-23, windows-client M1): the v1 control frames below were
+; written as integer-keyed maps with positional keys. That notation disagreed
+; with the enforced vector corpus in ./vectors, the relay's decoder
+; (`backend/wealdrelay/src/frame.rs`, `reader.array(2)`), and both shipped
+; clients, all of which speak a two-item array: `[ tag, [ fields... ] ]`. The
+; map keys were also not tags at all (`{0 => 9}` for ACCESS, whose tag is 6)
+; and CONNECT lacked `sent-at`. Rewritten to the array forms every
+; implementation speaks; field contents unchanged. Every frame on the wire is
+; that same two-item shape and nothing else.
 ; ---------------------------------------------------------------------------
 
 ; Every tag this grammar names, in one place. LiveFrame, KeysFrame, CallFrame and
@@ -331,43 +338,24 @@ Frame = ConnectFrame / AuthFrame / AccessPublishFrame / SubFrame / ReconFrame
       / PushFrame / SendFrame / BlobFrame / ErrorFrame
       / LiveFrame / KeysFrame / CallFrame / MediaFrame / WakeFrame
 
-ConnectFrame = { 0 => 1, 1 => protocol-version, 2 => [* group-id] }
-AuthFrame    = { 0 => 2, 1 => bstr, ? 2 => bstr .size 64, ? 3 => AuthState }
-SubFrame     = { 0 => 3, 1 => [+ group-id], ? 2 => seq, ? 3 => bool }
-ReconFrame   = { 0 => 4, 1 => group-id, 2 => [* Fingerprint] }
-PushFrame    = { 0 => 5, 1 => Envelope }
-SendFrame    = { 0 => 6, 1 => Envelope }
-BlobFrame    = { 0 => 7, 1 => BlobTicket }
-ErrorFrame   = { 0 => 8, 1 => ErrorBody }
+; Tags are the permanent wire values from `backend/wealdrelay/src/frame.rs`.
 
-AuthState = {
-  1 => uint                 ; relay time, ms. Observed, never trusted.
-  2 => uint                 ; this device's own unused key package count.
-                            ; Its own number, so this discloses nothing.
-  3 => write-mode           ; full or read_only
-  4 => enc-mode             ; the relay's configured MIN_ENC floor
-  ? 5 => tstr               ; non-content reason code when read_only
-}
+ConnectFrame = [1, [protocol-version, [* group-id], sent-at]]
 
-write-mode = "full" / "read_only"
+AuthFrame    = [4, [device-key, signature]]
+device-key   = bstr .size 32
 
-Fingerprint = { 1 => seq, 2 => seq, 3 => bstr .size 32 }   ; negentropy range
+SubFrame     = [7, [group-id, seq]]
+ReconFrame   = [9, [group-id, bstr]]       ; negentropy payload, opaque here
+PushFrame    = [10, [Envelope]]
+SendFrame    = [11, [Envelope]]
+BlobFrame    = [13, [bstr]]                ; BlobTicket bytes; opaque to this grammar
+ErrorFrame   = [15, [error-class, code, retry-after, detail]]
 
-BlobTicket = {
-  1 => content-hash         ; ciphertext hash. The relay never sees a key.
-  2 => uint                 ; size
-  3 => tstr                 ; presigned url
-  4 => uint                 ; expires-at, ms
-}
-
-ErrorBody = {
-  1 => error-class
-  2 => tstr                 ; stable code. registries/error-codes.md
-  ? 3 => bstr .size 32      ; current state hash, so the client can rebase
-  ? 4 => uint               ; retry-after, ms. Required for retry, quota and limit.
-}
-
-error-class = "retry" / "reject" / "denied" / "quota" / "version" / "limit"
+error-class  = "retry" / "reject" / "denied" / "quota" / "version" / "limit"
+code         = text                        ; registries/error-codes.md; class owns code
+retry-after  = uint                        ; seconds; zero means absent
+detail       = bstr                        ; state hash / limit / reason; empty means absent
 
 ; `limit` arrived with protocol version 4 and is the one class this protocol has
 ; ever added, which is a breaking change by the mechanical test in
@@ -422,7 +410,6 @@ keys-fields =
   / []                           ; form 5 none
 
 key-package = bstr
-device-key  = bstr .size 32
 fetch-count = uint .size 1        ; capped at 8; higher is enumeration
 
 ; ---------------------------------------------------------------------------

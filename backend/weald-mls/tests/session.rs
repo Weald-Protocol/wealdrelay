@@ -158,6 +158,72 @@ fn a_third_device_self_joins_by_external_commit_and_sees_what_follows() {
 }
 
 #[test]
+fn member_identities_name_the_credential_at_every_leaf() {
+    // WEALD-L335. `members()` returns leaves alone, so the admitting side could not
+    // say which principal sat at which leaf and a removal stopped at the rotation
+    // step for ever. The ratchet tree has always carried the credential.
+    let ada_device = device("ada");
+    let mut ada = ada_device.create_group(GROUP).expect("a group");
+    assert_eq!(
+        ada.member_identities(),
+        vec![(0u32, b"ada".to_vec())],
+        "a group of one names its founder"
+    );
+
+    let bo_device = device("bo");
+    let key_package = bo_device.key_package().expect("a key package");
+    let (_, welcome) = ada.add(&key_package).expect("an add");
+    ada.merge_pending().expect("merged");
+    let bo = bo_device.join_welcome(&welcome).expect("joined");
+
+    let expected = vec![(0u32, b"ada".to_vec()), (1u32, b"bo".to_vec())];
+    assert_eq!(ada.member_identities(), expected);
+    assert_eq!(bo.member_identities(), expected, "both ends agree");
+    // The leaves stay in step with the leaf-only call every other caller uses.
+    assert_eq!(
+        ada.member_identities()
+            .into_iter()
+            .map(|pair| pair.0)
+            .collect::<Vec<u32>>(),
+        ada.members()
+    );
+    // Self is named the same way `identity` names it, so a caller compares directly.
+    assert_eq!(
+        ada.member_identities()[usize::try_from(ada.own_leaf()).expect("a leaf")].1,
+        ada.identity()
+    );
+}
+
+#[test]
+fn an_external_commit_joiner_is_named_on_the_admitting_side() {
+    // The redeem path, and the whole of WEALD-L335: nobody adds Cy, so the admitting
+    // device writes down no leaf for Cy anywhere. It can still read Cy out of its own
+    // group, which is what makes a removal resolvable without a side channel.
+    let ada_device = device("ada");
+    let mut ada = ada_device.create_group(GROUP).expect("a group");
+    let group_info = ada.group_info().expect("a group info");
+
+    let cy_device = device("cy");
+    let (cy, commit) = cy_device.join_external(&group_info).expect("joined");
+    ada.process(&commit).expect("processed");
+
+    let named = ada.member_identities();
+    assert_eq!(named.len(), 2);
+    let cy_leaf = named
+        .iter()
+        .find(|pair| pair.1 == b"cy".to_vec())
+        .expect("the external-commit joiner is named on the admitting side")
+        .0;
+    assert_eq!(cy_leaf, cy.own_leaf());
+    assert_ne!(cy_leaf, ada.own_leaf());
+
+    // And after the removal it resolves is applied, the leaf is gone from the list.
+    ada.remove(&[cy_leaf]).expect("a removal");
+    ada.merge_pending().expect("merged");
+    assert_eq!(ada.member_identities(), vec![(0u32, b"ada".to_vec())]);
+}
+
+#[test]
 fn the_exporter_is_the_only_way_key_material_leaves_and_it_is_bounded() {
     let ada_device = device("ada");
     let ada = ada_device.create_group(GROUP).expect("a group");

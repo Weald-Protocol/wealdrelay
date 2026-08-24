@@ -285,11 +285,42 @@ pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
 /// that passes none: the budget then falls back to the token and the device, which
 /// narrows it rather than opening it.
 pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source: Option<String>) {
+    // The hub identity for this connection. Allocated before the first frame so a
+    // `SUB` arriving in the same TCP segment as `AUTH` has somewhere to register,
+    // and allocated here rather than inside so it can name the span the whole
+    // connection runs under.
+    let connection = state.hub.connect();
+    // The correlation handle every line from this socket carries.
+    //
+    // Until this span existed a relay's log was a flat sequence with nothing tying
+    // two lines to the same connection, so reconstructing one client's session
+    // during an incident meant guessing from timestamps. `conn` is the hub's own
+    // per-process counter: opaque, allocated in arrival order, meaningless outside
+    // this process and reset by a restart. That is deliberate and it is the whole
+    // reason it is safe to log. It is not a principal, not a group, not a device
+    // and not a source address: `source` is never logged anywhere in this file
+    // (see the doc comment above), and a trace id derived from it would put the
+    // address in the log under a different name.
+    //
+    // `instrument` rather than `span.enter()`, because a guard held across an
+    // `.await` attaches the span to whatever the runtime polls next. Everything
+    // this connection does, including every `handle_message` below it, inherits
+    // the field without one call site passing it.
+    use tracing::Instrument as _;
+    serve_connection_inner(socket, state, source, connection)
+        .instrument(tracing::info_span!("relay_connection", conn = connection))
+        .await;
+}
+
+async fn serve_connection_inner(
+    socket: WebSocket,
+    state: Arc<RelayState>,
+    source: Option<String>,
+    connection: crate::hub::ConnectionId,
+) {
     let (mut sink, mut stream) = socket.split();
     let (sender, mut receiver) = outbound_channel();
-    // The hub identity for this connection. Allocated before the first frame so a
-    // `SUB` arriving in the same TCP segment as `AUTH` has somewhere to register.
-    let connection = state.hub.connect();
+    tracing::debug!("connection opened");
 
     // The writer is its own task so the bound is real: when it is full the reader
     // below stops making progress, which stops it reading the socket.
@@ -472,6 +503,17 @@ pub async fn serve_connection(socket: WebSocket, state: Arc<RelayState>, source:
             .await;
     }
     state.release_connection();
+    // The close line, under the same span as everything this connection did. Debug
+    // rather than info for the reason `logging.rs` gives about group ids one layer
+    // up: a line per socket at info level on a busy relay is a log nobody reads,
+    // and the aggregate an operator actually watches is
+    // `weald_relay_connections` on `/metrics`. What this is for is the incident
+    // where somebody already has a `conn` from an error line and needs the rest of
+    // that socket's story.
+    tracing::debug!(
+        authenticated = !holds_unauthenticated_source_share,
+        "connection closed"
+    );
 }
 
 /// Decide about one incoming message. Returns false when the connection should

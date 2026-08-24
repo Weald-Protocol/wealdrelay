@@ -640,6 +640,47 @@ fn the_remaining_seam_functions_answer_through_pointers_too() {
     assert_eq!(count, 2);
     assert_eq!(member_bytes.len(), 8);
 
+    // `member_identities`, the same list with the credential at each leaf. Records are
+    // leaf, length, bytes, and the buffer must end exactly on the last one: a decoder
+    // that trusted the count and ran off the end is the failure this shape prevents
+    // (WEALD-L335).
+    let mut named = Buffer::empty();
+    let mut named_count = 0usize;
+    // Safety: live handle, both outs writable.
+    assert_eq!(
+        status(unsafe { weald_mls_member_identities(group, &mut named, &mut named_count) }),
+        Status::Ok
+    );
+    let named_bytes = take(&mut named);
+    assert_eq!(named_count, 2);
+    let mut cursor = 0usize;
+    let mut decoded: Vec<(u32, Vec<u8>)> = Vec::new();
+    for _ in 0..named_count {
+        assert!(named_bytes.len() - cursor >= 8);
+        let leaf = u32::from_le_bytes(named_bytes[cursor..cursor + 4].try_into().unwrap());
+        let length =
+            u32::from_le_bytes(named_bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        cursor += 8;
+        assert!(named_bytes.len() - cursor >= length);
+        decoded.push((leaf, named_bytes[cursor..cursor + length].to_vec()));
+        cursor += length;
+    }
+    assert_eq!(
+        cursor,
+        named_bytes.len(),
+        "the buffer ends on a record boundary"
+    );
+    assert_eq!(decoded[0], (0u32, b"ada".to_vec()));
+    assert_eq!(decoded[1], (1u32, b"bo".to_vec()));
+    // The leaves agree with the leaf-only call, which is the seam's own consistency.
+    assert_eq!(
+        decoded.iter().map(|pair| pair.0).collect::<Vec<u32>>(),
+        member_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<u32>>()
+    );
+
     // `remove`, then `decrypt` refusing a commit, then `join_external` from a group info.
     let leaves = [1u32];
     let mut commit = Buffer::empty();

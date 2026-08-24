@@ -488,6 +488,11 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_depth_error_has_a_bounded_message() {
+        assert!(CborError::TooDeep.to_string().contains("levels"));
+    }
+
     // --------------------------------------------------------------- encoding
 
     #[test]

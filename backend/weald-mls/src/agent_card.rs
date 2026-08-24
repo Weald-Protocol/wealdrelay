@@ -818,6 +818,39 @@ mod tests {
         Reader::new(data).schema_map(&key::SCHEMA).unwrap()
     }
 
+    #[test]
+    fn agent_coding_error_messages_and_malformed_nested_arrays_are_covered() {
+        for error in [
+            CardError::CodeBlockMismatch,
+            CardError::CodeRepositoriesInvalid,
+            CardError::RepositoryRefInvalid("bad ref".into()),
+            CardError::BranchInvalid("bad branch".into()),
+            CardError::TestPolicyInvalid,
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
+        assert!(matches!(
+            decode_code(&cbor::array(&[cbor::array(&[])])),
+            Err(CardError::Cbor(CborError::WrongArrayCount { got: 1, .. }))
+        ));
+        assert!(matches!(
+            decode_code(&cbor::array(&[
+                cbor::array(&[cbor::array(&[cbor::uint(1)])]),
+                cbor::uint(1),
+            ])),
+            Err(CardError::Cbor(CborError::WrongArrayCount { got: 1, .. }))
+        ));
+        assert!(matches!(
+            decode_code(&cbor::array(&[
+                cbor::array(&[cbor::array(&[cbor::uint(1), cbor::text("owner/repo"),])]),
+                cbor::uint(1),
+                cbor::array(&[cbor::array(&[cbor::text("test")])]),
+            ])),
+            Err(CardError::Cbor(CborError::WrongArrayCount { got: 1, .. }))
+        ));
+        assert!(!valid_repo_ref("é/repo"));
+    }
+
     // ------------------------------------------------------------ round trips
 
     #[test]

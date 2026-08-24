@@ -147,4 +147,8 @@ fn only_the_write_shaped_media_requests_are_writes() {
     }
     .is_write());
     assert!(!Request::RetentionPosition { group: vec![2; 32] }.is_write());
+    // WEALD-L453: a quota read stays a read — the gate lets it through and
+    // `handle_quota` skips its `ensure_quota_row` write when the session
+    // refuses writes, so the classification and that skip are a pair.
+    assert!(!Request::Quota { group: vec![2; 32] }.is_write());
 }

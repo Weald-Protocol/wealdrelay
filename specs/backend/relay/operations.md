@@ -345,6 +345,18 @@ relay has no billing client. Hosted orchestration of the setting is specified in
   database reachability, storage reachability, access-set enforcement state,
   any frozen retention chain, and whether the running build is behind the
   release feed (`specs/backend/relay/server.md`).
+- Private `/metrics` serves the same readiness snapshot as Prometheus text
+  (`src/metrics.rs`), behind the same operator bearer as `/readyz`'s detailed
+  body and on the same private listener. It answers 200 whether or not the relay
+  is ready, because a scrape is not a health check and a 503 makes a scraper drop
+  the one sample an incident is reconstructed from; readiness travels as the
+  `weald_relay_ready` series instead. It computes nothing of its own: every
+  series is a counter `/readyz` already reports, so the two can never disagree
+  during the incident they were both built for. The series that matter under
+  attack are `weald_relay_connections_refused_total` (the connection cap),
+  `weald_relay_connections_closed_handshake_deadline_total` (somebody parking on
+  the connection table) and `weald_relay_db_pool_in_use` against
+  `weald_relay_db_pool_size`.
 - Metrics are aggregate by default. Per-group labels are off unless
   `WEALD_RELAY_METRICS_GROUP_LABELS=on`, which exists for a self-hoster debugging
   their own instance and is never enabled on hosted, so that per-group counts are
@@ -352,6 +364,13 @@ relay has no billing client. Hosted orchestration of the setting is specified in
   (`specs/backend/cloud/billing.md`).
 - Structured logs carry group ids at debug level only and never carry envelope
   bytes, header or body, at any level.
+- Every line produced while serving a socket carries `conn`, the hub's
+  per-process connection counter, as a tracing span field (`src/ws.rs`
+  `serve_connection`). It is a correlation handle and nothing else: opaque,
+  allocated in arrival order, meaningless outside the process and reset by a
+  restart. It is deliberately not derived from the source address, which is never
+  logged anywhere, because a trace id derived from an address is the address in
+  the log under another name.
 
 The hosted SLO and its measurement live in
 `specs/backend/cloud/compliance.md`. This document is what the binary does; that

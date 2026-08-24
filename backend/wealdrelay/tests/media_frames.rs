@@ -26,6 +26,7 @@ use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use sqlx::PgPool;
 use wealdrelay::config::keys;
+use wealdrelay::config::WriteMode;
 use wealdrelay::frame::{ErrorCode, Frame};
 use wealdrelay::health::{Clock, RelayState};
 use wealdrelay::media::wire::{Request, Response};
@@ -571,6 +572,45 @@ async fn the_quota_read_is_charged_against_the_device_s_request_budget() {
         ),
         ErrorCode::RateLimited
     );
+
+    harness.finish().await;
+}
+
+/// WEALD-L453's negative proof: on a quiesced instance a quota read answers
+/// with real numbers and performs zero database writes — the `ensure_quota_row`
+/// INSERT that used to hide behind the read classification must not run, so a
+/// workspace that never uploaded has no `relay_quota` row afterwards.
+#[tokio::test]
+async fn a_quota_read_on_a_read_only_instance_answers_without_writing_the_quota_row() {
+    let harness = Harness::with(
+        "frames_quota_readonly",
+        [(keys::MAX_STORAGE_GB, "1".to_string())],
+        |state| state.config.write_mode = WriteMode::ReadOnly,
+    )
+    .await;
+    let group = harness.group(0x4f, &[device_from(0x71)]).await;
+    let session = harness.session();
+    assert!(session.refuses_writes());
+
+    assert!(matches!(
+        response(
+            &harness
+                .ask(
+                    &session,
+                    &Request::Quota {
+                        group: group.clone(),
+                    }
+                )
+                .await
+        ),
+        Response::Quota { .. }
+    ));
+    let rows: i64 = sqlx::query_scalar("select count(*) from relay_quota where workspace_id = $1")
+        .bind(WS)
+        .fetch_one(harness.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a quiesced quota read must not create the row");
 
     harness.finish().await;
 }
