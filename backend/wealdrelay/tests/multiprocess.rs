@@ -83,10 +83,26 @@ async fn drop_database(name: &str) {
 struct Relay {
     child: std::process::Child,
     port: u16,
+    /// Kept so a relay that lost the ephemeral-port race can be started again on a
+    /// fresh port. `free_port` binds, reads the number and closes, so between the
+    /// close and the relay's own bind the port belongs to whoever asks next; on a
+    /// loaded CI runner starting three relays at once that is sometimes another
+    /// process. Retrying is the only fix that does not hold the port hostage.
+    database: String,
+    blobs: std::path::PathBuf,
+    redis: Option<String>,
 }
 
 impl Relay {
     fn start(database: &str, blobs: &std::path::Path, redis: Option<&str>) -> Self {
+        let mut relay = Self::spawn(database, blobs, redis);
+        relay.database = database.to_string();
+        relay.blobs = blobs.to_path_buf();
+        relay.redis = redis.map(str::to_string);
+        relay
+    }
+
+    fn spawn(database: &str, blobs: &std::path::Path, redis: Option<&str>) -> Self {
         let port = free_port();
         let private = free_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_wealdrelay"));
@@ -131,11 +147,39 @@ impl Relay {
             command.env("WEALD_RELAY_LIVE", "off");
         }
         let child = command.spawn().expect("spawn a relay");
-        Self { child, port }
+        Self {
+            child,
+            port,
+            database: database.to_string(),
+            blobs: blobs.to_path_buf(),
+            redis: redis.map(str::to_string),
+        }
     }
 
     /// Wait until it answers, or fail with what it said on the way out.
     fn wait_for_liveness(&mut self) {
+        for _ in 0..4 {
+            match self.try_liveness() {
+                Ok(()) => return,
+                // The one failure that is about the runner and not about the
+                // relay. Anything else is the suite's business and fails here.
+                Err(said) if said.contains("Address already in use") => {
+                    let next = Self::spawn(
+                        &self.database.clone(),
+                        &self.blobs.clone(),
+                        self.redis.clone().as_deref(),
+                    );
+                    self.child = next.child;
+                    self.port = next.port;
+                }
+                Err(said) => panic!("{said}"),
+            }
+        }
+        panic!("a relay lost the ephemeral-port race four times running");
+    }
+
+    /// One attempt. `Err` carries what the process said on the way out.
+    fn try_liveness(&mut self) -> Result<(), String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().expect("check the child") {
@@ -148,7 +192,7 @@ impl Relay {
                     use std::io::Read as _;
                     let _ = stderr.read_to_string(&mut said);
                 }
-                panic!("a relay exited early with {status:?}: {said}");
+                return Err(format!("a relay exited early with {status:?}: {said}"));
             }
             if std::net::TcpStream::connect_timeout(
                 &format!("127.0.0.1:{}", self.port).parse().unwrap(),
@@ -156,11 +200,11 @@ impl Relay {
             )
             .is_ok()
             {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("a relay never opened its socket on {}", self.port);
+        Err(format!("a relay never opened its socket on {}", self.port))
     }
 
     fn stop(mut self) {
