@@ -21,9 +21,18 @@ use support::{config_for, default_device, seed_access_set, Client, Running, Scra
 
 const CLOCK: u64 = 1_700_000_000_000;
 
+/// Wall-clock milliseconds, for the one test here that runs on `Clock::System`
+/// and must therefore present a client clock the relay does not read as skew.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_millis() as u64
+}
+
 /// Wait for the open-connection counter to drain to zero, or fail with its value.
 async fn drained(relay: &Running) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let open = relay.state.open_connections();
         if open == 0 {
@@ -54,7 +63,17 @@ async fn aborted_upgrades_leave_no_connection_slot_behind() {
     // A finite, small table, so a leak is visible as refusal rather than as a
     // number nobody reads.
     config.max_connections = wealdrelay::config::Limit::Of(4);
-    let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
+    // A real clock and a short handshake deadline, because the third path out of
+    // this loop is an upgrade that completes against a socket already reset. That
+    // connection is not a leak and it is not closed by anything the test does: it
+    // is closed by the handshake deadline, which under `Clock::Fixed` never
+    // arrives, leaving the drain to wait on the host surfacing the RST. A
+    // two-core hosted runner does not always do that within ten seconds, which is
+    // how the v0.1.32 release failed here with nothing about slot accounting
+    // changed. With a moving clock the relay reaps it on its own schedule and the
+    // bound below is the relay's, not the operating system's.
+    config.handshake_timeout_ms = 5_000;
+    let relay = Running::start(config, Clock::System).await;
 
     for _ in 0..20 {
         // A raw socket that resets rather than closes: `SO_LINGER` at zero
@@ -109,7 +128,7 @@ async fn aborted_upgrades_leave_no_connection_slot_behind() {
     // about the connection slots this test is named for.
     seed_access_set(&relay.state, "ws-upgrade", &[default_device()]).await;
     let mut client = Client::connect(relay.address).await;
-    client.handshake(vec![group], CLOCK).await;
+    client.handshake(vec![group], now_ms()).await;
 
     relay.shutdown().await;
     scratch.drop_database().await;
