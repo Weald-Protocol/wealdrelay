@@ -343,6 +343,40 @@ mod tests {
         assert_ne!(path, handoff_path(&[0x12u8; 32]));
     }
 
+    /// The control plane pins this same table in
+    /// `backend/weald-cloud/test/handoff-path.test.ts`. WEALD-L270 was the two
+    /// implementations disagreeing on this one string, which made every packed
+    /// purchase unenrollable; if either side moves, one of the two suites fails.
+    #[test]
+    fn handoff_path_conformance_vectors() {
+        const VECTORS: &[(&str, &str)] = &[
+            (
+                "PISpbDPRwIK3xfE1dJKwziTV8zAMAGiIPZ6qhO8GrCg=",
+                "/handoff/VrR2KUukbU6dGJt2Prd_UM7bIuG8MlYu9QhSLopK3Uc",
+            ),
+            (
+                "mGAl8nOJa7ODOlDjwQ/cEVh1/lHcGPi3vrYYMO1HoAw=",
+                "/handoff/gvRbLJt__E9AdIPmkEX7ZuleuLfvIVgy88ED0nJ38cs",
+            ),
+            (
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "/handoff/Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+            ),
+        ];
+        for (configured, expected) in VECTORS {
+            let key = parse_public_key(configured).expect("a 32 byte key");
+            let path = handoff_path(&key);
+            assert_eq!(&path, expected);
+            // The two halves of the WEALD-L270 line, asserted as absences.
+            assert!(!path.contains(configured));
+            let stripped: String = configured
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            assert!(!path.contains(&stripped));
+        }
+    }
+
     #[test]
     fn sealing_twice_produces_two_blobs() {
         let key = parse_public_key("4NDwbOM3PhZLBl+aZKGWJm1JW8QoWHmVJBJPRz0uMHM=")

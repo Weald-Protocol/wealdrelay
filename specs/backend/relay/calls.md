@@ -373,13 +373,21 @@ beside a declared second instance is a boot refusal. What is new is that an
 a default must never be the thing that stops a relay from starting; the client then
 reads what it reads from any instance whose operator chose `off`.
 
-A relay this control plane provisions carries calls without being told to, because
-it inherits the default like any other instance. `WEALD_CLOUD_RELAY_CALL_CEILING`
-remains the way an operator sizes the fleet rather than accepting 8: set, both
-`WEALD_RELAY_CALLS=on` and the ceiling are written into a Render service's
-environment and a packed cell's compose file together
-(`provisioner/render-resources.ts`, `provisioner/cell-config.ts`), reaching a cell
-on its next convergence and a service on its next environment write.
+**Changed 2026-08-24: a relay this control plane provisions is told, and does not
+inherit.** Both hosted provisioners write `WEALD_RELAY_CALLS=on` unconditionally
+(`provisioner/render-resources.ts callVars`, `provisioner/cell-config.ts
+callEnvironment`). Inheriting was true of the binary and false of the fleet: a cell
+still serving an image published before 2026-08-21 carried that image's default,
+answered `calls=off`, and read as a posture nobody had chosen (WEALD-L663, on a
+cell whose recorded digest and running binary disagreed, WEALD-L664). Written, the
+posture a customer gets is the one we declared, and a binary too old to know the
+variable ignores it. This is safe because no hosted path sets
+`WEALD_RELAY_REDIS_URL`, so the explicit-`on`-beside-a-second-instance boot refusal
+above is unreachable here. `WEALD_CLOUD_RELAY_CALL_CEILING` remains the way an
+operator sizes the fleet rather than accepting 8: set, the ceiling is written
+beside `on` into a Render service's environment and a packed cell's compose file
+together, reaching a cell on its next convergence and a service on its next
+environment write.
 
 A relay with calls off answers both frames with `version/protocol_unsupported`,
 which a version 3 client reads as calls being unavailable on this relay: the same

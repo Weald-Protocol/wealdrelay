@@ -1427,6 +1427,15 @@ pub struct ReadyVerdict {
     pub ready: bool,
 }
 
+/// Why a present credential was refused. Named, because a caller that gets this
+/// has to be able to tell "wrong bearer" from "no operator surface" without
+/// guessing, which is the whole of WEALD-L673.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OperatorRefusal {
+    pub error: &'static str,
+    pub detail: &'static str,
+}
+
 async fn readyz(
     State(state): State<Arc<RelayState>>,
     headers: axum::http::HeaderMap,
@@ -1448,11 +1457,32 @@ async fn readyz(
     // to withhold), refusal counters, pool saturation and security posture; a
     // caller without the bearer gets the one thing readiness owes an
     // orchestrator, which is the verdict.
+    //
+    // A *present* credential is a different case from an absent one. Answering the
+    // public short body to a bearer this relay does not accept made a mistyped
+    // credential indistinguishable from a relay with no operator surface at all:
+    // WEALD-L673, where a hex-encoded HMAC (the bearer is base64url) read as
+    // "/readyz is unreadable from an operator machine" and two live runs declared
+    // the image gate's only load-bearing reading impossible. Absent header keeps
+    // the short body, which is what a load balancer needs. A relay with no
+    // operator bearer configured has no credential to reject, so it keeps
+    // answering the verdict to anybody, header or not.
     let authorized = state
         .config
         .operator_token
         .as_deref()
         .is_some_and(|expected| operator_authorized(expected, &headers));
+    let configured = state.config.operator_token.is_some();
+    if configured && !authorized && headers.contains_key(axum::http::header::AUTHORIZATION) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(OperatorRefusal {
+                error: "operator_token_invalid",
+                detail: "the authorization header was not this relay's operator bearer; it is HMAC-SHA256(operator secret, instance id) encoded base64url",
+            }),
+        )
+            .into_response();
+    }
     if authorized {
         (code, Json(readiness)).into_response()
     } else {

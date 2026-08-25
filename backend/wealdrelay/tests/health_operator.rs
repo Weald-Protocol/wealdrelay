@@ -394,9 +394,31 @@ async fn an_unauthenticated_readyz_carries_the_verdict_and_nothing_derived_from_
         "the unauthenticated verdict grew a field: {body}"
     );
 
-    // A wrong bearer is the same caller as no bearer.
-    let (_, wrong) = ask_at(&relay.state, "/readyz", Some("Bearer nope")).await;
+    // A wrong bearer is not the same caller as no bearer: it is refused, and it is
+    // told why. WEALD-L673, where the silent downgrade to the public body made a
+    // hex-encoded HMAC (the bearer is base64url) read as "this relay has no
+    // operator surface", and two live runs recorded the relay image as unreadable.
+    let (status, wrong) = ask_at(&relay.state, "/readyz", Some("Bearer nope")).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{wrong}");
     assert!(!wrong.contains(prefix), "{wrong}");
+    let refusal: serde_json::Value = serde_json::from_str(&wrong).expect("json");
+    assert_eq!(refusal["error"], "operator_token_invalid");
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("base64url"),
+        "the refusal did not name the encoding: {wrong}"
+    );
+
+    // No header at all still gets the short public body, which is what a load
+    // balancer polls.
+    let (status, bare_body) = ask_at(&relay.state, "/readyz", None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&bare_body).expect("json")["ok"],
+        true
+    );
 
     // The operator sees the document the control plane polls, frozen group named.
     let (status, body) = ask_at(&relay.state, "/readyz", Some(&format!("Bearer {TOKEN}"))).await;

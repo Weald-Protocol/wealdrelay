@@ -135,6 +135,15 @@ Default channels cannot be deleted or archived while their parent exists, becaus
 a workspace whose only channel has been deleted has no place to put a first
 message and no obvious repair. They can be muted, renamed and reordered.
 
+Amended 2026-08-24 (WEALD-L356): renaming and reordering are now built, and both
+are a rewrite of `.weald/chat/channels.json` rather than a relay record. Renaming
+changes `ChatChannel.name` only; the slug is the directory the room's messages
+live under and never moves, so a renamed channel keeps its history and its `#`
+resolution. Reordering writes an explicit `order` on each channel a team has
+moved, and `ChatChannelIndex.normalize` sorts moved channels ahead of unmoved
+ones so a new channel cannot land above a pinned one on the strength of its name.
+`main` stays first and is neither renameable in the sidebar nor moveable.
+
 `chan:ws/activity` exists so that agent chatter, which is the highest-volume
 writer at this posture (`specs/backend/relay/agents.md`), has a home that is not
 the channel humans read. Routing it into `general` by default is how a team turns
@@ -226,6 +235,15 @@ arrival exactly as an invited one is, and the only groups that are ever empty fo
 a joiner are the ones whose policy says so.
 
 ## Explicit groups and the pending add
+
+Amended 2026-08-24 (WEALD-L356): no client builds one of these yet, and none is
+planned for the first release. `WorkspaceEncryption.policy(for:creator:at:)`
+provisions every channel group as `kind: .ws, admission: .everyone, history:
+.open`, so the only explicit-admission groups the product creates are direct
+conversations and agent leaves. The protocol below is the design a private
+channel would be built on, and is described here as such; a workspace's channels
+are all workspace-wide until it is built. Private channels are therefore a gap
+and not a defect, and nothing in the product should be read as promising them.
 
 `explicit` groups are the only ones that need a member to act, and that is
 correct: a private channel where anybody entitled can add themselves is not a

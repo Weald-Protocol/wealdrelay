@@ -361,6 +361,121 @@ pub enum Work {
     },
 }
 
+/// What one deferred work item does to durable state.
+///
+/// Declared per work item rather than inferred, because the recurring defect
+/// class in this file is a new frame arm that defers durable work with no
+/// budget and no `read_only` refusal: WEALD-L253 (`WRAP`), WEALD-L264
+/// (`DROP`), WEALD-L403 (`BLOB`) and WEALD-L452 (`WAKE`) are four instances of
+/// one shape. The match below is exhaustive and wildcard-free on purpose, so a
+/// new `Work` variant does not compile until its author has decided what it
+/// costs, and `tests/durable_write_budget.rs` holds the declaration to the
+/// behaviour the frame table actually shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// Touches no database and stores nothing: fanned out and forgotten.
+    Ephemeral,
+    /// Reads the database and writes nothing durable.
+    Read,
+    /// Inserts, updates or deletes a row.
+    Write,
+}
+
+/// Where a durable write's `read_only` refusal is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteRefusal {
+    /// Not a durable write, so nothing is owed.
+    NotAWrite,
+    /// Refused from session state by the frame table, before any pool is
+    /// touched. What every write frame whose shape is knowable here owes.
+    FrameTable,
+    /// Refused by the handler, because the frame's payload is opaque to the
+    /// frame table and only the handler can tell a read from a write
+    /// (`BLOB`, WEALD-L403; `media::handle` answers it before the pool).
+    Handler,
+    /// A durable write the frame table deliberately serves while quiesced,
+    /// with the reason named at the declaration.
+    ServedWhileQuiesced,
+}
+
+/// What one work item costs, declared next to the item rather than left to be
+/// read out of the frame table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkPolicy {
+    pub durability: Durability,
+    /// The per-connection frames-per-minute ceiling the frame table charges
+    /// before deferring this item, or `None` for the two items charged by
+    /// another counter (`SEND`'s per-device budget, `MEDIA`'s per-stream one).
+    pub frames_per_minute: Option<u32>,
+    pub write_refusal: WriteRefusal,
+}
+
+impl Work {
+    /// The declared cost of this work item. Wildcard-free: see ``Durability``.
+    pub fn policy(&self) -> WorkPolicy {
+        use Durability::{Ephemeral, Read, Write};
+        use WriteRefusal::{FrameTable, Handler, NotAWrite, ServedWhileQuiesced};
+        let policy = |durability, frames_per_minute, write_refusal| WorkPolicy {
+            durability,
+            frames_per_minute,
+            write_refusal,
+        };
+        match self {
+            // Reads the access set and counts key packages. Bounded by the
+            // handshake deadline rather than by a frame budget: one per
+            // connection, and a second `AUTH` is refused by the frame table.
+            Self::Authenticate { .. } => policy(Read, None, NotAWrite),
+            // Charged per device in `ws::Work::Accept` by `send_budget`, not
+            // here: the counter is shared across a device's connections.
+            Self::Accept { .. } => policy(Write, None, FrameTable),
+            Self::Subscribe { .. } => policy(Read, Some(SUB_FRAMES_PER_MINUTE), NotAWrite),
+            Self::Reconcile { .. } => policy(Read, Some(RECON_FRAMES_PER_MINUTE), NotAWrite),
+            Self::RotateAccessSet { .. } => {
+                policy(Write, Some(ACCESS_FRAMES_PER_MINUTE), FrameTable)
+            }
+            Self::BlobTicket { .. } => policy(Write, Some(BLOB_FRAMES_PER_MINUTE), Handler),
+            Self::DropBefore { .. } => policy(Write, Some(DROP_FRAMES_PER_MINUTE), FrameTable),
+            Self::PublishWrap { .. } => policy(Write, Some(WRAP_FRAMES_PER_MINUTE), FrameTable),
+            // The one durable write served while quiesced, deliberately: a
+            // redemption is how a device becomes able to speak at all, and
+            // `read_only` is a maintenance mode for an instance that keeps
+            // serving its workspace, not a closed door. Bounded by the only
+            // budget that binds an unauthenticated peer.
+            Self::Redeem { .. } => policy(Write, Some(JOIN_FRAMES_PER_MINUTE), ServedWhileQuiesced),
+            Self::AdministerInvite { .. } => {
+                policy(Write, Some(INVITE_FRAMES_PER_MINUTE), FrameTable)
+            }
+            Self::PublishHandshake { .. } => {
+                policy(Write, Some(HANDSHAKE_FRAMES_PER_MINUTE), FrameTable)
+            }
+            Self::PublishLive { .. } => policy(Ephemeral, Some(LIVE_FRAMES_PER_MINUTE), NotAWrite),
+            // A publication inserts rows; a fetch reads and takes off the
+            // shelf, which the mode leaves alone.
+            Self::KeyPackages { body } => match body {
+                KeysBody::Publish { .. } => policy(Write, Some(KEYS_FRAMES_PER_MINUTE), FrameTable),
+                _ => policy(Read, Some(KEYS_FRAMES_PER_MINUTE), NotAWrite),
+            },
+            // A registration writes a row and a clear deletes one; a query
+            // reads. All three are two round trips against the shared pool,
+            // which is why all three are charged (WEALD-L452).
+            Self::WakeRegistration { body } => match body {
+                crate::frame::WakeBody::Register { .. } | crate::frame::WakeBody::Clear => {
+                    policy(Write, Some(WAKE_FRAMES_PER_MINUTE), FrameTable)
+                }
+                _ => policy(Read, Some(WAKE_FRAMES_PER_MINUTE), NotAWrite),
+            },
+            Self::PublishCall { .. } => policy(
+                Ephemeral,
+                Some(crate::calls::CALL_FRAMES_PER_MINUTE),
+                NotAWrite,
+            ),
+            // Charged by `MediaBudget` per stream and per minute of bytes, not
+            // by a frames-per-minute ceiling.
+            Self::PublishMedia { .. } => policy(Ephemeral, None, NotAWrite),
+        }
+    }
+}
+
 /// One connection's protocol state.
 #[derive(Debug)]
 pub struct Session {
@@ -965,6 +1080,21 @@ impl Session {
                 // is to ask the ringer for a live handle, never to resend this one
                 // (`specs/backend/relay/push.md` sections 3 and 4). One bound, shared
                 // with the writing path in `ws.rs`, so the two cannot drift.
+                // A registration inserts a row and a clear deletes one, so the
+                // two write forms owe the same refusal every sibling durable
+                // write gives while the instance is quiesced (WEALD-L158). A
+                // query only reads, so the mode leaves it alone. Answered from
+                // session state, before the budget is charged and before the
+                // salt read: a refused frame must cost the caller nothing and
+                // reach no pool.
+                if matches!(
+                    body,
+                    crate::frame::WakeBody::Register { .. } | crate::frame::WakeBody::Clear
+                ) {
+                    if let Some(refusal) = self.read_only_refusal() {
+                        return refusal;
+                    }
+                }
                 if let crate::frame::WakeBody::Register { expires_at, .. } = &body {
                     if !crate::push::expiry_in_bounds(*expires_at, now_ms) {
                         return Reaction::Reply(vec![Frame::Error(FrameError::new(

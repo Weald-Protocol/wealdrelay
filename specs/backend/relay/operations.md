@@ -332,6 +332,28 @@ than an error, but a device that runs out routinely turns every add into one.
   device offline for a quarter is added with a fresh package rather than one
   whose lifetime assumptions have lapsed.
 
+### Every deferred work item declares what it costs
+
+Four separate defects were one shape: a frame arm that deferred durable work
+with no per-connection budget and, where the write was knowable from the frame,
+no `read_only` refusal. `WRAP` (WEALD-L253), `DROP` (WEALD-L264), `BLOB`
+(WEALD-L403) and `WAKE` (WEALD-L452) each arrived that way and each was closed
+on its own, because the rule was never written down and every proof was per
+frame.
+
+The rule: every variant of `Work` in `src/session.rs` declares its durability,
+its frames-per-minute ceiling and where its `read_only` refusal is answered,
+through `Work::policy`. That match is wildcard-free, so a new work item does not
+compile until its author decides what it costs, and
+`tests/durable_write_budget.rs` holds the declaration to the frame table's
+actual behaviour: a declared ceiling is charged and bites at its stated count
+while leaving the connection up, and a declared durable write is refused from
+session state while the instance is quiesced, reaching no pool. Two exemptions
+exist and both are named at the declaration rather than left implicit: `BLOB`,
+whose payload is opaque to the frame table so `media::handle` answers the mode
+above the pool, and `JOIN`, a redemption served while quiesced so that
+maintenance cannot lock a workspace's new devices out of it.
+
 ## Availability and self-monitoring
 
 `WEALD_RELAY_WRITE_MODE=read_only` is a local maintenance mode: durable `SEND`

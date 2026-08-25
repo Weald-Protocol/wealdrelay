@@ -958,3 +958,134 @@ async fn leaving_a_call_this_process_is_not_carrying_is_answered_with_silence_an
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_third_member_of_the_room_who_never_joined_the_call_is_copied_no_media() {
+    // WEALD-L698. The confidentiality property the registry exists for: `MEDIA` is
+    // routed from the call table and not fanned at the group, so a device that is
+    // subscribed to the same group, admitted by the same access set and never sent
+    // a `CALL` hears nothing at all. `calls.md:132-135` steps 4 and 5.
+    let scratch = Scratch::new("calls_bystander").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(
+        config_for_calls(&scratch, blobs.path(), 3),
+        Clock::Fixed(CLOCK),
+    )
+    .await;
+    let bystander_key = device_from(0x91);
+    let group = support::make_group_in(
+        &relay.state,
+        "ws-bystander",
+        0x51,
+        &[default_device(), other_device(), bystander_key.clone()],
+        std::slice::from_ref(&default_device()),
+    )
+    .await;
+    let id = call_id(0xB1);
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake(vec![group.clone()], CLOCK).await;
+    subscribe(&mut ada, &group).await;
+    let mut bo = Client::connect(relay.address).await;
+    bo.handshake_as(&other_device(), vec![group.clone()], CLOCK)
+        .await;
+    subscribe(&mut bo, &group).await;
+    // The third member of the room. Same group, same access set, same subscription,
+    // and no `CALL` frame ever.
+    let mut cara = Client::connect(relay.address).await;
+    cara.handshake_as(&bystander_key, vec![group.clone()], CLOCK)
+        .await;
+    subscribe(&mut cara, &group).await;
+
+    ada.send_frame(&offer(&id, &group)).await;
+    // Signalling *is* fanned at the group, because an offer has to reach somebody
+    // who is not in the call yet. Both of them see it, which is what makes the
+    // media assertion below a statement about routing rather than about delivery.
+    assert!(matches!(bo.recv_frame().await, Frame::Call { .. }));
+    assert!(matches!(cara.recv_frame().await, Frame::Call { .. }));
+    bo.send_frame(&signal(&id, &group, CallKind::Answer)).await;
+    assert!(matches!(ada.recv_frame().await, Frame::Call { .. }));
+    assert!(matches!(cara.recv_frame().await, Frame::Call { .. }));
+
+    for seq in 0..50 {
+        ada.send_frame(&media(&id, seq)).await;
+        assert_eq!(bo.recv_frame().await, media(&id, seq));
+    }
+
+    // And the bystander was copied none of the fifty. Proved by asking for
+    // something that is answered: a single stray `MEDIA` would be sitting in front
+    // of the acknowledgement.
+    cara.send_frame(&Frame::Sub {
+        group: group.clone(),
+        from_seq: 0,
+    })
+    .await;
+    match cara.recv_frame().await {
+        Frame::SubAck { .. } => {}
+        other => panic!("a bystander in the room was copied a call's media: {other:?}"),
+    }
+
+    // The other half of step 4: the bystander's own media is refused, because the
+    // registry and not the group is what admits a sender.
+    cara.send_frame(&media(&id, 99)).await;
+    match cara.recv_frame().await {
+        Frame::Error(error) => {
+            assert_eq!(error.code, ErrorCode::WriterNotInAccessSet);
+            assert_eq!(error.code.class().as_str(), "denied");
+        }
+        other => panic!("expected a denial for a non-participant's media, got {other:?}"),
+    }
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_id_open_in_one_group_is_refused_in_another_the_sender_also_belongs_to() {
+    // WEALD-L699. The existing unadmitted-group test proves the collision is
+    // refused when the second room is one the sender was never admitted to, which
+    // leaves the interesting half open: a call is a conversation inside one room, so
+    // the refusal must hold even when both groups are the sender's own.
+    // `calls.md:69-77`.
+    let scratch = Scratch::new("calls_collide_both").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(
+        config_for_calls(&scratch, blobs.path(), 3),
+        Clock::Fixed(CLOCK),
+    )
+    .await;
+    let first = make_group(&relay.state, 0x52).await;
+    let second = make_group(&relay.state, 0x53).await;
+    let id = call_id(0xB2);
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake(vec![first.clone(), second.clone()], CLOCK)
+        .await;
+    subscribe(&mut ada, &first).await;
+    subscribe(&mut ada, &second).await;
+
+    ada.send_frame(&offer(&id, &first)).await;
+    // The call is open against the first group, and the sender is admitted to the
+    // second: every access-set check the frame meets passes.
+    ada.send_frame(&offer(&id, &second)).await;
+    match ada.recv_frame().await {
+        Frame::Error(error) => {
+            assert_eq!(error.code, ErrorCode::WriterNotInAccessSet);
+            assert_eq!(error.code.class().as_str(), "denied");
+        }
+        other => panic!("a call id was pointed at a second room: {other:?}"),
+    }
+    // One call, not two: the refused frame opened nothing.
+    assert_eq!(relay.state.calls.open_calls().await, 1);
+    // And leaving under the wrong group is refused for the same reason, so the
+    // collision cannot be laundered through a `bye` either.
+    ada.send_frame(&signal(&id, &second, CallKind::Bye)).await;
+    match ada.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::WriterNotInAccessSet),
+        other => panic!("a bye named another room's group and was taken: {other:?}"),
+    }
+    assert_eq!(relay.state.calls.open_calls().await, 1);
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
