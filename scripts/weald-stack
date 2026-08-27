@@ -3897,6 +3897,311 @@ open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
   echo "converged=c1,c2"
 }
 
+cmd_agent_availability_gateway() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-21}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-availability-gateway: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/gateway-availability.txt"
+
+  # The provider credential, from this Mac's login Keychain, exported to the seeder
+  # and to nothing else. This scenario never calls a provider - a beat is not an
+  # invocation - but the control plane's schema holds a sealed credential per agent and
+  # the seeder is the only thing that writes one, so the same real key is required to
+  # seed the same real row. Never written to the tree, never printed, and absent is a
+  # failure rather than a skip (`production-only.md`).
+  local provider_key
+  provider_key="$(/usr/bin/security find-generic-password -s com.dicyanin.weald \
+    -a openrouter-api-key -w 2>/dev/null || true)"
+  [ -n "$provider_key" ] || {
+    echo "weald-stack: no OpenRouter key in the Keychain. This crossing reaches the" >&2
+    echo "real vendor and there is no test mode." >&2
+    exit 1
+  }
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="reviewer-ga$nonce"
+  local work; work="$STACK_STATE/gateway-availability-$nonce"
+  mkdir -p "$work/pki"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  # The channel's real group id, from the client that is a member of it rather than
+  # from a bash reimplementation of `GroupID.derive`.
+  local group; group="$(field "$(wc_ c1 agent-members)" group)"
+  [ -n "$group" ] || { echo "weald-stack: c1 named no group" >&2; exit 1; }
+
+  {
+    echo "# A gateway beats for the organization agent it hosts, and a member sees the ring"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "group     $group"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+  } | tee "$out"
+
+  # The gateway's key, and its principal before the process exists. The admin has to
+  # admit it to the workspace access set first: a principal the access set does not
+  # name cannot open a relay session at all, so a gateway started before this would
+  # exit on its first connect.
+  local seed principal
+  seed="$(python3 -c 'import os; print(os.urandom(32).hex())')"
+  principal="$(field "$(cargo run -q -p weald-agent-gateway --example principal_of -- "$seed")" principal)"
+  [ -n "$principal" ] || { echo "weald-stack: could not derive the gateway principal" >&2; exit 1; }
+  wc_ c1 admit --device "$principal" >>"$out" 2>&1 || {
+    echo "weald-stack: the admin could not admit the gateway to the access set" >&2
+    tail -20 "$out" >&2
+    exit 1
+  }
+
+  # The control plane, as step 13's console will leave it: the agent, the channel it
+  # is assigned to, the roster of members who may invoke it, one sealed credential
+  # and the run's mutual TLS material.
+  local control_db="weald_agents_ga_$nonce"
+  docker exec -i "$(dc ps -q postgres)" createdb -U weald "$control_db" >/dev/null 2>&1 || true
+  local control_url="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/$control_db"
+  local seeded
+  seeded="$(WEALD_LLM_OPENROUTER_KEY="$provider_key" cargo run -q -p weald-agent-worker \
+    --example org_crossing_seed -- \
+    --database "$control_url" --alias "$alias" --scope "$group" \
+    --member "$d1" --member "$d2" --pki "$work/pki" \
+    --model "${WEALD_AGENT_CROSSING_MODEL:-anthropic/claude-haiku-4.5}")" || {
+    echo "weald-stack: seeding the control plane failed" >&2
+    exit 1
+  }
+  local agent kek
+  agent="$(field "$seeded" agent)"
+  kek="$(field "$seeded" kek)"
+  { echo; echo "## the control plane"; echo "agent $agent"; echo "database $control_db"; } \
+    | tee -a "$out"
+
+  # The worker. A separate process, mutually authenticated, holding the credential
+  # this gateway cannot open: the architecture's whole point is that the process with
+  # the plaintext conversation is not the process that can call a vendor.
+  local worker_port; worker_port="$(python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  cargo build -q -p weald-agent-worker --bin weald-agent-worker || {
+    echo "weald-stack: the worker did not build" >&2; exit 1; }
+  WEALD_AGENT_WORKER_LISTEN="127.0.0.1:$worker_port" \
+  WEALD_AGENT_WORKER_SERVER_CERT="$(cat "$work/pki/server.pem")" \
+  WEALD_AGENT_WORKER_CLIENT_CA="$(cat "$work/pki/ca.pem")" \
+  WEALD_AGENT_WORKER_KEK="$kek" \
+  WEALD_AGENT_WORKER_DATABASE_URL="$control_url" \
+    nohup "$ROOT/target/debug/weald-agent-worker" >"$work/worker.log" 2>&1 &
+  local worker_pid=$!
+
+  # The gateway. Its assignment is already in the database, so it subscribes on its
+  # first pass rather than on a reload.
+  cargo build -q -p weald-agent-gateway --bin weald-agent-gateway || {
+    echo "weald-stack: the gateway did not build" >&2; kill "$worker_pid" 2>/dev/null; exit 1; }
+  local gateway_port; gateway_port="$(python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  # A file path and not a directory: `config.rs` calls this the MLS state database.
+  WEALD_AGENT_GATEWAY_LISTEN="127.0.0.1:$gateway_port" \
+  WEALD_AGENT_GATEWAY_RELAY_URL="127.0.0.1:$WEALD_STACK_RELAY_PORT" \
+  WEALD_AGENT_GATEWAY_DEVICE_KEY="$seed" \
+  WEALD_AGENT_GATEWAY_DATABASE_URL="$control_url" \
+  WEALD_AGENT_GATEWAY_STATE="$work/mls.sqlite" \
+  WEALD_AGENT_WORKER_URL="127.0.0.1:$worker_port" \
+  WEALD_AGENT_WORKER_CLIENT_CERT="$(cat "$work/pki/client.pem")" \
+    nohup "$ROOT/target/debug/weald-agent-gateway" >"$work/gateway.log" 2>&1 &
+  local gateway_pid=$!
+
+  gateway_availability_stop() {
+    kill "$gateway_pid" "$worker_pid" 2>/dev/null || true
+    wait "$gateway_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+  }
+
+  # The key package, which the gateway publishes on the way up. Waiting for it is how
+  # this knows the process is alive without asking it.
+  local waited=0 package=""
+  while [ "$waited" -lt 120 ]; do
+    # `|| true` because this file runs under `set -eo pipefail`: the table does not
+    # exist until the gateway has migrated it, and a psql that failed for that
+    # ordinary reason would end the run with no message at all.
+    package="$(docker exec -i "$(dc ps -q postgres)" psql -U weald -d "$control_db" -tAc \
+      "select encode(key_package,'hex') from agent_gateway_key_package" 2>/dev/null \
+      | tr -d '[:space:]' || true)"
+    # `if` rather than `[ ... ] && break`: this file runs under `set -e`, where a
+    # test that is false as the last command of a loop body exits the script, and
+    # the failure would be silent.
+    if [ -n "$package" ]; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ -n "$package" ] || {
+    echo "weald-stack: the gateway never published a key package" >&2
+    tail -20 "$work/gateway.log" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  python3 -c 'import sys, binascii
+open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
+    "$work/key-package.bin" "$package"
+  grep -q "scopes=1" "$work/gateway.log" || {
+    # The subscription is what makes the Welcome below reach it: the gateway reads
+    # from the moment it connects, so a Welcome published before it subscribed is a
+    # Welcome it never sees.
+    waited=0
+    while [ "$waited" -lt 90 ] && ! grep -q "scopes=1" "$work/gateway.log"; do
+      sleep 1; waited=$((waited + 1))
+    done
+  }
+  grep -q "scopes=1" "$work/gateway.log" || {
+    echo "weald-stack: the gateway never subscribed to the channel" >&2
+    tail -30 "$work/gateway.log" >&2
+    gateway_availability_stop
+    exit 1
+  }
+
+  # The admission. A person is welcomed by an admin and a user agent's leaf is added
+  # by the device that issued its certificate; a gateway is neither, and this verb is
+  # the path a member's Mac has to admit one.
+  local admit_out
+  admit_out="$(wc_ c1 agent-org-admit --alias "$alias" --fingerprint "$principal" \
+    --secrets-file "$work/key-package.bin")" || {
+    echo "weald-stack: c1 could not admit the gateway" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  { echo; echo "## c1 admits the gateway"; echo "$admit_out"; } | tee -a "$out"
+  [ "$(field "$admit_out" welcome)" = "1" ] || {
+    echo "weald-stack: the welcome was not published" >&2
+    gateway_availability_stop
+    exit 1
+  }
+
+  # The card, delivered. The gateway signs its hosted cards into the control plane
+  # (`hosting::reconcile`) and is deliberately not a member of the workspace root
+  # group, which is where every client reads cards from, so the admin's own device
+  # publishes the signed bytes. Without this a mention of an organization agent
+  # resolves to nothing on a real client and there is nothing to disclose.
+  local card_hex=""
+  waited=0
+  while [ "$waited" -lt 90 ]; do
+    card_hex="$(docker exec -i "$(dc ps -q postgres)" psql -U weald -d "$control_db" -tAc \
+      "select encode(card,'hex') from agent_hosted_card" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$card_hex" ]; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ -n "$card_hex" ] || {
+    echo "weald-stack: the gateway published no hosted card" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  python3 -c 'import sys, binascii
+open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
+    "$work/agent-card.bin" "$card_hex"
+  local card_out
+  card_out="$(wc_ c1 agent-org-card --secrets-file "$work/agent-card.bin")" || {
+    echo "weald-stack: c1 could not publish the organization card" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  { echo; echo "## c1 publishes the gateway's card"; echo "$card_out"; } | tee -a "$out"
+  wc_ c1 --seconds 10 sync >/dev/null 2>&1 || true
+  wc_ c2 --seconds 10 sync >/dev/null 2>&1 || true
+
+
+  # What this scenario exists for: the gateway's own beat. It is a member of the access
+  # set in its own right, so its beat is a signed claim by a member exactly like a
+  # human's, and `availability.rs` is where it is built. The gateway beats on the
+  # twenty second cadence and immediately on the first pass, so a reader that opened a
+  # session before it is guaranteed one inside that interval.
+  local live_log="$out_dir/gateway-seen.txt"
+  ( wc_ c2 --seconds 40 agent-availability --alias "$alias" >"$live_log" 2>&1 ) &
+  local watcher=$!
+  wait "$watcher" || {
+    echo "weald-stack: c2 could not read the org agent's availability" >&2
+    cat "$live_log" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  local live; live="$(cat "$live_log")"
+  { echo; echo "## what c2 sees while the gateway is up"; echo "$live"; } | tee -a "$out"
+  { echo; echo "## the gateway's own account";
+    grep -E "^availability" "$work/gateway.log" | tail -5; } | tee -a "$out"
+
+  grep -qE "^availability beats=[1-9]" "$work/gateway.log" || {
+    echo "weald-stack: the gateway never beat for the agent it hosts" >&2
+    tail -30 "$work/gateway.log" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  [ "$(field "$live" folded)" -ge 1 ] || {
+    echo "weald-stack: c2 folded none of the gateway's beats" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  [ "$(field "$live" state)" = "active" ] || {
+    echo "weald-stack: c2 shows the org agent as '$(field "$live" state)'" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  [ "$(field "$live" accepts)" = "yes" ] || {
+    echo "weald-stack: c2 would refuse an invoke to an org agent whose gateway is up" >&2
+    gateway_availability_stop
+    exit 1
+  }
+  # The gateway stops. Nothing is sent on the way out, and the ring goes dark on the
+  # claim's own TTL, which is the same rule a Mac host is held to.
+  gateway_availability_stop
+  local away
+  away="$(wc_ c2 --seconds 6 agent-availability --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the availability after the gateway stopped" >&2
+    exit 1
+  }
+  { echo; echo "## what c2 sees after the gateway stops"; echo "$away"; } | tee -a "$out"
+  [ "$(field "$away" state)" = "offline" ] || {
+    echo "weald-stack: a stopped gateway still shows '$(field "$away" state)'" >&2
+    exit 1
+  }
+  [ "$(field "$away" accepts)" = "no" ] || {
+    echo "weald-stack: c2 would still compose an invoke to a stopped gateway" >&2
+    exit 1
+  }
+
+  {
+    echo
+    echo "## the comparison"
+    echo "gateway    $principal, a member of the access set in its own right"
+    echo "hosted     $agent, on no Mac"
+    echo "beats      $(grep -cE '^availability beats=' "$work/gateway.log") pass(es) logged"
+    echo "seen       state=$(field "$live" state) folded=$(field "$live" folded) \
+accepts=$(field "$live" accepts)"
+    echo "stopped    state=$(field "$away" state) accepts=$(field "$away" accepts)"
+  } | tee -a "$out"
+
+  docker exec -i "$(dc ps -q postgres)" dropdb -U weald --if-exists "$control_db" >/dev/null 2>&1 || true
+  rm -rf "$work"
+
+  echo "beaten=gateway"
+  echo "offline=after-stop"
+}
+
 # Step 14's crossing: one composed message produces exactly one invoke per resolved
 # agent, an ordinary message carrying the same text produces none, and a name two
 # agents answer to produces none either.
@@ -4256,6 +4561,739 @@ online=$(field "$away" online) records=$(field "$away" records)"
   echo "converged=yes"
 }
 
+# Step 21's crossing: a host beats for its agent, the other player sees the ring,
+# the host quits, and the ring goes out inside the TTL while the composer refuses
+# with a reason and a deadline instead of spinning.
+#
+# "Quits" is modelled by not beating again, which is what a quit actually is here:
+# a `LIVE` claim carries a TTL and the receiver expires it, so a closing lid never
+# gets to send a farewell and absence has to be the signal. Nothing sleeps for two
+# minutes to prove it either: the beat is sent with a short `--ttl`, which is the
+# sender's own field, and the receiver's clamp is only an upper bound. The clamp
+# itself is proven in `AgentAvailabilityTests`, where a claim of a year is bounded
+# to two minutes without a two minute wait.
+#
+# Three things are asserted that a happy path would not show: the forged beat from
+# a member who is not the host is dropped at the far side, the relay stored no row
+# for any of it, and the composer's refusal names `hostOffline` and carries the
+# deadline the requester signed rather than one this harness made up.
+cmd_agent_availability_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-21}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-availability-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/availability-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="researcher-av$nonce"
+
+  # Three players, not two. Player 1 hosts, Player 2 reads, and the third is the
+  # forger: a real admitted member of this workspace who does not host this agent. It
+  # cannot be Player 2 itself, because two sessions of one device key do not both keep
+  # a subscription at the relay and the forgery would be fanned out to nobody, which
+  # reads exactly like a refusal and would be a proof of nothing.
+  cmd_clients 3 --selections relay,relay,relay --fresh >/dev/null
+
+  local d1 d2 d3
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  d3="$(field "$(wc_ c3 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] && [ "$d2" != "$d3" ] && [ "$d1" != "$d3" ] || {
+    echo "weald-stack: the clients share a device key, so this is one player repeated" >&2
+    exit 1
+  }
+
+  local ws; ws="$(cat "$CLIENTS_DIR/workspace-id")"
+  {
+    echo "# A host beats for its agent, the other player sees it, then it goes dark"
+    echo
+    echo "workspace $ws"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "c1 device $d1"
+    echo "c2 device $d2"
+    echo "c3 device $d3  (the forger)"
+  } | tee "$out"
+
+  # The relay's row counts before anything ephemeral happens. A `LIVE` frame is
+  # never stored and never sequenced (`specs/backend/relay/presence.md`), so the
+  # negative here is a zero delta measured against the real database rather than a
+  # promise repeated from the spec.
+  local before_envelopes before_bytes
+  before_envelopes="$(relay_psql "select count(*) from relay_envelope e join relay_group g \
+on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  before_bytes="$(relay_psql "select coalesce(sum(octet_length(ct)),0) from relay_envelope e \
+join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" \
+    | tr -d '[:space:]')"
+
+  # c1 hosts the agent: a published card, which is what makes c2's `hostFor` answer
+  # c1 and therefore what makes every refusal below a refusal about a real agent.
+  local card_out
+  card_out="$(wc_ c1 agent-publish-card --alias "$alias" --title "Researcher AV$nonce")" || {
+    echo "weald-stack: c1 could not publish its card" >&2; exit 1
+  }
+  { echo; echo "## c1 publishes the card it hosts"; echo "$card_out"; } | tee -a "$out"
+  { echo; echo "## all three sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; \
+    wc_ c3 --seconds 30 sync; } >>"$out" 2>&1
+
+  # c2 asks the agent something, so there is a signed deadline for the refusal to
+  # carry. Published before the host goes away, exactly as it happens in the product:
+  # a member sends, and the host is gone by the time it lands.
+  local invoke_out
+  invoke_out="$(wc_ c2 agent-invoke --alias "$alias" --id WEALD-921)" || {
+    echo "weald-stack: c2 could not publish the invoke" >&2; exit 1
+  }
+  { echo; echo "## c2 invokes"; echo "$invoke_out"; } | tee -a "$out"
+  { echo; echo "## both sync"; wc_ c1 --seconds 30 sync; wc_ c2 --seconds 30 sync; } \
+    >>"$out" 2>&1
+
+  # The live half. c2 watches while c1 beats: the relay fans a `LIVE` out to every
+  # *other* subscribed session and never back to the sender, so the reader has to be
+  # the other process or the proof would pass with the relay switched off.
+  #
+  # The reader first, and given time to finish connecting before anything is sent: a
+  # `LIVE` is fanned out to the sessions the relay holds at that moment and is never
+  # replayed, so a beat published before the reader subscribed reaches nobody and the
+  # reader cannot tell that from silence. This is the ordinary shape of the frame and
+  # `RelayClientPresenceCLI` documents it for the same reason.
+  #
+  # The claim's `--ttl` is 110 seconds, just inside the receiver's two minute clamp and
+  # longer than the reader's window, because this phase asserts a *live* ring: a claim
+  # that expired while the reader was still listening would assert the opposite. The
+  # expiry is asserted in its own phase below, where a fresh reader hears nothing at
+  # all, and the clamp is asserted with no wait at all in `AgentAvailabilityTests`.
+  local beat_log="$out_dir/beat.txt" forged_log="$out_dir/forged.txt"
+  local live_log="$out_dir/seen-live.txt"
+  ( wc_ c2 --seconds 75 agent-availability --alias "$alias" >"$live_log" 2>&1 ) &
+  local watcher=$!
+  sleep 12
+  # `--seconds 25` and a second attempt, because that flag is also the budget the
+  # client waits for its socket in (`withLiveSession`), and a 20 second default lost
+  # the session to load when this runs inside the gate beside a build. A connect that
+  # took too long is a flake in the harness rather than a fact about the product, and
+  # the fix belongs here rather than in a re-run.
+  local beat_out=""
+  local attempt
+  for attempt in 1 2; do
+    if beat_out="$(wc_ c1 --seconds 25 --ttl 110 --quiet 3 agent-beat --alias "$alias" \
+        --state active 2>&1)"; then
+      break
+    fi
+    echo "weald-stack: c1's beat attempt $attempt did not connect; retrying" >&2
+    beat_out=""
+  done
+  [ -n "$beat_out" ] || {
+    echo "weald-stack: c1 could not beat for its own agent" >&2
+    kill "$watcher" 2>/dev/null || true
+    exit 1
+  }
+  wait "$watcher" || {
+    echo "weald-stack: c2 could not read the availability while its host was beating" >&2
+    cat "$live_log" >&2
+    exit 1
+  }
+  local live; live="$(cat "$live_log")"
+  {
+    echo; echo "## c1 beats"; echo "$beat_out"
+    echo; echo "## what c2 saw while c1 was beating"; echo "$live"
+  } | tee -a "$out"
+
+  [ "$(field "$beat_out" sent)" -ge 2 ] || {
+    echo "weald-stack: c1's beats did not leave the socket" >&2; exit 1
+  }
+  [ "$(field "$live" state)" = "active" ] || {
+    echo "weald-stack: c2 shows the agent as '$(field "$live" state)' while its host beats" >&2
+    exit 1
+  }
+  [ "$(field "$live" accepts)" = "yes" ] || {
+    echo "weald-stack: c2 would refuse an invoke to an agent whose host is beating" >&2
+    exit 1
+  }
+  [ "$(field "$live" compose)" = "invoke" ] || {
+    echo "weald-stack: c2's composer says '$(field "$live" compose)' for a live agent" >&2
+    exit 1
+  }
+  # The forgery, in its own phase, so it is read by a reader that heard nothing else:
+  # a refusal proved in a window that also carried three honest beats could be a
+  # refusal of one of those. c2 is a real member of this workspace and is not the host
+  # of this agent, and the beat it sends is correctly signed by its own device key,
+  # which is what makes this the exact claim the receiver's host rule exists to refuse.
+  # Signed by c3's own device key, so nothing about it is malformed: the only thing
+  # wrong with it is who is speaking, which is the shape a replay or a hostile member
+  # reaches a reader in.
+  local agent; agent="$(field "$invoke_out" agent)"
+  ( wc_ c2 --seconds 75 agent-availability --alias "$alias" >"$forged_log" 2>&1 ) &
+  local forge_watcher=$!
+  sleep 12
+  local forged_out=""
+  for attempt in 1 2; do
+    if forged_out="$(wc_ c3 --seconds 25 --ttl 110 agent-beat --fingerprint "$agent" \
+        --state away 2>&1)"; then
+      break
+    fi
+    echo "weald-stack: the forged beat attempt $attempt did not connect; retrying" >&2
+    forged_out=""
+  done
+  [ -n "$forged_out" ] || {
+    echo "weald-stack: c3 could not send the forged beat, so nothing was refused" >&2
+    kill "$forge_watcher" 2>/dev/null || true
+    exit 1
+  }
+  wait "$forge_watcher" || {
+    echo "weald-stack: c2 could not read the availability while the forgery was in flight" >&2
+    cat "$forged_log" >&2
+    exit 1
+  }
+  local forged_seen; forged_seen="$(cat "$forged_log")"
+  {
+    echo; echo "## c2 forges a beat for c1's agent"; echo "$forged_out"
+    echo; echo "## what c2 makes of the forgery"; echo "$forged_seen"
+  } | tee -a "$out"
+  [ "$(field "$forged_seen" droppedNotHost)" -ge 1 ] || {
+    echo "weald-stack: c2 folded the forged beat, or never received it" >&2
+    exit 1
+  }
+  [ "$(field "$forged_seen" folded)" = "0" ] || {
+    echo "weald-stack: c2 folded $(field "$forged_seen" folded) beat(s) it should have refused" >&2
+    exit 1
+  }
+  [ "$(field "$forged_seen" state)" = "offline" ] || {
+    echo "weald-stack: a forged beat lit the ring: $(field "$forged_seen" state)" >&2
+    exit 1
+  }
+
+  # c1 quits. Nothing is sent, and nothing has to be: the claim's own eight seconds
+  # run out while c2 watches.
+  # A fresh reader, which holds no beats at all: c1 has stopped, so nothing arrives
+  # inside the window and the ring is dark for the only reason it can be, which is
+  # that nobody claimed it.
+  local away
+  away="$(wc_ c2 --seconds 6 agent-availability --alias "$alias")" || {
+    echo "weald-stack: c2 could not read the availability after the host went away" >&2
+    exit 1
+  }
+  { echo; echo "## what c2 sees after c1 stops"; echo "$away"; } | tee -a "$out"
+  [ "$(field "$away" state)" = "offline" ] || {
+    echo "weald-stack: c2 shows '$(field "$away" state)' for a host that stopped beating" >&2
+    exit 1
+  }
+  [ "$(field "$away" accepts)" = "no" ] || {
+    echo "weald-stack: c2 would still compose an invoke to an offline host" >&2
+    exit 1
+  }
+  [ "$(field "$away" compose)" = "declined/hostOffline" ] || {
+    echo "weald-stack: the composer says '$(field "$away" compose)', not declined/hostOffline" >&2
+    exit 1
+  }
+  [ "$(field "$away" reason)" = "hostOffline" ] || {
+    echo "weald-stack: the refusal carried reason '$(field "$away" reason)'" >&2
+    exit 1
+  }
+  # The deadline the requester signed, not one this harness invented: an offline host
+  # is a visible state *with a countdown*, which is the whole invariant.
+  [ -n "$(field "$away" deadline)" ] || {
+    echo "weald-stack: the refusal carried no deadline, which is the spinner" >&2
+    exit 1
+  }
+  [ "$(field "$away" deadline)" = "$(field "$invoke_out" deadline)" ] || {
+    echo "weald-stack: the displayed deadline is not the one c2 signed" >&2
+    exit 1
+  }
+
+  # The zero delta. Every beat above crossed a real relay backed by real Postgres,
+  # and the relay kept none of them.
+  local after_envelopes after_bytes
+  after_envelopes="$(relay_psql "select count(*) from relay_envelope e join relay_group g \
+on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  after_bytes="$(relay_psql "select coalesce(sum(octet_length(ct)),0) from relay_envelope e \
+join relay_group g on g.group_id = e.group_id where g.workspace_id = '$ws'" \
+    | tr -d '[:space:]')"
+  # The card and the invoke are durable and are expected to have landed; what must
+  # not have moved is the count *between* the two readings taken after them, so the
+  # delta is measured across the ephemeral half alone.
+  local ephemeral_before ephemeral_after
+  ephemeral_before="$(relay_psql "select count(*) from relay_envelope e join relay_group g \
+on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  wc_ c1 --seconds 4 --ttl 110 agent-beat --alias "$alias" --state busy >>"$out" 2>&1 || {
+    echo "weald-stack: the closing beat did not go" >&2; exit 1
+  }
+  ephemeral_after="$(relay_psql "select count(*) from relay_envelope e join relay_group g \
+on g.group_id = e.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  [ "$ephemeral_before" = "$ephemeral_after" ] || {
+    echo "weald-stack: a LIVE beat added $((ephemeral_after - ephemeral_before)) envelope row(s)" >&2
+    exit 1
+  }
+  # And no table anywhere grew a row that names the beat. The frame has no id, so the
+  # assertion is over the tables that could have carried one: the envelope log, the
+  # handshake log and the checkpoint anchors.
+  local handshakes anchors
+  handshakes="$(relay_psql "select count(*) from relay_handshake h join relay_group g \
+on g.group_id = h.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+  anchors="$(relay_psql "select count(*) from relay_checkpoint_anchor a join relay_group g \
+on g.group_id = a.group_id where g.workspace_id = '$ws'" | tr -d '[:space:]')"
+
+  {
+    echo
+    echo "## the comparison"
+    echo "beaten     c1 sent=$(field "$beat_out" sent) ttl=$(field "$beat_out" ttl) \
+shed=$(field "$beat_out" shed) budget=$(field "$beat_out" budget)"
+    echo "seen       state=$(field "$live" state) accepts=$(field "$live" accepts) \
+compose=$(field "$live" compose)"
+    echo "forged     dropped=$(field "$forged_seen" droppedNotHost) by the host rule, \
+carried by the relay, folded=$(field "$forged_seen" folded)"
+    echo "offline    state=$(field "$away" state) reason=$(field "$away" reason) \
+deadline=$(field "$away" deadline)"
+    echo "signed     c2's invoke deadline=$(field "$invoke_out" deadline)"
+    echo "envelopes  before=$before_envelopes after=$after_envelopes \
+bytes before=$before_bytes after=$after_bytes"
+    echo "ephemeral  envelope rows $ephemeral_before -> $ephemeral_after across a beat"
+    echo "handshakes $handshakes  anchors $anchors  (a LIVE has no row in either)"
+    echo "converged  one ring, two facts: the agent is dark, the invoke has a deadline"
+  } | tee -a "$out"
+
+  echo "offline=inside-ttl"
+  echo "declined=hostOffline"
+  echo "live_rows=0"
+}
+
+# Step 22's crossing: a member opens a private conversation with an organization's
+# agent, is shown the disclosure, sends, and folds one signed answer.
+#
+# The same real parts as step 19's crossing, because the claim is the same shape and a
+# lighter rig would prove a group rather than a conversation: two real client processes,
+# the real relay, a scratch control plane holding a real sealed provider credential, the
+# real worker behind per-run mutual TLS, and the real gateway in its own process. What is
+# new is the group it all happens in: `GroupKind.agentdm`, created by the member, holding
+# one person and one agent card and labelled as such at every surface.
+#
+# The refusals are driven here too, in the same run, because each of them is a state a
+# person can reach: an agent asking to open the conversation, a member who has not
+# accepted the disclosure, an agent nobody assigned the scope to, and the original dm
+# policy still refusing an agent principal outright.
+cmd_agent_dm_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-22}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-dm-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/agentdm-crossing.txt"
+
+  local provider_key
+  provider_key="$(/usr/bin/security find-generic-password -s com.dicyanin.weald \
+    -a openrouter-api-key -w 2>/dev/null || true)"
+  [ -n "$provider_key" ] || {
+    echo "weald-stack: no OpenRouter key in the Keychain. This crossing reaches the" >&2
+    echo "real vendor and there is no test mode." >&2
+    exit 1
+  }
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(4).hex())')"
+  local alias="reviewer-dm$nonce"
+  local unassigned="stranger-dm$nonce"
+  local work; work="$STACK_STATE/agentdm-crossing-$nonce"
+  mkdir -p "$work/pki"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  # The channel group, which the agent is also assigned so that the disclosure and the
+  # card projection have a shared scope to be read in, and the `agentdm` group, derived
+  # by the client itself rather than by a bash reimplementation of `GroupID.derive`.
+  local channel; channel="$(field "$(wc_ c1 agent-members)" group)"
+  [ -n "$channel" ] || { echo "weald-stack: c1 named no group" >&2; exit 1; }
+  local derived; derived="$(wc_ c2 adm-derive --alias "$alias")" || {
+    echo "weald-stack: c2 could not derive the conversation's group" >&2; exit 1; }
+  local group agent slug
+  group="$(field "$derived" group)"
+  agent="$(field "$derived" agent)"
+  slug="$(field "$derived" slug)"
+  [ -n "$group" ] && [ -n "$agent" ] || {
+    echo "weald-stack: the derivation named no group or no agent" >&2; exit 1; }
+  [ "$group" != "$channel" ] || {
+    echo "weald-stack: the conversation derived the channel's own group" >&2; exit 1; }
+  [ "$(field "$derived" kind)" = "agentdm" ] || {
+    echo "weald-stack: the derived group is kind $(field "$derived" kind)" >&2; exit 1; }
+  [ "$(field "$derived" identity)" = "$group" ] || {
+    echo "weald-stack: the identity record and the scope derive different groups" >&2; exit 1; }
+  [ "$(field "$derived" section)" = "agents" ] || {
+    echo "weald-stack: the conversation is drawn in the $(field "$derived" section) section" >&2
+    exit 1; }
+
+  {
+    echo "# A member opens a private conversation with an organization's agent"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "alias     $alias"
+    echo "channel   $channel"
+    echo "agentdm   $group  slug $slug"
+    echo "c1 device $d1  (the admin)"
+    echo "c2 device $d2  (the member whose conversation this is)"
+  } | tee "$out"
+
+  # The gateway's key, and its principal before the process exists.
+  local seed principal
+  seed="$(python3 -c 'import os; print(os.urandom(32).hex())')"
+  principal="$(field "$(cargo run -q -p weald-agent-gateway --example principal_of -- "$seed")" principal)"
+  [ -n "$principal" ] || { echo "weald-stack: could not derive the gateway principal" >&2; exit 1; }
+  wc_ c1 admit --device "$principal" >>"$out" 2>&1 || {
+    echo "weald-stack: the admin could not admit the gateway to the access set" >&2
+    tail -20 "$out" >&2
+    exit 1
+  }
+
+  # The control plane. Two scopes, assigned in the one admin action step 22 says an
+  # `agentdm` is: "an `agentdm` is a scope like any other. It appears in the card's
+  # scopes or the agent cannot be invoked in it, and assignment is the same admin action
+  # as assigning a channel."
+  local control_db="weald_agents_adm_$nonce"
+  docker exec -i "$(dc ps -q postgres)" createdb -U weald "$control_db" >/dev/null 2>&1 || true
+  local control_url="postgres://weald:weald@127.0.0.1:$WEALD_STACK_PG_PORT/$control_db"
+  local seeded
+  seeded="$(WEALD_LLM_OPENROUTER_KEY="$provider_key" cargo run -q -p weald-agent-worker \
+    --example org_crossing_seed -- \
+    --database "$control_url" --alias "$alias" \
+    --scope "$channel" --scope "$group" \
+    --member "$d1" --member "$d2" --pki "$work/pki" \
+    --model "${WEALD_AGENT_CROSSING_MODEL:-anthropic/claude-haiku-4.5}")" || {
+    echo "weald-stack: seeding the control plane failed" >&2
+    exit 1
+  }
+  local kek; kek="$(field "$seeded" kek)"
+  [ "$(field "$seeded" agent)" = "$agent" ] || {
+    echo "weald-stack: the control plane hosts $(field "$seeded" agent), the client "\
+"addressed $agent" >&2
+    exit 1
+  }
+  [ "$(field "$seeded" scopes)" = "2" ] || {
+    echo "weald-stack: the agent was assigned $(field "$seeded" scopes) scope(s)" >&2
+    exit 1
+  }
+  { echo; echo "## the control plane"; echo "agent $agent"; echo "database $control_db";
+    echo "scopes channel + agentdm"; } | tee -a "$out"
+
+  local worker_port; worker_port="$(python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  cargo build -q -p weald-agent-worker --bin weald-agent-worker || {
+    echo "weald-stack: the worker did not build" >&2; exit 1; }
+  WEALD_AGENT_WORKER_LISTEN="127.0.0.1:$worker_port" \
+  WEALD_AGENT_WORKER_SERVER_CERT="$(cat "$work/pki/server.pem")" \
+  WEALD_AGENT_WORKER_CLIENT_CA="$(cat "$work/pki/ca.pem")" \
+  WEALD_AGENT_WORKER_KEK="$kek" \
+  WEALD_AGENT_WORKER_DATABASE_URL="$control_url" \
+    nohup "$ROOT/target/debug/weald-agent-worker" >"$work/worker.log" 2>&1 &
+  local worker_pid=$!
+
+  cargo build -q -p weald-agent-gateway --bin weald-agent-gateway || {
+    echo "weald-stack: the gateway did not build" >&2; kill "$worker_pid" 2>/dev/null; exit 1; }
+  local gateway_port; gateway_port="$(python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  WEALD_AGENT_GATEWAY_LISTEN="127.0.0.1:$gateway_port" \
+  WEALD_AGENT_GATEWAY_RELAY_URL="127.0.0.1:$WEALD_STACK_RELAY_PORT" \
+  WEALD_AGENT_GATEWAY_DEVICE_KEY="$seed" \
+  WEALD_AGENT_GATEWAY_DATABASE_URL="$control_url" \
+  WEALD_AGENT_GATEWAY_STATE="$work/mls.sqlite" \
+  WEALD_AGENT_WORKER_URL="127.0.0.1:$worker_port" \
+  WEALD_AGENT_WORKER_CLIENT_CERT="$(cat "$work/pki/client.pem")" \
+    nohup "$ROOT/target/debug/weald-agent-gateway" >"$work/gateway.log" 2>&1 &
+  local gateway_pid=$!
+
+  adm_crossing_stop() {
+    kill "$gateway_pid" "$worker_pid" 2>/dev/null || true
+    wait "$gateway_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+  }
+
+  # The key package the gateway publishes on the way up, which is what a member adds it
+  # to the conversation with. `private-messaging.md`'s establishment, unchanged: the
+  # agent's key package is published by its host.
+  local waited=0 package=""
+  while [ "$waited" -lt 120 ]; do
+    package="$(docker exec -i "$(dc ps -q postgres)" psql -U weald -d "$control_db" -tAc \
+      "select encode(key_package,'hex') from agent_gateway_key_package" 2>/dev/null \
+      | tr -d '[:space:]' || true)"
+    if [ -n "$package" ]; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ -n "$package" ] || {
+    echo "weald-stack: the gateway never published a key package" >&2
+    tail -20 "$work/gateway.log" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  python3 -c 'import sys, binascii
+open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
+    "$work/key-package.bin" "$package"
+  # Both scopes subscribed, because the welcome for the conversation is published into
+  # the conversation's own handshake stream and a gateway that had not subscribed to it
+  # would never see the group it was invited to.
+  waited=0
+  while [ "$waited" -lt 120 ] && ! grep -q "scopes=2" "$work/gateway.log"; do
+    sleep 1; waited=$((waited + 1))
+  done
+  grep -q "scopes=2" "$work/gateway.log" || {
+    echo "weald-stack: the gateway never subscribed to both scopes" >&2
+    tail -30 "$work/gateway.log" >&2
+    adm_crossing_stop
+    exit 1
+  }
+
+  # The card, delivered by the admin's own device, because the gateway is not a member of
+  # the workspace root group where cards are read from.
+  local card_hex=""
+  waited=0
+  while [ "$waited" -lt 90 ]; do
+    card_hex="$(docker exec -i "$(dc ps -q postgres)" psql -U weald -d "$control_db" -tAc \
+      "select encode(card,'hex') from agent_hosted_card" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$card_hex" ]; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ -n "$card_hex" ] || {
+    echo "weald-stack: the gateway published no hosted card" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  python3 -c 'import sys, binascii
+open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
+    "$work/agent-card.bin" "$card_hex"
+  local card_out
+  card_out="$(wc_ c1 agent-org-card --secrets-file "$work/agent-card.bin")" || {
+    echo "weald-stack: c1 could not publish the organization card" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c1 publishes the gateway's card"; echo "$card_out"; } | tee -a "$out"
+  wc_ c1 --seconds 10 sync >/dev/null 2>&1 || true
+  wc_ c2 --seconds 10 sync >/dev/null 2>&1 || true
+
+  # The refusals, before the conversation exists, because each is a state a person can
+  # reach and three of them would otherwise be provable only in a suite.
+  local refused_agent refused_undisclosed refused_unassigned refused_dm
+  refused_agent="$(wc_ c2 adm-open --alias "$alias" --state agent)" || {
+    echo "weald-stack: adm-open --state agent did not answer at all" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$refused_agent" reason)" = "agentCreator" ] || {
+    echo "weald-stack: an agent was allowed to open the conversation: $refused_agent" >&2
+    adm_crossing_stop; exit 1; }
+  refused_undisclosed="$(wc_ c2 adm-open --alias "$alias" --state decline)" || {
+    echo "weald-stack: adm-open --state decline did not answer at all" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$refused_undisclosed" reason)" = "undisclosed" ] || {
+    echo "weald-stack: a declined disclosure still opened the conversation: "\
+"$refused_undisclosed" >&2
+    adm_crossing_stop; exit 1; }
+  refused_unassigned="$(wc_ c2 adm-open --alias "$unassigned")" || {
+    echo "weald-stack: adm-open against an unassigned agent did not answer" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$refused_unassigned" reason)" = "notAssigned" ] || {
+    echo "weald-stack: an unassigned agent was given a conversation: $refused_unassigned" >&2
+    adm_crossing_stop; exit 1; }
+  # And the refusal this whole step exists so as not to weaken.
+  refused_dm="$(wc_ c2 dm-open --state agent)" || {
+    echo "weald-stack: dm-open --state agent did not answer" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$refused_dm" state)" = "refused" ] \
+    && [ "$(field "$refused_dm" reason)" = "dm.principal.agent" ] || {
+    echo "weald-stack: the human dm policy admitted an agent: $refused_dm" >&2
+    adm_crossing_stop; exit 1; }
+  {
+    echo; echo "## what is refused"
+    echo "agent creator     $(field "$refused_agent" reason)"
+    echo "undisclosed       $(field "$refused_undisclosed" reason)"
+    echo "unassigned agent  $(field "$refused_unassigned" reason)"
+    echo "agent in a dm     $(field "$refused_dm" reason)  (unchanged, still permanent)"
+  } | tee -a "$out"
+
+  # The disclosure, in the conversation's own scope. Required before creation, which is
+  # stricter than a channel mention: creating the conversation is itself the first thing
+  # sent to somebody else's server.
+  local declined_out accepted_out
+  declined_out="$(wc_ c2 agent-disclosure --alias "$alias" --scope-group "$group" \
+    --state decline)" || {
+    echo "weald-stack: c2 was never shown a disclosure for $alias" >&2
+    adm_crossing_stop; exit 1; }
+  [ -z "$(field "$declined_out" invocable)" ] || {
+    echo "weald-stack: a declined disclosure still left the agent invocable" >&2
+    adm_crossing_stop; exit 1; }
+  accepted_out="$(wc_ c2 agent-disclosure --alias "$alias" --scope-group "$group" \
+    --state accept)" || {
+    echo "weald-stack: c2 could not accept the disclosure" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$accepted_out" invocable)" = "$alias" ] || {
+    echo "weald-stack: an accepted disclosure did not make the agent invocable" >&2
+    adm_crossing_stop; exit 1; }
+  { echo; echo "## c2 is shown the disclosure, declines, then accepts";
+    echo "$declined_out"; echo; echo "$accepted_out"; } | tee -a "$out"
+
+  # The conversation. Created by the member, holding the gateway's leaf, with the welcome
+  # in the group's own handshake stream.
+  local opened
+  opened="$(wc_ c2 adm-open --alias "$alias" --fingerprint "$agent" \
+    --secrets-file "$work/key-package.bin")" || {
+    echo "weald-stack: c2 could not open the conversation" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c2 opens the conversation"; echo "$opened"; } | tee -a "$out"
+  [ "$(field "$opened" state)" = "opened" ] || {
+    echo "weald-stack: the conversation is $(field "$opened" state)" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" group)" = "$group" ] || {
+    echo "weald-stack: the conversation opened group $(field "$opened" group)" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" welcomes)" = "1" ] || {
+    echo "weald-stack: $(field "$opened" welcomes) welcome(s) published" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" private)" = "no" ] || {
+    echo "weald-stack: the conversation reports itself as private" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" section)" = "agents" ] \
+    && [ "$(field "$opened" peopleSection)" = "people" ] || {
+    echo "weald-stack: the two sidebar sections are not distinct" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" dmAdmitsAgents)" = "no" ] || {
+    echo "weald-stack: the dm policy admitted an agent during the crossing" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$opened" recoveryWrap)" = "no" ] || {
+    echo "weald-stack: an agentdm published a recovery wrap" >&2
+    adm_crossing_stop; exit 1; }
+  case "$(field "$opened" header)" in
+    *"Not private"*) : ;;
+    *) echo "weald-stack: the header does not say the host can read this" >&2
+       adm_crossing_stop; exit 1 ;;
+  esac
+
+  # The message, and the invoke beside it, into the conversation.
+  local token="CLOISTER$nonce"
+  local sent
+  sent="$(wc_ c2 adm-send --alias "$alias" \
+    --body "@$alias In one short sentence, tell me the reference code for this conversation, which is $token, quoted exactly as written.")" || {
+    echo "weald-stack: c2 could not send into the conversation" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c2 sends"; echo "$sent"; } | tee -a "$out"
+  [ "$(field "$sent" agent)" = "$agent" ] || {
+    echo "weald-stack: the invoke addressed $(field "$sent" agent)" >&2
+    adm_crossing_stop; exit 1; }
+
+  waited=0
+  while [ "$waited" -lt 180 ] && ! grep -q "answered outcome=Answered" "$work/gateway.log"; do
+    wc_ c2 --seconds 5 sync >/dev/null 2>&1 || true
+    waited=$((waited + 5))
+  done
+  grep -q "answered outcome=Answered" "$work/gateway.log" || {
+    echo "weald-stack: the gateway never answered in the conversation" >&2
+    tail -40 "$work/gateway.log" >&2
+    adm_crossing_stop
+    exit 1
+  }
+  { echo; echo "## the gateway"; grep -E "^(received|answered|published)" "$work/gateway.log"; } \
+    | tee -a "$out"
+
+  local read_out folded=0
+  while [ "$folded" -lt 12 ]; do
+    if read_out="$(wc_ c2 adm-read --alias "$alias" 2>/dev/null)"; then break; fi
+    wc_ c2 --seconds 10 sync >/dev/null 2>&1 || true
+    folded=$((folded + 1))
+  done
+  read_out="$(wc_ c2 adm-read --alias "$alias")" || {
+    echo "weald-stack: c2 could not fold the answer in the conversation" >&2
+    adm_crossing_stop; exit 1; }
+  { echo; echo "## c2 reads"; echo "$read_out"; } | tee -a "$out"
+  [ "$(field "$read_out" verified)" = "yes" ] || {
+    echo "weald-stack: the answer did not verify" >&2; adm_crossing_stop; exit 1; }
+  [ "$(field "$read_out" state)" = "completed" ] || {
+    echo "weald-stack: folded state $(field "$read_out" state)" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$read_out" anomalies)" = "0" ] || {
+    echo "weald-stack: $(field "$read_out" anomalies) anomalies" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$(field "$read_out" renders)" = "yes" ] || {
+    echo "weald-stack: the header a person reads this under fails its own assertion" >&2
+    adm_crossing_stop; exit 1; }
+  local author; author="$(field "$read_out" answerAuthor)"
+  [ "$author" = "$principal" ] || {
+    echo "weald-stack: the answer was authored by $author, not by the gateway" >&2
+    adm_crossing_stop; exit 1; }
+  [ "$author" != "$d1" ] && [ "$author" != "$d2" ] || {
+    echo "weald-stack: the answer was authored by a person's device key" >&2
+    adm_crossing_stop; exit 1; }
+  local answer_folded token_folded
+  answer_folded="$(tr '[:upper:]' '[:lower:]' <<< "$(field "$read_out" answerText)")"
+  token_folded="$(tr '[:upper:]' '[:lower:]' <<< "$token")"
+  case "$answer_folded" in
+    *"$token_folded"*) : ;;
+    *) echo "weald-stack: the answer does not carry the token the member asked for" >&2
+       adm_crossing_stop; exit 1 ;;
+  esac
+
+  # And the other member is not in it. Two principals, and the second is the agent: c1 is
+  # an admin of this workspace and holds no content key for the conversation's group, so
+  # the conversation is private from the workspace even though the agent's host can read
+  # it. Read from c1's own seal rather than asserted.
+  local c1groups
+  c1groups="$(wc_ c1 groups 2>/dev/null || true)"
+  case "$c1groups" in
+    *"$group"*) echo "weald-stack: c1 holds the conversation's group" >&2
+                adm_crossing_stop; exit 1 ;;
+    *) : ;;
+  esac
+
+  {
+    echo
+    echo "## the comparison"
+    echo "kind         agentdm, created by the member $d2"
+    echo "group        $group  slug $slug"
+    echo "principals   one person and one agent card; c1 the admin holds no key for it"
+    echo "sections     $(field "$opened" peopleSection) and $(field "$opened" section), distinct"
+    echo "header       $(field "$read_out" header)"
+    echo "private      $(field "$read_out" private)  (the word a dm header carries, refused)"
+    echo "answered     $(field "$read_out" state) anomalies=$(field "$read_out" anomalies)"
+    echo "answerAuthor $author  (the gateway, not $d1 and not $d2)"
+    echo "answerText   $(field "$read_out" answerText)"
+    echo "token        $token present in the answer"
+    echo "refusals     agentCreator, undisclosed, notAssigned, dm.principal.agent"
+  } | tee -a "$out"
+
+  adm_crossing_stop
+  docker exec -i "$(dc ps -q postgres)" dropdb -U weald --if-exists "$control_db" >/dev/null 2>&1 || true
+  rm -rf "$work"
+
+  echo "opened=agentdm"
+  echo "answered=gateway"
+  echo "refused=agentCreator,undisclosed,notAssigned,dm.principal.agent"
+  echo "sections=people,agents"
+}
+
 # Step 16's crossing: a remote ticket ask executes only on the published owner and
 # survives a reconnect without a second answer.
 #
@@ -4452,6 +5490,9 @@ main() {
     agent-org-crossing) cmd_agent_org_crossing "$@" ;;
     agent-mention-crossing) cmd_agent_mention_crossing "$@" ;;
     agent-offline-crossing) cmd_agent_offline_crossing "$@" ;;
+    agent-availability-crossing) cmd_agent_availability_crossing "$@" ;;
+    agent-availability-gateway) cmd_agent_availability_gateway "$@" ;;
+    agent-dm-crossing) cmd_agent_dm_crossing "$@" ;;
     agent-ticket-crossing) cmd_agent_ticket_crossing "$@" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "weald-stack: unknown command: $cmd" >&2; exit 64 ;;

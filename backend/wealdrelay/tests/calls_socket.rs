@@ -126,6 +126,23 @@ async fn closed(client: &mut Client) -> bool {
     )
 }
 
+/// One frame, or a named failure rather than a hung test.
+///
+/// A test that blocks on `recv_frame` forever does not fail, it occupies its
+/// runner: `a_sixth_participant_is_refused_and_the_five_keep_talking` waited
+/// 4 h 23 m here and took the whole release job's ceiling with it on
+/// wealdrelay-v0.1.36, publishing nothing. Under `Clock::Fixed` no deadline
+/// ever arrives to close the socket, so the bound has to be the test's.
+async fn frame_within(client: &mut Client, what: &str) -> Frame {
+    match tokio::time::timeout(std::time::Duration::from_secs(30), client.recv()).await {
+        Ok(Some(payload)) => {
+            Frame::decode(&payload).expect("the relay sent something that is not a frame")
+        }
+        Ok(None) => panic!("the relay closed the socket while waiting for {what}"),
+        Err(_) => panic!("no {what} within thirty seconds"),
+    }
+}
+
 fn offer(id: &[u8], group: &[u8]) -> Frame {
     signal(id, group, CallKind::Offer)
 }
@@ -834,6 +851,28 @@ async fn a_sixth_participant_is_refused_and_the_five_keep_talking() {
         clients.push(client);
     }
 
+    // Every one of the five is in the call before the sixth asks to be. `send_frame`
+    // returns when the bytes are written, not when the relay has counted them, so
+    // the sixth used to race the five: on a loaded host it could be admitted as the
+    // fourth or fifth participant, and then it waited forever for a refusal that
+    // was never owed it. One connection's frames are handled in the order they
+    // arrive, so an acknowledgement for a frame sent after the offer is proof that
+    // the offer ahead of it has been counted, and a `Sub` is the cheapest frame
+    // here that is always answered.
+    for (index, client) in clients.iter_mut().enumerate() {
+        client
+            .send_frame(&Frame::Sub {
+                group: group.clone(),
+                from_seq: 0,
+            })
+            .await;
+        let frame = frame_within(client, "the acknowledgement behind participant's offer").await;
+        assert!(
+            matches!(frame, Frame::SubAck { .. }),
+            "expected participant {index}'s offer to have been counted, got {frame:?}"
+        );
+    }
+
     let mut sixth = Client::connect(relay.address).await;
     sixth
         .handshake_as(
@@ -843,7 +882,7 @@ async fn a_sixth_participant_is_refused_and_the_five_keep_talking() {
         )
         .await;
     sixth.send_frame(&offer(&id, &group)).await;
-    match sixth.recv_frame().await {
+    match frame_within(&mut sixth, "the refusal owed a sixth participant").await {
         Frame::Error(error) => {
             assert_eq!(error.code, ErrorCode::RateLimited);
             assert_eq!(

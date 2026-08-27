@@ -34,7 +34,7 @@ because it is authorization state and must not merge last-writer-wins.
 ```
 GroupPolicy {
   group:      [32]byte          // group id
-  kind:       "ws" | "chan" | "dm"
+  kind:       "ws" | "chan" | "dm" | "agentdm"
   parent:     [32]byte | null   // the workspace root for a channel, null otherwise
   admission:  "everyone" | "parent" | "explicit"
   history:    "open" | "closed"
@@ -88,6 +88,17 @@ Legal combinations, and the only ones a client may create:
 | `ws` | `everyone` | `open` |
 | `chan` | `parent` or `explicit` | `open` if `parent`, `closed` if `explicit` |
 | `dm` | `explicit` | `closed` |
+| `agentdm` | `explicit` | `closed` |
+
+`agentdm` is the fourth kind, added by `specs/agents/networked/phases-live.md`
+step 22: a private conversation holding one person and one agent card. It has
+the `dm` shape and differs in one field of the admission decision rather than in
+the policy record, which is why it is a row here and not a page of its own: the
+second principal is an agent, so `dm`'s permanent refusal of `PrincipalKind.agent`
+stays exactly as written and this kind is the route around it. Only the human
+creates one, the slug prefix is `adm-` rather than `dm-`, the sidebar section and
+the header are different by rule rather than by convention, and no group of either
+kind ever publishes a recovery wrap.
 
 There is no project group, because the workspace root **is** the project: it
 carries the roster, the tickets, the board state and the project documents.
