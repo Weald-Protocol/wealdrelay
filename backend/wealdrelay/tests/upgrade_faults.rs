@@ -30,9 +30,22 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The handshake deadline the abort test configures. One of the three paths out
+/// of an aborted upgrade completes the upgrade against a socket that is already
+/// gone, and that connection is closed by this deadline rather than by anything
+/// the test does, so the drain below must be a multiple of it and not a round
+/// number picked by hand.
+const ABORT_HANDSHAKE_MS: u64 = 5_000;
+
 /// Wait for the open-connection counter to drain to zero, or fail with its value.
+///
+/// The budget is twelve handshake deadlines. Thirty seconds, six of them, failed
+/// the v0.1.34 release on a two-core hosted runner driving twenty sequential
+/// aborts: the reap is a timer inside each connection loop, so on a starved host
+/// the wait is the deadline plus however long that task waits to be scheduled.
+/// A leak is permanent, so a generous ceiling costs nothing and still fails.
 async fn drained(relay: &Running) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_millis(ABORT_HANDSHAKE_MS * 12);
     loop {
         let open = relay.state.open_connections();
         if open == 0 {
@@ -72,7 +85,7 @@ async fn aborted_upgrades_leave_no_connection_slot_behind() {
     // how the v0.1.32 release failed here with nothing about slot accounting
     // changed. With a moving clock the relay reaps it on its own schedule and the
     // bound below is the relay's, not the operating system's.
-    config.handshake_timeout_ms = 5_000;
+    config.handshake_timeout_ms = ABORT_HANDSHAKE_MS;
     let relay = Running::start(config, Clock::System).await;
 
     for _ in 0..20 {

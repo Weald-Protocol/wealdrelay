@@ -312,6 +312,16 @@ relay_start() {
     fi
     # Something else is on our port. Never adopt it: see `relay_is_ours`.
     relay_reclaim_port || return 1
+  elif lsof -nP -iTCP:"$WEALD_STACK_RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    # Held, and answering nothing. A relay left wedged by a Postgres that went away
+    # under it keeps its listener and fails every health check, and `up` then tried
+    # to bind the port anyway and reported "Address already in use" while claiming
+    # the stack was up: every crossing afterwards failed with "the relay is not
+    # serving" for a reason that had nothing to do with what it was proving. The
+    # port is not part of any proof, so this moves rather than killing a process
+    # this harness cannot prove is its own.
+    note "wealdrelay" "port $WEALD_STACK_RELAY_PORT is held by a process answering no health check"
+    relay_reclaim_port || return 1
   fi
   mkdir -p "$STACK_STATE/blobs"
   # `--relay-db` is a database of the harness Postgres, created if absent. One
@@ -3684,6 +3694,73 @@ open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
   { echo; echo "## c1 admits the gateway"; echo "$admit_out"; } | tee -a "$out"
   [ "$(field "$admit_out" welcome)" = "1" ] || {
     echo "weald-stack: the welcome was not published" >&2
+    org_crossing_stop
+    exit 1
+  }
+
+  # The card, delivered. The gateway signs its hosted cards into the control plane
+  # (`hosting::reconcile`) and is deliberately not a member of the workspace root
+  # group, which is where every client reads cards from, so the admin's own device
+  # publishes the signed bytes. Without this a mention of an organization agent
+  # resolves to nothing on a real client and there is nothing to disclose.
+  local card_hex=""
+  waited=0
+  while [ "$waited" -lt 90 ]; do
+    card_hex="$(docker exec -i "$(dc ps -q postgres)" psql -U weald -d "$control_db" -tAc \
+      "select encode(card,'hex') from agent_hosted_card" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$card_hex" ]; then break; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ -n "$card_hex" ] || {
+    echo "weald-stack: the gateway published no hosted card" >&2
+    org_crossing_stop
+    exit 1
+  }
+  python3 -c 'import sys, binascii
+open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
+    "$work/agent-card.bin" "$card_hex"
+  local card_out
+  card_out="$(wc_ c1 agent-org-card --secrets-file "$work/agent-card.bin")" || {
+    echo "weald-stack: c1 could not publish the organization card" >&2
+    org_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c1 publishes the gateway's card"; echo "$card_out"; } | tee -a "$out"
+  wc_ c1 --seconds 10 sync >/dev/null 2>&1 || true
+  wc_ c2 --seconds 10 sync >/dev/null 2>&1 || true
+
+  # What c2 is shown before it may invoke at all. Step 13: the client discloses the
+  # organization, region, provider, model, retention and cost policy and the
+  # capabilities before a first invocation, and declining leaves the mention as
+  # text. Both answers are driven here, in that order, so the run proves the
+  # refusal as well as the acceptance rather than only the path that continues.
+  local declined_out
+  declined_out="$(wc_ c2 agent-disclosure --alias "$alias" --scope-group "$group" --state decline)" || {
+    echo "weald-stack: c2 was never shown a disclosure for $alias" >&2
+    org_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c2 is shown the disclosure and declines"; echo "$declined_out"; } | tee -a "$out"
+  [ -z "$(field "$declined_out" invocable)" ] || {
+    echo "weald-stack: a declined disclosure still left the mention invocable" >&2
+    org_crossing_stop
+    exit 1
+  }
+  local accepted_out
+  accepted_out="$(wc_ c2 agent-disclosure --alias "$alias" --scope-group "$group" --state accept)" || {
+    echo "weald-stack: c2 could not accept the disclosure" >&2
+    org_crossing_stop
+    exit 1
+  }
+  { echo; echo "## c2 accepts"; echo "$accepted_out"; } | tee -a "$out"
+  [ "$(field "$accepted_out" invocable)" = "$alias" ] || {
+    echo "weald-stack: an accepted disclosure did not make the mention invocable" >&2
+    org_crossing_stop
+    exit 1
+  }
+  [ -n "$(field "$accepted_out" provider)" ] && [ -n "$(field "$accepted_out" model)" ] || {
+    echo "weald-stack: the disclosure named no provider or model" >&2
     org_crossing_stop
     exit 1
   }
