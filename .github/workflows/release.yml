@@ -49,7 +49,10 @@ jobs:
     # over real sockets, the two reproducible builds and the clean-clone rebuild
     # are untouched, and the digest they agree on is a property of the source
     # rather than of how many property cases ran.
-    timeout-minutes: 180
+    # Raised from 180 with the oversubscription below, because the cancellation
+    # it caused published nothing at all: the ceiling is the last line of
+    # defence and it should not be the thing the suite is racing.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml is the pin and has to be the pin here too.
@@ -78,8 +81,17 @@ jobs:
           set -eux
           cargo install cddl --locked --quiet
           ./scripts/spec-check.sh
+      # `RUST_TEST_THREADS` because these suites are bound by Postgres round
+      # trips and by relay deadlines, not by CPU: a test waiting on a 5 second
+      # handshake deadline occupies a core it is not using. The default is the
+      # runner's core count, which is how `build and test` grew to 2h50m57s on
+      # wealdrelay-v0.1.33 and was cancelled against this job's ceiling on
+      # v0.1.35 while `tests/session.rs` alone cost 3434 s here against 17 s on
+      # a developer machine running the same commands. Eight is the same
+      # oversubscription a laptop gets for free.
       - env:
           PROPTEST_CASES: "64"
+          RUST_TEST_THREADS: "8"
         run: cargo test --workspace --locked
       - if: always()
         run: scripts/weald-stack down
