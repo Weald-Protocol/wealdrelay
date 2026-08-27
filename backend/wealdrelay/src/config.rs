@@ -648,6 +648,20 @@ pub enum ConfigError {
          a plaintext wake url on any other host puts a wake capability on the wire"
     )]
     PushUrlNotSecure { key: &'static str, value: String },
+    /// A `register_url` past the bound `push.md` section 3 fixes, either stated
+    /// directly or derived from the wake url. Fatal at startup rather than
+    /// discovered on the wire: the relay states this value in every `Capability`
+    /// answer, and a conforming client refuses one over the bound, so a relay that
+    /// started with it would answer every registration with something every device
+    /// throws away (BR-047).
+    #[error(
+        "{key} resolves to a register_url of {bytes} bytes, over the          {max}-byte bound every client enforces"
+    )]
+    PushRegisterUrlTooLong {
+        key: &'static str,
+        bytes: usize,
+        max: usize,
+    },
     /// A setting the hosted profile forbids. Fatal at startup: a relay that
     /// logged about a forbidden setting and served anyway would be a relay whose
     /// posture nobody chose (`crate::profile`).
@@ -680,6 +694,7 @@ impl ConfigError {
             | Self::PushUrlMissing { key, .. }
             | Self::PushSettingUnused { key, .. }
             | Self::PushUrlNotSecure { key, .. }
+            | Self::PushRegisterUrlTooLong { key, .. }
             | Self::ZeroLimit { key } => Some(key),
             Self::UnknownFileKey { key, .. } | Self::NonScalarFileValue { key, .. } => Some(key),
             Self::UnreadableFile { .. } | Self::MalformedFile { .. } => None,
@@ -1040,6 +1055,30 @@ impl Config {
                     });
                 }
             }
+        }
+        // The bound, on the value the relay will actually state. Checked here and not
+        // only in the codec because `Settings::from_config` derives this string from
+        // the wake url when the operator named none, so a long `WEALD_RELAY_PUSH_URL`
+        // can carry it over the line without anyone setting it (BR-047).
+        let register_url = self
+            .push_register_url
+            .clone()
+            .or_else(|| {
+                self.push_url
+                    .as_deref()
+                    .map(crate::push::default_register_url)
+            })
+            .unwrap_or_default();
+        if register_url.len() > crate::push::MAX_REGISTER_URL_BYTES {
+            return Err(ConfigError::PushRegisterUrlTooLong {
+                key: if self.push_register_url.is_some() {
+                    keys::PUSH_REGISTER_URL
+                } else {
+                    keys::PUSH_URL
+                },
+                bytes: register_url.len(),
+                max: crate::push::MAX_REGISTER_URL_BYTES,
+            });
         }
         Ok(())
     }

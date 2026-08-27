@@ -404,6 +404,20 @@ one.
    `Sources/Sync/RetentionRecords.swift`'s `Resolution` and
    `Weald relay-client resolve-freeze --id EPOCH`.
 
+   WEALD-L716 records what the recovery cost when the client read the wrong
+   answer. A cleared freeze is `Response::RetentionResolved`, tag 11 and an empty
+   body; a retention *control* is acknowledged with tag 9 and a digest. The Mac
+   client accepted only tag 9, so a resolution that actually cleared the freeze
+   exited non-zero saying the group was not resolved. The client now reads both
+   tags, asks the relay for its settled epoch with `RetentionPosition` before
+   signing anything, prints that epoch beside its own, and offers every epoch it
+   holds a key for rather than only the newest: the relay accepts a resolution at
+   any epoch it has a candidate control for, so a member that never held the
+   conflicting controls can still resolve after one sync. A verifier the relay has
+   no candidate for is refused `writer_not_in_access_set` with the detail
+   `unknown_retention_verifier`, so an operator is not sent hunting a membership
+   fault that does not exist.
+
 The resulting property, stated at its real strength rather than a flattering one:
 a removed member cannot cause deletion, because their forged branch freezes the
 group instead of governing it. They can cause a **freeze**, meaning the group

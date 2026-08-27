@@ -71,7 +71,7 @@ async fn the_item_read_is_ascending_and_tolerates_gaps() {
     let first = store(pool, &group, b"first", 1).await;
     let second = store(pool, &group, b"second", 4).await;
 
-    let items = log::items(pool, &group).await.expect("read the items");
+    let items = log::items(pool, &group, 0).await.expect("read the items");
     assert_eq!(
         items.iter().map(|item| item.seq).collect::<Vec<_>>(),
         vec![1, 4, 9]
@@ -83,7 +83,7 @@ async fn the_item_read_is_ascending_and_tolerates_gaps() {
     // A group with nothing in it reads as empty rather than as an error: the relay
     // cannot tell a group it has never heard of from one with no envelopes, and
     // saying so would be a membership signal.
-    assert!(log::items(pool, &[0x99; 32]).await.unwrap().is_empty());
+    assert!(log::items(pool, &[0x99; 32], 0).await.unwrap().is_empty());
 
     relay.shutdown().await;
     scratch.drop_database().await;
@@ -275,7 +275,7 @@ async fn every_read_reports_a_database_that_has_gone() {
         .await
         .expect("drop it under the relay");
 
-    let items = log::items(&pool, &group).await;
+    let items = log::items(&pool, &group, 0).await;
     let one = log::envelope_bytes(&pool, &group, &stored.hash).await;
     let several = log::envelopes_for(&pool, &group, &[id_of(&stored)]).await;
     let backfill = log::since(&pool, &group, 0, usize::MAX, usize::MAX).await;
@@ -341,7 +341,7 @@ async fn a_relay_that_can_list_but_not_read_answers_retry() {
         .expect("connect as the list-only role");
 
     // The list works.
-    let items = log::items(&limited, &group)
+    let items = log::items(&limited, &group, 0)
         .await
         .expect("listing is permitted");
     assert_eq!(items.len(), 1);
@@ -478,6 +478,48 @@ async fn a_batch_of_envelopes_is_one_round_trip_rather_than_one_each() {
     assert_eq!(first.computed_hash(), first.hash);
     assert_eq!(first.seq, 1);
     assert_eq!(first.ts, CLOCK);
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// BR-036: the reconciliation window is anchored at the caller's floor, not at the
+/// newest row, so the middle of a large group is reachable rather than in no answer.
+///
+/// The bound itself is not exercised here (a hundred thousand rows of real inserts
+/// is not a test anybody runs); what is exercised is the property that made the
+/// truncation dangerous. A newest-first window drops the *oldest* rows, which no
+/// later round can name; a floor-anchored window drops the newest, which the next
+/// round reaches because the floor rises as low ranges settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_item_read_starts_at_the_floor_it_is_given() {
+    let scratch = Scratch::new("logfloor").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = make_group(&relay.state, 0x64).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+
+    for seq in 1..=6i64 {
+        store(pool, &group, format!("body {seq}").as_bytes(), seq).await;
+    }
+
+    let all = log::items(pool, &group, 0).await.expect("read from zero");
+    assert_eq!(
+        all.iter().map(|item| item.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
+
+    // The floor is inclusive, and everything above it is present: the window grows
+    // upward from where the peer still has work to do.
+    let above = log::items(pool, &group, 4).await.expect("read from four");
+    assert_eq!(
+        above.iter().map(|item| item.seq).collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+
+    // Past the head is empty rather than an error, for the same reason an unknown
+    // group is: there is nothing to say and saying it differently would be a signal.
+    assert!(log::items(pool, &group, 99).await.unwrap().is_empty());
 
     relay.shutdown().await;
     scratch.drop_database().await;

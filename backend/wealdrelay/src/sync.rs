@@ -169,6 +169,24 @@ fn reopen_omitted(
     }
 }
 
+/// The lowest sequence the peer has not already settled.
+///
+/// `respond` answers a `Skip` span from the message rather than from the relay's
+/// item set, so items below this floor cannot change any answer, and reading them
+/// only spends the one bounded window `log::items` is allowed. Anchoring that
+/// window here is what closes BR-036: the truncation moves to the top of the range,
+/// where the next round reaches it, instead of the middle, where nothing did.
+fn unsettled_floor(incoming: &Message) -> u64 {
+    let mut lower = 0u64;
+    for range in &incoming.ranges {
+        if !matches!(range.mode, negentropy::Mode::Skip) {
+            return lower;
+        }
+        lower = range.upper;
+    }
+    lower
+}
+
 /// Answer one `RECON` round. Returns false when the connection should end.
 pub async fn reconcile(
     sender: &crate::ws::OutboundSender,
@@ -192,7 +210,7 @@ pub async fn reconcile(
         );
     };
 
-    let items = match log::items(database.pool(), &group).await {
+    let items = match log::items(database.pool(), &group, unsettled_floor(&incoming)).await {
         Ok(items) => items,
         Err(_) => {
             return queue_all(

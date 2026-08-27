@@ -145,6 +145,34 @@ impl BuildInfo {
     pub fn line(&self) -> String {
         format!("{} {}", self.name, self.version)
     }
+
+    /// The wire protocol range this build serves, as its own line.
+    ///
+    /// Separate from ``line`` and printed after it, so step 13's diff keeps the
+    /// identity line it has always compared while an operator still gets the one
+    /// number a capability shortfall turns on.
+    ///
+    /// This exists because a digest is opaque about behaviour as well as bytes
+    /// (WEALD-L339). A hosted cell answered `push=unsupported`, which is what a
+    /// client prints when the session negotiated below
+    /// `crate::frame::PROTOCOL_VERSION`'s push form, and deciding whether the
+    /// client or the running image was behind took a source read across two
+    /// languages and a guess about which digest the cell had been created at.
+    /// A cell keeps the digest it was created at until an upgrade is deployed to
+    /// it (`specs/backend/build/container-image.md`), so "the source speaks 4" is
+    /// never an answer about a running box. The binary says it itself now.
+    pub fn protocol_line(&self) -> String {
+        format!(
+            "protocol {}..{}",
+            crate::frame::MIN_PROTOCOL_VERSION,
+            crate::frame::PROTOCOL_VERSION
+        )
+    }
+
+    /// What `--version` prints: the identity, then the protocol range.
+    pub fn version_report(&self) -> String {
+        format!("{}\n{}", self.line(), self.protocol_line())
+    }
 }
 
 /// What the process was asked to do. Parsed from argv so that `main` holds no
@@ -571,7 +599,7 @@ fn describe_storage(target: &config::StorageTarget) -> String {
 fn run_invocation(invocation: Invocation) -> Outcome {
     match invocation {
         Invocation::Version => Outcome {
-            stdout: BuildInfo::current().line(),
+            stdout: BuildInfo::current().version_report(),
             stderr: String::new(),
             code: 0,
         },
@@ -650,7 +678,19 @@ mod tests {
     fn version_run_prints_the_identity_and_exits_zero() {
         let out = run(["--version"]);
         assert_eq!(out.code, 0);
-        assert_eq!(out.stdout, BuildInfo::current().line());
+        assert_eq!(out.stdout, BuildInfo::current().version_report());
+        assert!(out.stdout.starts_with(&BuildInfo::current().line()));
+        assert_eq!(
+            out.stdout.lines().nth(1),
+            Some(
+                format!(
+                    "protocol {}..{}",
+                    crate::frame::MIN_PROTOCOL_VERSION,
+                    crate::frame::PROTOCOL_VERSION
+                )
+                .as_str()
+            )
+        );
         assert!(out.stderr.is_empty());
     }
 

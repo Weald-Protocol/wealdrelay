@@ -34,6 +34,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use wealdrelay::health::{Clock, RelayState};
 use wealdrelay::media::retention::{self, ControlOutcome, StoreError};
+use wealdrelay::media::store as media_store;
 
 use support::{
     blob_hash, config_for, device_from, make_group_in, signed_control, signed_manifest,
@@ -528,6 +529,86 @@ async fn a_manifest_that_cannot_be_written_is_not_reported_as_an_accepted_claim(
     .await
     .unwrap();
     assert_eq!(rows, 0, "a refused manifest claimed a blob anyway");
+
+    scratch.drop_database().await;
+}
+
+/// BR-040: the manifest and every claim it names land together or not at all.
+///
+/// `media.md` makes an accepted manifest the boundary after which a named blob is no
+/// longer an unclaimed-upload candidate. Committing the manifest first and then
+/// claiming blob by blob put a durable "latest manifest" in front of an object the
+/// collector could still delete, and an exact retry could not repair it: the retry
+/// fails the sequence check, so the later claims had no second chance to run.
+#[tokio::test]
+async fn a_manifest_whose_claims_cannot_land_leaves_no_manifest_behind() {
+    let (scratch, _blobs, state) = prepared("retentionfault_partial_claims").await;
+    let pool = pool_of(&state);
+    let workspace = "ws-partialclaim";
+    let group = workspace_with(&state, workspace, 0x6e).await;
+    let epoch0 = verifier_key(0x27);
+    retention::apply_control(pool, &signed_control(&group, 0, &epoch0, None, &epoch0))
+        .await
+        .unwrap();
+
+    media_store::ensure_quota_row(pool, workspace, Some(100_000))
+        .await
+        .unwrap();
+    for byte in [7u8, 8u8] {
+        media_store::reserve(pool, workspace, &group, &blob_hash(byte), 10, false, 900)
+            .await
+            .unwrap();
+    }
+
+    let manifest = signed_manifest(
+        &group,
+        0,
+        1,
+        None,
+        vec![blob_hash(7), blob_hash(8)],
+        &epoch0,
+    );
+
+    // The claim's own write is what fails, after the manifest row has been written
+    // inside the same transaction. This is the exact shape of the original defect.
+    refuse_statements(pool, "relay_blob_reservation", "update").await;
+    is_told_to_come_back(
+        retention::apply_manifest(pool, workspace, &manifest).await,
+        "a manifest whose claims the database will not take",
+    );
+    stop_refusing(pool, "relay_blob_reservation", "update").await;
+
+    assert!(
+        retention::latest_manifest(pool, &group)
+            .await
+            .unwrap()
+            .is_none(),
+        "the manifest outlived the claims it promised"
+    );
+    let finalized: i64 = sqlx::query_scalar(
+        "select count(*) from relay_blob_reservation where finalized_at is not null",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(finalized, 0, "a claim survived a manifest that did not");
+
+    // And the exact retry now repairs everything, because the sequence it names is
+    // still the sequence the chain is waiting for.
+    let outcome = retention::apply_manifest(pool, workspace, &manifest)
+        .await
+        .expect("the retry runs");
+    assert!(
+        matches!(outcome, retention::ManifestOutcome::Accepted { .. }),
+        "the exact retry was refused: {outcome:?}"
+    );
+    let finalized: i64 = sqlx::query_scalar(
+        "select count(*) from relay_blob_reservation where finalized_at is not null",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(finalized, 2, "the retry left a claim unrepaired");
 
     scratch.drop_database().await;
 }

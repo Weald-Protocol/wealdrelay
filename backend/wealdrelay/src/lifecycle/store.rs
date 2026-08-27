@@ -113,18 +113,25 @@ pub async fn drop_before(
     // The checkpoint's own envelope is an anchor as much as the snapshots are:
     // it is the signature a joiner verifies history from once the changes beneath
     // it are gone.
-    for hash in std::iter::once(&manifest_hash.to_vec()).chain(snapshots.iter()) {
-        sqlx::query(
-            "insert into relay_checkpoint_anchor (group_id, manifest_hash, hash) \
-             values ($1, $2, $3) on conflict do nothing",
-        )
-        .bind(group)
-        .bind(manifest_hash)
-        .bind(hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?;
-    }
+    //
+    // One statement, not one per hash: a `DROP` may name `MAX_SNAPSHOTS` (4096)
+    // snapshots, and the loop that wrote them one at a time made a single frame cost
+    // thousands of sequential round trips against the relay's small shared pool,
+    // which one admitted member could repeat at socket speed (BR-039). This is the
+    // same correction `missing_envelopes` already carries for the read half.
+    let anchors: Vec<Vec<u8>> = std::iter::once(manifest_hash.to_vec())
+        .chain(snapshots.iter().cloned())
+        .collect();
+    sqlx::query(
+        "insert into relay_checkpoint_anchor (group_id, manifest_hash, hash) \
+         select $1, $2, h from unnest($3::bytea[]) as h on conflict do nothing",
+    )
+    .bind(group)
+    .bind(manifest_hash)
+    .bind(&anchors)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
 
     // Anchors are read across every checkpoint this group has, not just this one.
     // An older checkpoint's snapshots are still the anchor for anybody verifying

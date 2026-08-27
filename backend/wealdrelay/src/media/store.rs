@@ -188,8 +188,16 @@ pub async fn reserve(
     .map_err(db)?;
     if let Some(existing) = existing {
         let reservation_id: Uuid = existing.try_get("reservation_id").map_err(db)?;
+        // Both clocks move. `expires_at` is the upload window the client is being
+        // given; `created_at` is what the unclaimed collector measures age against,
+        // and leaving it where it was meant a client that resumed a large upload at
+        // hour 23 had its object deleted and its quota released an hour later,
+        // inside the window it had just been granted (BR-041). The row's age is
+        // time since it was last active, which is the only reading under which the
+        // window `media.md` calls refreshable is actually refreshable.
         sqlx::query(
-            "update relay_blob_reservation set expires_at = now() + make_interval(secs => $2) \
+            "update relay_blob_reservation \
+             set expires_at = now() + make_interval(secs => $2), created_at = now() \
              where reservation_id = $1",
         )
         .bind(reservation_id)
@@ -354,6 +362,24 @@ pub async fn claim(
     hash: &[u8],
 ) -> Result<bool, StoreError> {
     let mut tx = pool.begin().await.map_err(db)?;
+    let claimed = claim_in(&mut tx, workspace, group, hash).await?;
+    tx.commit().await.map_err(db)?;
+    Ok(claimed)
+}
+
+/// `claim`, inside a transaction the caller owns.
+///
+/// `retention::apply_manifest` needs the manifest row and every claim it names to
+/// land together: committing the manifest first and then claiming blob by blob left
+/// a durable "latest manifest" whose named objects were still unclaimed-upload
+/// candidates, and an exact retry could not repair the later claims because the
+/// sequence check now refused it (BR-040).
+pub(crate) async fn claim_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: &str,
+    group: &[u8],
+    hash: &[u8],
+) -> Result<bool, StoreError> {
     let row = sqlx::query(
         "update relay_blob_reservation set finalized_at = now() \
          where workspace_id = $1 and group_id = $2 and blob_hash = $3 and finalized_at is null \
@@ -362,11 +388,10 @@ pub async fn claim(
     .bind(workspace)
     .bind(group)
     .bind(hash)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(db)?;
     let Some(row) = row else {
-        tx.commit().await.map_err(db)?;
         return Ok(false);
     };
     let bytes: i64 = row.try_get("bytes").map_err(db)?;
@@ -376,10 +401,9 @@ pub async fn claim(
     )
     .bind(workspace)
     .bind(bytes)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(db)?;
-    tx.commit().await.map_err(db)?;
     Ok(true)
 }
 
@@ -531,8 +555,14 @@ pub async fn active_scopes(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>, Stor
         .collect()
 }
 
-/// Every reservation older than `older_than_seconds` that was never finalized:
-/// the 24-hour unclaimed-upload collector's candidate list.
+/// Every reservation older than `older_than_seconds` that was never finalized: the
+/// unclaimed-upload collector's candidate list.
+///
+/// The age is time since the reservation was last *active*, not since it was first
+/// taken: `reserve` moves `created_at` forward when it refreshes an upload window,
+/// for the reason given there (BR-041). Written as one clock rather than as a second
+/// predicate on `expires_at`, so an operator sweep with a shortened grace still means
+/// what it says.
 pub async fn stale_unclaimed(
     pool: &PgPool,
     older_than_seconds: i64,

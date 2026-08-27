@@ -25,9 +25,9 @@
 //! The bound that matters is `MAX_ITEMS_PER_RECONCILE` below, and it is a bound on
 //! the relay's resident memory as much as on the database's work: the set is
 //! materialised whole, in the relay process, once per reconciliation round. Past
-//! the bound the relay reconciles the newest window and the older tail is reached
-//! by `SUB` with an explicit cursor, rather than loading an unbounded set into
-//! memory because a peer asked it to.
+//! the bound the relay reconciles one window anchored at the peer's own unsettled
+//! floor and the rounds that follow walk upward, rather than loading an unbounded
+//! set into memory because a peer asked it to.
 //!
 //! The read is one index-only scan of `relay_envelope_group_seq_hash_idx`, which is
 //! `(group_id, seq) include (hash)`. That was not true until migration
@@ -55,9 +55,10 @@ use crate::negentropy::Item;
 ///
 /// A hundred thousand is four megabytes of pairs and still covers a corpus far
 /// past anything `specs/backend/build/local-harness.md` describes. A group past it
-/// reconciles over its newest window and the older tail is reached by `SUB` with
-/// an explicit cursor, which is the case compaction
-/// (`specs/backend/relay/lifecycle.md`) is supposed to prevent from ever arising.
+/// reconciles one window at a time, anchored at the lowest range the peer has not
+/// settled, so the rounds walk the history upward instead of leaving its middle in
+/// no answer at all (BR-036). Compaction
+/// (`specs/backend/relay/lifecycle.md`) is what keeps a real group under the bound.
 pub const MAX_ITEMS_PER_RECONCILE: i64 = 100_000;
 
 /// The most envelopes one `SUB` reads before the client is told to reconcile
@@ -83,20 +84,30 @@ fn log_error(error: sqlx::Error) -> LogError {
     }
 }
 
-/// Every `(seq, hash)` the group holds, ascending by `seq`.
-pub async fn items(pool: &PgPool, group: &[u8]) -> Result<Vec<Item>, LogError> {
-    // Newest first out of the database so the bound keeps the newest window, then
-    // reversed at the end: everything downstream binary-searches this slice and
-    // needs it ascending.
-    //
-    // Streamed rather than `fetch_all`, so the driver's own `Vec<PgRow>` is not a
-    // second, wider copy of the set alive at the same time as the `Vec<Item>`
-    // being built from it. A row carries its own buffer; an item is 40 bytes.
+/// Every `(seq, hash)` the group holds at or above `from_seq`, ascending by `seq`.
+///
+/// The window is anchored at the caller's floor and grows upward, which is what
+/// makes the bound survivable. Anchoring it at the newest row instead left the
+/// interval between a short `SUB` backfill and the window's own lower edge in
+/// neither answer: `respond` cannot offer an identifier it was not given, so a
+/// client and a relay could settle with tens of thousands of envelopes missing and
+/// no round that would ever name them (WEALD-336 / BR-036).
+///
+/// `sync::reconcile` passes the lower bound of the first range the peer has not
+/// already settled, so a truncated window truncates at the *top*, where the next
+/// round reaches it: settled ranges are answered from the message rather than from
+/// this set, and each round the floor rises by at most one window.
+///
+/// Streamed rather than `fetch_all`, so the driver's own `Vec<PgRow>` is not a
+/// second, wider copy of the set alive at the same time as the `Vec<Item>`
+/// being built from it. A row carries its own buffer; an item is 40 bytes.
+pub async fn items(pool: &PgPool, group: &[u8], from_seq: u64) -> Result<Vec<Item>, LogError> {
     let mut rows = sqlx::query(
-        "select seq, hash from relay_envelope where group_id = $1 \
-         order by seq desc limit $2",
+        "select seq, hash from relay_envelope where group_id = $1 and seq >= $2 \
+         order by seq asc limit $3",
     )
     .bind(group)
+    .bind(i64::try_from(from_seq).unwrap_or(i64::MAX))
     .bind(MAX_ITEMS_PER_RECONCILE)
     .fetch(pool);
 
@@ -104,7 +115,6 @@ pub async fn items(pool: &PgPool, group: &[u8]) -> Result<Vec<Item>, LogError> {
     while let Some(row) = rows.try_next().await.map_err(log_error)? {
         items.push(row_to_item(&row));
     }
-    items.reverse();
     Ok(items)
 }
 

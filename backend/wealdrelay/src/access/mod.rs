@@ -365,8 +365,19 @@ pub fn quorum_message(digest: &[u8], replacement_entry: &[u8]) -> Vec<u8> {
 /// signature crate: a 31-byte key and a bad signature are the same answer to the
 /// only question this module asks, and two error paths for one answer is two paths
 /// for a caller to get wrong.
+///
+/// `verify_strict` and not `verify`, and that is a correctness rule rather than a
+/// preference. The permissive check tests the group equation alone, which a
+/// small-order public key satisfies for a signature nobody had to hold a secret to
+/// write: the all-zero key with the all-zero signature is a point of order four,
+/// and the equation holds whenever the challenge hash lands in one residue class,
+/// so roughly one connection in four accepted it. A red team run against a live
+/// relay saw exactly that, as an `AUTH` whose refusal code changed with the key and
+/// therefore told an outsider which possession checks had passed. Strict
+/// verification refuses a small-order or non-canonical key outright, so no key an
+/// attacker can write reaches the membership read behind it.
 pub fn verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
     let Ok(key_bytes): Result<[u8; KEY_BYTES], _> = pubkey.try_into() else {
         return false;
     };
@@ -376,7 +387,7 @@ pub fn verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
         return false;
     };
-    key.verify(message, &Signature::from_bytes(&sig_bytes))
+    key.verify_strict(message, &Signature::from_bytes(&sig_bytes))
         .is_ok()
 }
 

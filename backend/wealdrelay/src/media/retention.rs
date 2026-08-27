@@ -508,6 +508,13 @@ pub async fn apply_manifest(
     }
 
     let digest = record.digest();
+    // The manifest row and every claim it names, in one transaction. `media.md`
+    // makes an accepted manifest the boundary after which a named blob is no longer
+    // an unclaimed-upload candidate, so a manifest that is durable while one of its
+    // claims is not is a named object the collector may still delete, and an exact
+    // retry cannot repair it because the sequence check refuses the second attempt
+    // (BR-040). Either the whole boundary moves or none of it does.
+    let mut tx = pool.begin().await.map_err(db)?;
     sqlx::query(
         "insert into relay_retention_manifest \
          (group_id, sequence, epoch, prev_manifest_hash, blobs, sig, digest) \
@@ -520,15 +527,16 @@ pub async fn apply_manifest(
     .bind(&record.blobs)
     .bind(&record.sig)
     .bind(&digest)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
 
     for hash in &record.blobs {
-        super::store::claim(pool, workspace, &record.group, hash)
+        super::store::claim_in(&mut tx, workspace, &record.group, hash)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))?;
     }
+    tx.commit().await.map_err(db)?;
 
     Ok(ManifestOutcome::Accepted { digest })
 }

@@ -25,6 +25,7 @@ pub mod boundary;
 pub mod buffer;
 pub mod ffi;
 pub mod handle;
+pub mod handshake_record;
 pub mod recovery;
 pub mod session;
 pub mod status;

@@ -1430,3 +1430,26 @@ async fn the_position_names_the_newest_control_epoch() {
 
     scratch.drop_database().await;
 }
+
+/// The bytes a cleared freeze actually puts on the wire.
+///
+/// WEALD-L716. The relay answers a resolution with `RTAG_RETENTION_RESOLVED` and
+/// never with the acknowledgement tag a control gets, and the Mac client read only
+/// the latter: a resolution that genuinely cleared the freeze was reported to the
+/// operator as "the relay answered ... with 11 rather than an acknowledgement",
+/// with a non-zero exit, so the one recovery a frozen group has looked broken from
+/// the outside every single time it worked. Pinned as bytes because the fix on the
+/// client side is a constant that has to keep matching this one.
+#[test]
+fn a_cleared_freeze_answers_its_own_tag_and_carries_nothing_else() {
+    let encoded = wealdrelay::media::wire::Response::RetentionResolved.encode();
+    // CBOR array(2) [ 11, array(0) ].
+    assert_eq!(encoded, vec![0x82, 0x0b, 0x80]);
+    assert_eq!(
+        wealdrelay::media::wire::Response::decode(&encoded).unwrap(),
+        wealdrelay::media::wire::Response::RetentionResolved
+    );
+    // And it is not the acknowledgement tag, which is the confusion that cost the
+    // ticket: an acknowledgement carries a digest, a resolution carries nothing.
+    assert_ne!(encoded[1], 0x09);
+}

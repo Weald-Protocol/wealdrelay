@@ -368,6 +368,34 @@ fn every_wrong_shaped_input_to_verify_is_one_answer_and_not_a_type() {
     assert!(!access::verify(&pk(&signer), b"other bytes", &signature));
 }
 
+/// The all-zero device key with the all-zero signature is not a signature.
+///
+/// It is a point of order four, and the permissive Ed25519 check tests only the
+/// group equation, which that point satisfies whenever the challenge hash lands in
+/// one residue class of four. A live red team run watched a relay accept it on
+/// roughly a quarter of its connections and answer a different refusal code when it
+/// did, which is an outsider learning which possession checks passed. Strict
+/// verification refuses the key itself, so every challenge answers the same way.
+///
+/// Many messages rather than one: a single challenge has a three in four chance of
+/// refusing even under the permissive check, so a one-message assertion would have
+/// passed against the defect it exists to catch.
+#[test]
+fn a_small_order_key_never_verifies_whatever_the_challenge_is() {
+    for index in 0u16..256 {
+        let message = index.to_be_bytes();
+        assert!(
+            !access::verify(&[0u8; 32], &message, &[0u8; 64]),
+            "challenge {index}: the identity-adjacent key must never verify"
+        );
+    }
+    // And a real key still does, over the same shape of message.
+    let signer = key(1);
+    let message = 7u16.to_be_bytes();
+    let signature = signer.sign(&message).to_bytes().to_vec();
+    assert!(access::verify(&pk(&signer), &message, &signature));
+}
+
 #[test]
 fn a_quorum_confirms_only_with_distinct_configured_keys_over_this_transition() {
     let configured = RecoveryQuorum {

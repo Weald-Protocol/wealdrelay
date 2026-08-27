@@ -673,3 +673,37 @@ fn the_outbound_writer_refuses_a_frame_over_the_wire_cap() {
     assert_eq!(bytes, small.encode());
     assert!(bytes.len() <= MAX_FRAME_BYTES);
 }
+
+// MARK: The pre-auth JOIN flood
+
+/// The one budget that bounds a peer which has authenticated nothing has to hold
+/// at the socket layer, not only in `Session::handle`: a red team run against a
+/// live relay saw 22 pre-auth `JOIN`s answered `quota/seats_exhausted` and never
+/// `quota/rate_limited`, which is the budget being bypassed rather than spent.
+#[tokio::test]
+async fn a_pre_auth_join_flood_is_refused_by_the_frame_budget() {
+    let state = blind();
+    let mut session = Session::new(&state.config);
+    let (sender, mut receiver) = outbound_channel();
+    let allowance = wealdrelay::session::JOIN_FRAMES_PER_MINUTE;
+    let mut first_rate_limited: Option<u32> = None;
+    for index in 1..=allowance + 2 {
+        let frame = Frame::Join {
+            body: vec![index as u8; 24],
+        };
+        let message = Message::Binary(frame.encode());
+        handle_message(&sender, &state, &mut session, CONNECTION, message, NOW).await;
+        while let Ok(Outbound::Frame(queued)) = receiver.try_recv() {
+            if let Frame::Error(error) = queued {
+                if error.code == ErrorCode::RateLimited && first_rate_limited.is_none() {
+                    first_rate_limited = Some(index);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        first_rate_limited,
+        Some(allowance + 1),
+        "the JOIN budget must bite on the frame after the allowance"
+    );
+}

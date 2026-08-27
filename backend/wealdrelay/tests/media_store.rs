@@ -430,6 +430,56 @@ async fn only_reservations_past_the_grace_and_never_claimed_are_stale() {
     scratch.drop_database().await;
 }
 
+/// BR-041: a reservation whose window was refreshed survives the collector, even
+/// though its `created_at` is older than the grace period.
+///
+/// `media.md` defines a *refreshable* upload window, and `reserve` refreshes
+/// `expires_at` while `created_at` deliberately stays put. A collector that read the
+/// age alone deleted the object and released the quota of an upload it had just
+/// granted a fresh window to, which the client experiences as a large upload that
+/// vanishes at the 24 hour mark no matter how recently it was resumed.
+#[tokio::test]
+async fn a_refreshed_reservation_is_not_collected_inside_its_new_window() {
+    let (scratch, _blobs, state) = prepared("mediastore_refreshed").await;
+    let pool = pool_of(&state);
+    let group = make_group(&state, 0x5e).await;
+    store::ensure_quota_row(pool, WORKSPACE, Some(100_000))
+        .await
+        .unwrap();
+
+    let hash = blob_hash(0xf7);
+    let id = reservation_id(
+        &store::reserve(pool, WORKSPACE, &group, &hash, 40, false, TTL)
+            .await
+            .unwrap(),
+    );
+    age(pool, id, "25 hours").await;
+
+    // Old on both clocks: collectable, which is the case the sweep exists for.
+    let stale = store::stale_unclaimed(pool, wealdrelay::media::gc::UNCLAIMED_GRACE_SECONDS)
+        .await
+        .unwrap();
+    assert!(stale.iter().any(|row| row.3 == id));
+
+    // The client resumes. The retry refreshes the window and holds the same row.
+    let again = reservation_id(
+        &store::reserve(pool, WORKSPACE, &group, &hash, 40, false, TTL)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(again, id, "a retry refreshes rather than doubling");
+
+    let stale = store::stale_unclaimed(pool, wealdrelay::media::gc::UNCLAIMED_GRACE_SECONDS)
+        .await
+        .unwrap();
+    assert!(
+        !stale.iter().any(|row| row.3 == id),
+        "a live upload window is not an abandoned upload"
+    );
+
+    scratch.drop_database().await;
+}
+
 async fn age(pool: &PgPool, id: uuid::Uuid, interval: &str) {
     sqlx::query(&format!(
         "update relay_blob_reservation set created_at = now() - interval '{interval}' \

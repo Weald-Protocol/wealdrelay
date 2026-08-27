@@ -157,6 +157,12 @@ fn every_request_and_every_response_round_trips_through_its_encoding() {
         Request::Revoke {
             token: vec![0x09; 16],
         },
+        Request::Refresh {
+            token: vec![0x0a; 16],
+            group: vec![0x0b; 32],
+            epoch: 7,
+            ct: vec![0x0c; 8],
+        },
     ];
     for request in requests {
         let encoded = request.encode();
@@ -201,6 +207,8 @@ fn every_request_and_every_response_round_trips_through_its_encoding() {
         Response::Revoked {
             token: vec![0x07; 16],
         },
+        Response::Refreshed { accepted: true },
+        Response::Refreshed { accepted: false },
     ];
     for response in responses {
         let encoded = response.encode();
@@ -1060,6 +1068,123 @@ async fn the_record_step_serves_the_issuer_s_own_bytes_and_an_empty_body_for_a_t
         panic!("the record step answered with something else");
     };
     assert!(body.is_empty());
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+// MARK: Refresh
+
+/// BR-045: an admin's client can actually upload a fresh sealed `GroupInfo`.
+///
+/// `invites.md` requires a bundle refresh after a commit, and `store::refresh_bundle`
+/// has implemented it since it was written, but until the `Refresh` arm existed no
+/// frame reached it: every outstanding invite went stale on the next commit and its
+/// parked joins waited for expiry. This is the wire in front of it, held to the same
+/// workspace scoping every other privileged arm carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn refreshing_a_bundle_is_scoped_and_reaches_the_store() {
+    let (scratch, _blobs, relay) = prepared("invite_admin_refresh").await;
+    let pool = pool_of(&relay.state);
+    let root_key = key(0x21);
+    let member = key(0x22);
+    found(pool, &root_key, &[&member]).await;
+
+    let own = issue(&root_key, 0xd1, Code::from_bits(0x0123_4567_89ab_cdef));
+    admin::handle(
+        pool,
+        WORKSPACE,
+        &pk(&root_key),
+        Request::Create {
+            record: own.encode(),
+        },
+        CLOCK as i64,
+    )
+    .await
+    .expect("issued");
+
+    let refresh = |token: Vec<u8>, group: Vec<u8>, epoch: u64| Request::Refresh {
+        token,
+        group,
+        epoch,
+        ct: b"a fresher GroupInfo sealed to the same update key".to_vec(),
+    };
+
+    // A member who is not an authorizer is refused before anything is written, as
+    // every other privileged arm refuses them.
+    assert!(matches!(
+        admin::handle(
+            pool,
+            WORKSPACE,
+            &pk(&member),
+            refresh(own.token.clone(), root(), 2),
+            CLOCK as i64,
+        )
+        .await,
+        Err(AdminError::NotAnAdmin)
+    ));
+
+    // The admin's own invite, its own scope: stored, and readable by the join path.
+    assert_eq!(
+        admin::handle(
+            pool,
+            WORKSPACE,
+            &pk(&root_key),
+            refresh(own.token.clone(), root(), 2),
+            CLOCK as i64,
+        )
+        .await
+        .expect("answered"),
+        Response::Refreshed { accepted: true }
+    );
+    let candidates = store::bundles_for(pool, &own.token, &root(), CLOCK as i64)
+        .await
+        .expect("the query runs");
+    assert!(candidates.iter().any(|bundle| bundle.epoch == 2));
+    // The candidate the issuer sealed into the record is still there: a refresh adds
+    // to the choices rather than replacing the one every joiner can already read.
+    assert!(candidates.iter().any(|bundle| bundle.epoch == 1));
+
+    // A group the record does not scope is refused, and so is a token this workspace
+    // does not own. One flat answer for both, because an admin has nothing to do
+    // differently about either and a distinction would be a probe.
+    assert_eq!(
+        admin::handle(
+            pool,
+            WORKSPACE,
+            &pk(&root_key),
+            refresh(own.token.clone(), vec![0x5c; 32], 2),
+            CLOCK as i64,
+        )
+        .await
+        .expect("answered"),
+        Response::Refreshed { accepted: false }
+    );
+
+    let elsewhere = issue(&key(0x31), 0xd2, Code::from_bits(0x0123_4567_89ab_cdef));
+    store::create(pool, "ws-somebody-else", &elsewhere, CLOCK as i64)
+        .await
+        .expect("stored");
+    assert_eq!(
+        admin::handle(
+            pool,
+            WORKSPACE,
+            &pk(&root_key),
+            refresh(elsewhere.token.clone(), root(), 2),
+            CLOCK as i64,
+        )
+        .await
+        .expect("answered"),
+        Response::Refreshed { accepted: false }
+    );
+    // And nothing was written there.
+    assert!(
+        store::bundles_for(pool, &elsewhere.token, &root(), CLOCK as i64)
+            .await
+            .expect("the query runs")
+            .iter()
+            .all(|bundle| bundle.epoch != 2)
+    );
 
     relay.shutdown().await;
     scratch.drop_database().await;

@@ -1543,3 +1543,51 @@ fn the_shipped_compose_environment_resolves() {
     assert_eq!(config.tls, TlsMode::Off);
     assert_eq!(config.trusted_proxy_hops, 1);
 }
+
+/// BR-047: the 512-byte `register_url` bound the relay states is also a bound the
+/// relay refuses to start over, whether the operator wrote the value or the relay
+/// derived it from the wake url.
+///
+/// Enforced at startup rather than left to the codec, because this string goes into
+/// every `Capability` answer and a conforming client refuses one past the bound: a
+/// relay that started with it would answer every registration with something every
+/// device throws away, and nothing on either side would say why.
+#[test]
+fn a_register_url_past_the_bound_refuses_to_start() {
+    let max = wealdrelay::push::MAX_REGISTER_URL_BYTES;
+    let prefix = "https://ringer.example/v1/handles?p=";
+    let padded: &'static str =
+        Box::leak(format!("{prefix}{}", "a".repeat(max + 1 - prefix.len())).into_boxed_str());
+    assert_eq!(padded.len(), max + 1);
+
+    let error = resolve_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+        (keys::PUSH_REGISTER_URL, padded),
+    ])
+    .expect_err("a stated register url past the bound is refused");
+    assert!(matches!(error, ConfigError::PushRegisterUrlTooLong { .. }));
+    assert_eq!(error.key(), Some(keys::PUSH_REGISTER_URL));
+
+    // The derived half. Nobody set the register url here; it came off the wake url,
+    // which is the way an operator crosses this line without ever seeing the value.
+    let wake_prefix = "https://ringer.example/v1/wake?p=";
+    let long_wake: &'static str =
+        Box::leak(format!("{wake_prefix}{}", "a".repeat(max - wake_prefix.len())).into_boxed_str());
+    let error = resolve_with(&[(keys::PUSH, "on"), (keys::PUSH_URL, long_wake)])
+        .expect_err("a derived register url past the bound is refused");
+    assert!(matches!(error, ConfigError::PushRegisterUrlTooLong { .. }));
+    assert_eq!(error.key(), Some(keys::PUSH_URL));
+
+    // And one exactly at the bound starts, so this is a ceiling rather than a
+    // narrowing of what `push.md` allows.
+    let exact: &'static str =
+        Box::leak(format!("{prefix}{}", "a".repeat(max - prefix.len())).into_boxed_str());
+    assert_eq!(exact.len(), max);
+    resolve_with(&[
+        (keys::PUSH, "on"),
+        (keys::PUSH_URL, "https://ringer.example/v1/wake"),
+        (keys::PUSH_REGISTER_URL, exact),
+    ])
+    .expect("the bound itself is acceptable");
+}

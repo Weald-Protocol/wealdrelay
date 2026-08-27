@@ -48,15 +48,41 @@ pub enum Request {
     List,
     /// End one, by token.
     Revoke { token: Vec<u8> },
+    /// A freshly sealed `GroupInfo` for one scope of one live invite.
+    ///
+    /// `invites.md` requires a bundle refresh after a commit, because every commit
+    /// makes the sealed candidate the record carries stale and a joiner that can
+    /// only read a stale one parks until the invite expires. `store::refresh_bundle`
+    /// has done this since it was written; until this arm existed, no frame reached
+    /// it and the promise was code with no wire in front of it (BR-045).
+    Refresh {
+        token: Vec<u8>,
+        group: Vec<u8>,
+        epoch: u64,
+        ct: Vec<u8>,
+    },
 }
 
 /// What the relay answers with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    Authority { may_issue: bool },
-    Created { token: Vec<u8> },
+    Authority {
+        may_issue: bool,
+    },
+    Created {
+        token: Vec<u8>,
+    },
     Live(Vec<Summary>),
-    Revoked { token: Vec<u8> },
+    Revoked {
+        token: Vec<u8>,
+    },
+    /// Whether the candidate was stored. `false` for a token this workspace does
+    /// not own, a scope the record does not name, an invite that is no longer live,
+    /// or ciphertext outside the bundle bound: one flat answer, because an admin has
+    /// nothing to do differently about any of them and the alternative is a probe.
+    Refreshed {
+        accepted: bool,
+    },
 }
 
 /// One live invite, as an admin's list shows it.
@@ -121,6 +147,18 @@ impl Request {
             Self::Create { record } => cbor::array(&[cbor::uint(1), cbor::bytes(record)]),
             Self::List => cbor::array(&[cbor::uint(2)]),
             Self::Revoke { token } => cbor::array(&[cbor::uint(3), cbor::bytes(token)]),
+            Self::Refresh {
+                token,
+                group,
+                epoch,
+                ct,
+            } => cbor::array(&[
+                cbor::uint(4),
+                cbor::bytes(token),
+                cbor::bytes(group),
+                cbor::uint(*epoch),
+                cbor::bytes(ct),
+            ]),
         }
     }
 
@@ -136,6 +174,12 @@ impl Request {
             (2, 1) => Self::List,
             (3, 2) => Self::Revoke {
                 token: reader.bytes()?,
+            },
+            (4, 5) => Self::Refresh {
+                token: reader.bytes()?,
+                group: reader.bytes()?,
+                epoch: reader.uint()?,
+                ct: reader.bytes()?,
             },
             _ => return Err(AdminError::UnknownRequest(kind)),
         };
@@ -156,6 +200,9 @@ impl Response {
                 cbor::array(&[cbor::uint(2), cbor::array(&encoded)])
             }
             Self::Revoked { token } => cbor::array(&[cbor::uint(3), cbor::bytes(token)]),
+            Self::Refreshed { accepted } => {
+                cbor::array(&[cbor::uint(4), cbor::uint(u64::from(*accepted))])
+            }
         }
     }
 
@@ -181,6 +228,9 @@ impl Response {
             }
             (3, 2) => Self::Revoked {
                 token: reader.bytes()?,
+            },
+            (4, 2) => Self::Refreshed {
+                accepted: reader.uint()? != 0,
             },
             _ => return Err(AdminError::UnknownRequest(kind)),
         };
@@ -317,6 +367,26 @@ pub async fn handle(
             // see an error, and an answer that distinguished "revoked" from "no such
             // token" would be a probe for tokens in other workspaces.
             Ok(Response::Revoked { token })
+        }
+        Request::Refresh {
+            token,
+            group,
+            epoch,
+            ct,
+        } => {
+            // Scoped to this workspace before anything is written, exactly as
+            // `Revoke` is: an admin of one workspace must not be able to write a
+            // candidate into another workspace's invite by presenting its token.
+            // Everything else the upload has to satisfy (the invite still live, the
+            // group actually one of its scopes, the ciphertext inside the bundle
+            // bound) is `store::refresh_bundle`'s own gate, and it answers the same
+            // `false` for all of them.
+            if !store::belongs_to(pool, &token, workspace_id).await? {
+                return Ok(Response::Refreshed { accepted: false });
+            }
+            let bundle = super::EncBundle { group, epoch, ct };
+            let accepted = store::refresh_bundle(pool, &token, &bundle).await?;
+            Ok(Response::Refreshed { accepted })
         }
     }
 }

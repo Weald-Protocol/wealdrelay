@@ -271,6 +271,28 @@ pub struct Client {
     pub stream: TcpStream,
     /// Bytes read from the socket and not yet consumed as a message.
     pub buffer: Vec<u8>,
+    /// Ping payloads this client owes a pong for, oldest first.
+    ///
+    /// The relay's idle deadline is application level and answered at the
+    /// transport level: after `WEALD_RELAY_IDLE_TIMEOUT_MS` of hearing nothing
+    /// from a peer it sends a liveness ping and closes the connection if nothing
+    /// comes back inside the probe window (`src/deadline.rs`, `Next::Probe`).
+    /// `last_seen_ms` counts "a ping, a pong, a close and a frame" alike, so any
+    /// answer keeps the socket, and a client that answers none is by definition
+    /// the wedged peer that deadline exists to remove.
+    ///
+    /// This harness consumed a ping and replied with nothing, so **every test
+    /// client here was a wedged client after five idle minutes**. It never
+    /// showed up because no test was quiet for that long, until the 24-hour call
+    /// soak: its callee only ever listens, so it was probed at five minutes,
+    /// answered nothing, and was closed, and `recv_frame`'s expect turned that
+    /// into a panic in a spawned task two minutes into a run that would then have
+    /// taken a day to report. The gate could never have passed.
+    ///
+    /// Recorded here rather than answered in `take_message` because that method
+    /// is synchronous and a pong is a write. `recv` drains this before it waits
+    /// on the socket again, which is the only point where both are possible.
+    pending_pongs: Vec<Vec<u8>>,
 }
 
 impl Client {
@@ -360,6 +382,7 @@ impl Client {
         Self {
             stream,
             buffer: Vec::new(),
+            pending_pongs: Vec::new(),
         }
     }
 
@@ -401,8 +424,14 @@ impl Client {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         loop {
             if let Some(message) = self.take_message() {
+                // Owed pongs go out before the message is handed up, not after:
+                // a caller that stops reading once it has what it wanted would
+                // otherwise leave the answer unsent for ever, which is the exact
+                // state that gets a connection closed.
+                self.answer_pings().await;
                 return message;
             }
+            self.answer_pings().await;
             let mut chunk = [0u8; 8192];
             let read = self.stream.read(&mut chunk).await.ok()?;
             if read == 0 {
@@ -453,8 +482,29 @@ impl Client {
         // provokes one fail for the wrong reason.
         match opcode {
             0x8 => Some(None),
-            0x9 | 0xa => self.take_message(),
+            // A ping is owed a pong carrying the same payload, and a pong is
+            // owed nothing. Both are still evidence the peer is there, so both
+            // are skipped past to whatever data frame follows.
+            0x9 => {
+                self.pending_pongs.push(payload);
+                self.take_message()
+            }
+            0xa => self.take_message(),
             _ => Some(Some(payload)),
+        }
+    }
+
+    /// Answer every ping this client has been sent and not yet replied to.
+    ///
+    /// Public so a test that wants to prove the deadline *fires* can decline to
+    /// call it: silence is now something a test chooses rather than something
+    /// the harness does to every test by accident.
+    pub async fn answer_pings(&mut self) {
+        if self.pending_pongs.is_empty() {
+            return;
+        }
+        for payload in std::mem::take(&mut self.pending_pongs) {
+            self.send_opcode(0xa, &payload).await;
         }
     }
 
@@ -1127,6 +1177,11 @@ pub async fn http_request(
 pub struct RecordingRinger {
     pub address: std::net::SocketAddr,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// The whole conversation, head and body, oldest first. The bodies alone say
+    /// what the relay meant; the heads say what it actually put on the wire, which
+    /// is the only thing a contract with another implementation on the far side of
+    /// it can be asserted against. See `tests/push_ringer_wire.rs`.
+    raw_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1143,16 +1198,22 @@ impl RecordingRinger {
             .expect("bind a ringer");
         let address = listener.local_addr().expect("a ringer address");
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let raw_requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
+        let raw_recorded = Arc::clone(&raw_requests);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let recorded = Arc::clone(&recorded);
+                let raw_recorded = Arc::clone(&raw_recorded);
                 tokio::spawn(async move {
-                    let request = read_http_request(&mut stream).await;
-                    recorded.lock().await.push(request);
+                    let (head, body) = read_http_request_raw(&mut stream).await;
+                    // The head keeps its trailing blank line, so this is the request
+                    // exactly as it sat on the wire.
+                    raw_recorded.lock().await.push(format!("{head}{body}"));
+                    recorded.lock().await.push(body);
                     let extra = match retry_after {
                         Some(seconds) => format!("Retry-After: {seconds}\r\n"),
                         None => String::new(),
@@ -1170,6 +1231,7 @@ impl RecordingRinger {
         Self {
             address,
             requests,
+            raw_requests,
             task,
         }
     }
@@ -1182,6 +1244,12 @@ impl RecordingRinger {
     /// Every request body it has been sent, oldest first.
     pub async fn requests(&self) -> Vec<String> {
         self.requests.lock().await.clone()
+    }
+
+    /// Every request as it arrived, request line and headers and body, oldest
+    /// first, headers lowercased exactly as they were read off the stream.
+    pub async fn raw_requests(&self) -> Vec<String> {
+        self.raw_requests.lock().await.clone()
     }
 
     /// Wait until at least `count` requests have arrived, or give up.
@@ -1252,6 +1320,14 @@ impl HangingRinger {
 /// bytes. The relay is the only client, it always sends a length, and a test listener
 /// that implemented chunked encoding would be testing itself.
 async fn read_http_request(stream: &mut TcpStream) -> String {
+    read_http_request_raw(stream).await.1
+}
+
+/// The whole request: `(head, body)`, the head ending before the blank line that
+/// separates it from the body. The head keeps its original case; only the copy
+/// used to find `content-length` is lowercased, because header names arrive in
+/// whatever case the client's HTTP stack felt like writing.
+async fn read_http_request_raw(stream: &mut TcpStream) -> (String, String) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -1259,7 +1335,7 @@ async fn read_http_request(stream: &mut TcpStream) -> String {
             Ok(1) => head.push(byte[0]),
             // The peer went away mid-request, which is a test tearing down. An empty
             // body is the honest record of it.
-            _ => return String::new(),
+            _ => return (String::new(), String::new()),
         }
     }
     let headers = String::from_utf8_lossy(&head).to_ascii_lowercase();
@@ -1271,9 +1347,11 @@ async fn read_http_request(stream: &mut TcpStream) -> String {
         .unwrap_or(0);
     let mut body = vec![0u8; length];
     if length > 0 && stream.read_exact(&mut body).await.is_err() {
-        return String::new();
+        return (String::new(), String::new());
     }
-    String::from_utf8_lossy(&body).to_string()
+    let head = String::from_utf8_lossy(&head).to_string();
+    let body = String::from_utf8_lossy(&body).to_string();
+    (head, body)
 }
 
 /// A relay with push on, pointed at `wake_url`.

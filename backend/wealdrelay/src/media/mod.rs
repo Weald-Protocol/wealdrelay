@@ -995,9 +995,15 @@ async fn handle_resolution(
         Ok(retention::ResolveOutcome::BadSignature) => {
             Frame::Error(FrameError::new(ErrorCode::MalformedHeader))
         }
-        Ok(retention::ResolveOutcome::UnknownVerifier) => {
-            Frame::Error(FrameError::new(ErrorCode::WriterNotInAccessSet))
-        }
+        // WEALD-L716: an unrecognised verifier is not an access-set problem, and
+        // reporting it as a bare `writer_not_in_access_set` sent an operator
+        // hunting a membership fault that did not exist. The detail names the
+        // real one: this device signed for an epoch the relay has no candidate
+        // control for, so it should name another epoch it holds.
+        Ok(retention::ResolveOutcome::UnknownVerifier) => Frame::Error(
+            FrameError::new(ErrorCode::WriterNotInAccessSet)
+                .detail(b"unknown_retention_verifier".to_vec()),
+        ),
         Err(error) => {
             tracing::warn!(error = %error, "media: retention resolution store failed");
             Frame::Error(FrameError::new(ErrorCode::Backpressure))

@@ -144,7 +144,17 @@ impl Relay {
             .env("WEALD_RELAY_MAX_CONCURRENT_CALLS", "8")
             .current_dir(blobs)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // The relay's own account of the run, kept.
+            //
+            // This was `Stdio::null()`, so a twenty-four hour gate threw away the
+            // only record of why the process under test did anything. When the
+            // callee's socket was closed by the idle deadline the harness could
+            // say "the relay closed unexpectedly" and nothing could say which
+            // deadline or why. A soak whose subject is unobservable is a soak
+            // that can only ever report the number it was already looking at.
+            .stderr(Stdio::from(
+                std::fs::File::create(blobs.join("relay.log")).expect("a relay log"),
+            ));
         let child = command.spawn().expect("spawn a relay");
         Self { child, port }
     }

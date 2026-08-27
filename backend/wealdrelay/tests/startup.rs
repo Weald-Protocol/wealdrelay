@@ -75,7 +75,15 @@ fn the_argv_only_invocations_do_not_consult_the_configuration() {
     let empty = Values::from_pairs(Vec::<(&str, &str)>::new());
     let version = printed(startup(["--version"], &empty));
     assert_eq!(version.code, 0);
-    assert_eq!(version.stdout, BuildInfo::current().line());
+    // The identity line, then the protocol range the build serves: the number a
+    // `push=unsupported` turns on, printed by the binary rather than inferred from
+    // the digest it was created at (WEALD-L339).
+    assert_eq!(version.stdout, BuildInfo::current().version_report());
+    assert!(version.stdout.starts_with(&BuildInfo::current().line()));
+    assert_eq!(
+        version.stdout.lines().nth(1),
+        Some(BuildInfo::current().protocol_line().as_str())
+    );
 
     let help = printed(startup(["--help"], &empty));
     assert_eq!(help.code, 0);

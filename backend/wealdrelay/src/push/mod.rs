@@ -259,7 +259,7 @@ pub struct Settings {
 /// does not end in the wake path is a ringer mounted somewhere this function cannot
 /// reason about, and the path is appended to it unchanged, which is what the operator
 /// gets to override with `WEALD_RELAY_PUSH_REGISTER_URL`.
-fn default_register_url(wake_url: &str) -> String {
+pub(crate) fn default_register_url(wake_url: &str) -> String {
     let base = wake_url.trim_end_matches('/');
     let base = base.strip_suffix(RINGER_WAKE_PATH).unwrap_or(base);
     format!("{}{RINGER_REGISTER_PATH}", base.trim_end_matches('/'))
