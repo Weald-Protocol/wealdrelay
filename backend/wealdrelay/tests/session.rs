@@ -1401,6 +1401,41 @@ fn a_binary_that_cannot_be_read_reports_unknown_rather_than_empty() {
     );
 }
 
+/// `resolve()` answers from a memo rather than re-reading the executable.
+///
+/// The signature of the memo, without reading a clock: resolve once, then change
+/// the one input `resolve()` consults, and resolve again. An unmemoised resolver
+/// reports the new value; a memoised one reports what it resolved the first time.
+///
+/// The bug this pins is not a slow function. `Session::new` calls `resolve()` for
+/// every connection, so the unbaked branch re-read and BLAKE3-hashed this process'
+/// own 84 MB executable per socket: every core of the host went to hashing, the
+/// Postgres pool behind the relay logged eight to twelve second acquires, and the
+/// relay accepted connections and then sent nothing for thirty seconds. That is
+/// indistinguishable from an overloaded machine from the outside, and it was read
+/// as one for a whole session before the profiler named it.
+#[test]
+fn the_running_digest_is_resolved_once_per_process() {
+    let first = wealdrelay::RunningDigest::resolve();
+    // Safety: this test owns the variable for the length of the assertion, and
+    // the value it sets is never a shape any other test asserts on.
+    unsafe {
+        std::env::set_var(
+            wealdrelay::RunningDigest::IMAGE_KEY,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+    }
+    let second = wealdrelay::RunningDigest::resolve();
+    unsafe {
+        std::env::remove_var(wealdrelay::RunningDigest::IMAGE_KEY);
+    }
+    assert_eq!(
+        first, second,
+        "resolve() consulted its inputs a second time, so every connection pays \
+         the cost of hashing this executable again"
+    );
+}
+
 #[test]
 fn the_process_resolves_a_digest_without_being_told_one() {
     // The default path, exercised so `resolve` itself is covered: this test

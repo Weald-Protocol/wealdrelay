@@ -125,7 +125,7 @@ pub enum Phase {
     Pushing,
 }
 impl Phase {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Claiming => "claiming",
             Self::Checkout => "checkout",
@@ -135,7 +135,13 @@ impl Phase {
             Self::Pushing => "pushing",
         }
     }
-    fn parse(raw: &str) -> Option<Self> {
+    /// The phase named by this string, or nothing.
+    ///
+    /// Public because the gateway reads a phase out of a control-plane column
+    /// and must publish only a phase this vocabulary names: the alternative was
+    /// a second copy of the six words in `weald-agent-gateway`, and a second
+    /// copy is how a client comes to meet a phase it cannot decode.
+    pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "claiming" => Some(Self::Claiming),
             "checkout" => Some(Self::Checkout),

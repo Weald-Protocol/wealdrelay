@@ -16,6 +16,8 @@
 #   weald-stack agent-crossing [--out DIR]
 #   weald-stack agent-fold-crossing [--out DIR]
 #   weald-stack agent-card-crossing [--out DIR]
+#   weald-stack ci-card-crossing [--out DIR]
+#   weald-stack ci-disclosure-crossing [--out DIR]
 #   weald-stack down [--volumes]
 #
 # Components that a later step builds are reported as such and exit 69
@@ -27,6 +29,16 @@ set -euo pipefail
 # harness drives a loopback relay on a machine that is already the operator's, so
 # the leak has nobody to leak to and the escape is taken explicitly.
 export WEALD_ALLOW_ARGV_SECRETS=1
+
+# Step 17's rollout flag, opened for the harness as a whole.
+#
+# The product default is `local-only`: private local bots and nothing on the wire.
+# Every crossing in this file is about what happens *on* the wire, so each one
+# needs the workspace opted in, and setting it once here rather than in fifteen
+# crossings is what keeps a new crossing from silently proving that the flag was
+# off. Step 17's negative part unsets it deliberately, which is the only place in
+# this harness that wants the default.
+export WEALD_NETWORKED_AGENTS="${WEALD_NETWORKED_AGENTS:-ticket-migration}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -213,7 +225,33 @@ relay_answers() {
       "$WEALD_STACK_RELAY_HEALTH_URL" >/dev/null 2>&1
     return
   fi
-  curl -fsS --max-time 2 "http://127.0.0.1:$WEALD_STACK_RELAY_PORT/healthz" >/dev/null 2>&1
+  # Thirty seconds, not two. Two was "anything slower is a relay that is not there",
+  # which is a wall-clock read dressed as a fact: on a machine running a build, a
+  # soak and another session's stack, this relay's own Postgres pool logs twelve
+  # second acquires and the health handler answered after seven to eleven. Every gate part
+  # downstream then reported "the relay is not serving" about a relay that was
+  # serving, which is the flake class `CLAUDE.md` says to fix in the harness rather
+  # than re-run. A relay that is genuinely absent still fails here, immediately,
+  # because nothing is listening and the connection is refused rather than slow.
+  #
+  # And a deadline rather than a single attempt. One 30s read is still a wall-clock
+  # read: measured on this machine under another session's build the handler answered
+  # in 21s, so the budget was being met by margin alone and the next slower pass
+  # reported an absent relay again. A refused connection is still immediate -- curl
+  # returns at once and the port check below decides -- so a relay that is genuinely
+  # not there costs nothing extra, while a relay that is merely slow gets the whole
+  # deadline to answer.
+  local deadline=$(( $(date +%s) + ${WEALD_STACK_RELAY_HEALTH_TIMEOUT:-90} ))
+  while :; do
+    if curl -fsS --max-time 30 \
+      "http://127.0.0.1:$WEALD_STACK_RELAY_PORT/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    # Nothing is listening at all: absent, not slow, and no deadline will change it.
+    lsof -nP -iTCP:"$WEALD_STACK_RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1 || return 1
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 2
+  done
 }
 
 # Start `wealdrelay` against the harness Postgres and a file-backed blob store.
@@ -485,6 +523,42 @@ cmd_enrol() {
     relay_psql "delete from relay_invite_reservation where token in \
                 (select token from relay_invite where bootstrap and workspace_id = '$ENROLLED_WORKSPACE')" >/dev/null
     relay_psql "delete from relay_invite where bootstrap and workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    # And everything the *previous* workspace carried, which is the half this
+    # reset used to leave behind. `docker compose down` removes the containers
+    # but not `weald-stack_postgres-data`, so the relay's database outlives the
+    # stack: a fresh genesis then met the dead workspace's published channel
+    # GroupInfo and the founder could not join its own channel, reporting "the
+    # publication was sealed at a workspace epoch this device does not hold" --
+    # a true sentence about a workspace nobody meant to still exist. Deleting
+    # the key material and the groups is the whole point of a reset; a reset
+    # that clears only the pre-genesis rows is a reset in name.
+    #
+    # Everything keyed by one of this workspace's groups, before the groups
+    # themselves: `relay_envelope_group_id_fkey` and its siblings restrict rather
+    # than cascade, so deleting the group first is refused and -- under `set -e`
+    # with the output discarded -- takes the whole enrolment down without a word.
+    # The order here is the foreign keys' order, not a preference.
+    local group_scoped="relay_envelope relay_handshake relay_checkpoint_anchor \
+relay_checkpoint relay_drop_run relay_invite_scope_commit relay_invite_scope \
+relay_invite_bundle relay_recovery_wrap_prior relay_recovery_wrap \
+relay_retention_manifest_rejected relay_retention_manifest \
+relay_retention_destruction relay_retention_control_conflict \
+relay_retention_control relay_retention_policy relay_blob_reservation"
+    local table
+    for table in $group_scoped; do
+      relay_psql "delete from $table where group_id in \
+                  (select group_id from relay_group \
+                   where workspace_id = '$ENROLLED_WORKSPACE')" >/dev/null
+    done
+    relay_psql "delete from relay_group where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_key_package where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_recovery_rotation where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_bootstrap_handoff where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_push_handle where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_blob_reservation where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_invite_tombstone where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_log_budget where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
+    relay_psql "delete from relay_quota where workspace_id = '$ENROLLED_WORKSPACE'" >/dev/null
     relay_stop
     relay_start || return 1
   fi
@@ -2209,6 +2283,28 @@ clients_status() {
   done
 }
 
+# The cluster runs with fsync, synchronous_commit and full_page_writes all off,
+# because the volume is disposable and fsync on a laptop is most of the 90 second
+# cold-start budget. The price of that trade is real: kill the suite mid-write
+# (a Ctrl-C, a harness timeout, an OrbStack restart) and redo can panic on a torn
+# page, after which the container exits 1 on every start and every test in
+# backend/weald-cloud fails with ECONNREFUSED 127.0.0.1:54032. Nothing in the
+# volume outlives a run, so the answer is to notice and reinitialise rather than
+# to make somebody read Postgres WAL logs to learn that their scratch databases
+# are gone.
+heal_postgres() {
+  local cid state
+  cid="$(dc ps -aq postgres 2>/dev/null || true)"
+  [ -n "$cid" ] || return 0
+  state="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+  [ "$state" = "exited" ] || return 0
+  docker logs --tail 50 "$cid" 2>&1 |
+    grep -qE 'PANIC|shutting down due to startup process failure' || return 0
+  note "postgres" "unrecoverable cluster, reinitialising the disposable volume"
+  dc rm -sf postgres >/dev/null 2>&1 || true
+  docker volume rm weald-stack_postgres-data >/dev/null 2>&1 || true
+}
+
 wait_healthy() {
   local deadline=$((SECONDS + 120)) unhealthy
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -2248,6 +2344,7 @@ cmd_up() {
 
   # Real infrastructure. No credentials: every value in the compose file is a
   # local-only literal, which is what lets an auditor run this on arrival.
+  heal_postgres
   dc up -d --wait --wait-timeout 120 "${INFRA_SERVICES[@]}" >/dev/null
   wait_healthy
   for svc in "${INFRA_SERVICES[@]}"; do note "$svc" "healthy"; done
@@ -2909,6 +3006,191 @@ cmd_agent_card_crossing() {
   echo "needle=${secret}-model"
   echo "needle=${secret}-path"
   echo "keys=$keys"
+}
+
+# --- ci-disclosure-crossing --------------------------------------------------
+#
+# CI5's integration proof: `CiDisclosure` fires on a `ci.report` card that
+# actually crossed a real relay, not on a card this process assembled itself.
+# Client 1 publishes the card; client 2 reads the real bytes back, and its own
+# `CiDisclosureGate` is asked about the resulting directory entry, first
+# unanswered (must ask) and then after accepting (must show).
+cmd_ci_disclosure_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-CI5}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack ci-disclosure-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/ci-disclosure-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  local slug="@Pipeline CID${nonce}"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  {
+    echo "# CiDisclosure asked about a real ci.report card, over a real relay"
+    echo
+    echo "## client 1 publishes a card carrying ci.report"
+    wc_ c1 agent-publish-card --alias "$slug" --title "Pipeline CID${nonce}" \
+      --capability ci.report
+    echo
+    echo "## client 1 publishes, client 2 receives"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+    echo
+    echo "## client 2, unanswered: must ask"
+    wc_ c2 agent-ci-disclosure --alias "$slug"
+    echo
+    echo "## client 2, after accepting: must show"
+    wc_ c2 agent-ci-disclosure --alias "$slug" --state accept
+  } | tee "$out"
+
+  local unanswered accepted
+  unanswered="$(wc_ c2 agent-ci-disclosure --alias "$slug")"
+  if ! grep -q "^step=ask" <<<"$unanswered"; then
+    echo "weald-stack: an unanswered ci.report card did not ask for a disclosure" >&2
+    echo "$unanswered" >&2
+    exit 1
+  fi
+  accepted="$(wc_ c2 agent-ci-disclosure --alias "$slug" --state accept)"
+  if ! grep -q "^step=show" <<<"$accepted"; then
+    echo "weald-stack: accepting the CI disclosure did not lead to showing it" >&2
+    echo "$accepted" >&2
+    exit 1
+  fi
+  echo "ci-disclosure-crossing: pass" | tee -a "$out"
+}
+
+# --- ci-card-crossing --------------------------------------------------------
+#
+# CI1's integration proof, from `specs/agents/networked/ci-module.md`: the Weald
+# CI card is the built card with one capability the workspace has to be able to
+# read, and nothing that writes to a repository.
+#
+# Client 1 publishes a card carrying `ci.report` and no code block. Client 2, a
+# separate process with its own device key and its own directory, reads it back
+# off a real relay, walks the encoded map, and says which capability crossed and
+# whether the block that names repositories is there. Two instances rather than
+# one, because "the far side sees ci.report" is the whole claim and a single
+# process comparing its own encoder to its own decoder cannot make it.
+#
+# The refusal is driven in the same run: the same verb asked for `ci.report` and
+# `code.pullrequest` together must fail before anything is written, which is what
+# makes "a CI client is never a second Git writer" a property of the bytes.
+cmd_ci_card_crossing() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-CI1}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack ci-card-crossing: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/ci-card-crossing.txt"
+
+  local nonce; nonce="$(python3 -c 'import os; print(os.urandom(5).hex().upper())')"
+  local slug="@Pipeline CI${nonce}"
+  local secret="ZQXCI${nonce}"
+
+  cmd_clients 2 --selections relay,relay --fresh >/dev/null
+
+  {
+    echo "# A Weald CI agent.card crosses a real relay and is walked at the far side"
+    echo
+    echo "workspace $(cat "$CLIENTS_DIR/workspace-id")"
+    echo "relay     $(relay_ws_url)"
+    echo "slug      $slug"
+    echo
+    echo "## client 1 publishes a card carrying ci.report and no code block"
+    wc_ c1 agent-publish-card --alias "$slug" --title "Pipeline CI${nonce}" \
+      --body "$secret" --capability ci.report
+    echo
+    echo "## client 1 publishes, client 2 receives"
+    wc_ c1 --seconds 30 sync
+    wc_ c2 --seconds 30 sync
+    echo
+    echo "## client 2 verifies the card and walks its keys"
+    wc_ c2 agent-read-card
+  } | tee "$out"
+
+  local read_out
+  read_out="$(wc_ c2 agent-read-card)" || {
+    echo "weald-stack: client 2 did not read the CI card that crossed" >&2
+    exit 1
+  }
+
+  local capabilities code outside
+  capabilities="$(field "$read_out" capabilities)"
+  code="$(field "$read_out" code)"
+  outside="$(field "$read_out" outside)"
+  [ "$capabilities" = "ci.report" ] || {
+    echo "weald-stack: the card that crossed carries '$capabilities', not ci.report" >&2
+    exit 1
+  }
+  [ "$code" = "absent" ] || {
+    echo "weald-stack: a ci.report card crossed carrying a code block" >&2
+    exit 1
+  }
+  [ "$outside" = "0" ] || {
+    echo "weald-stack: the CI card carried $outside key(s) outside the schema" >&2
+    exit 1
+  }
+  if grep -qi "$secret" <<<"$read_out"; then
+    echo "weald-stack: the planted secret reached the far side" >&2
+    exit 1
+  fi
+
+  local d1 d2
+  d1="$(field "$(wc_ c1 device)" device)"
+  d2="$(field "$(wc_ c2 device)" device)"
+  [ -n "$d1" ] && [ "$d1" != "$d2" ] || {
+    echo "weald-stack: the two clients share a device key, so this is one player twice" >&2
+    exit 1
+  }
+
+  # The refusal, in the same run and through the same verb: a CI card that also
+  # claims the capability that writes a branch is not publishable at all.
+  local both
+  if both="$(wc_ c1 agent-publish-card --alias "$slug" --title "Both CI${nonce}" \
+        --capability ci.report --capability code.pullrequest 2>&1)"; then
+    echo "weald-stack: a card carrying ci.report and code.pullrequest published" >&2
+    echo "$both" >&2
+    exit 1
+  fi
+
+  {
+    echo
+    echo "## the comparison"
+    echo "capabilities $capabilities"
+    echo "code         $code"
+    echo "outside      $outside"
+    echo "c1 device    $d1"
+    echo "c2 device    $d2"
+    echo
+    echo "## the refusal, same verb, same run"
+    echo "$both" | sed 's/^/  /'
+  } | tee -a "$out"
+
+  echo "control=$d1"
+  echo "needle=${secret}-systemprompt"
+  echo "needle=${secret}-goal"
+  echo "needle=${secret}-model"
+  echo "needle=${secret}-path"
+  echo "capabilities=$capabilities"
 }
 
 # Step 6's integration proof: two instances converge on one directory, and a
@@ -5301,6 +5583,139 @@ open(sys.argv[1], "wb").write(binascii.unhexlify(sys.argv[2]))' \
 # record again and ask a host to consider it again. So c1 is asked to execute twice with
 # a sync in between: the second call must reach its recorded result rather than start a
 # second run, and the count of terminal records must not move.
+# Step 17's ship gate: the five-point acceptance test, plus the org addendum.
+#
+# `specs/agents/networked/phases-product.md` names six numbered claims and an org
+# addendum, and every one of them already has a crossing in this file that proves
+# it against the real rig. So this composes rather than reimplements: a second
+# hand-written discovery-and-invoke path here would prove that *this function*
+# works, which is not what the gate is for, and the two copies would drift the
+# first time either side of the protocol changed.
+#
+# What composition adds, and what makes this a gate rather than a shell loop, is
+# the three things no constituent crossing can assert about itself:
+#
+#   - that all six hold *together*, on one relay, in one run, rather than on six
+#     rigs on six days;
+#   - one transcript naming each claim, its crossing and its verdict, which is the
+#     artifact step 17 owes and the thing a person reads before saying the word
+#     "multiplayer" out loud;
+#   - the sentence in the spec that until this is green the product describes bots
+#     as local assistants. That is a deliverable of the gate as much as the tests,
+#     so it is written into the transcript either way, with the verdict attached.
+#
+# Ordered the way a person meets the feature: discovery, then the ask, then the
+# failure modes, then the live signals, then the org half.
+cmd_agent_ship_gate() {
+  local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-17}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="$2"; shift 2 ;;
+      *) echo "weald-stack agent-ship-gate: unknown argument: $1" >&2; exit 64 ;;
+    esac
+  done
+  require_daemon
+  relay_answers || {
+    echo "weald-stack: the relay is not serving. scripts/weald-stack up" >&2
+    exit 1
+  }
+  mkdir -p "$out_dir"
+  local out="$out_dir/acceptance.txt"
+  local work="$out_dir/parts"
+  rm -rf "$work"; mkdir -p "$work"
+
+  {
+    echo "# Step 17 ship gate: the two-player acceptance run"
+    echo
+    echo "relay      $(relay_ws_url)"
+    echo "rollout    ${WEALD_NETWORKED_AGENTS:-unset}"
+    echo "at         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo
+  } >"$out"
+
+  # Each row: the claim, the crossing that proves it, and the file it wrote.
+  # Kept as one table so a claim cannot be added here without a crossing, and a
+  # crossing cannot quietly stop running without its row losing its verdict.
+  local -a claims=(
+    "1,2,3,4|Player 2 discovers, asks, only Player 1 executes, both fold one signed answer|agent-crossing"
+    "1|Player 2 discovers Player 1's opted-in agent in the directory|agent-card-directory-crossing"
+    "3,4|Only the host executes, and the answer is signed and terminal|agent-execution-crossing"
+    "5|Offline host, duplicate delivery, revoked requester, expired agent|agent-offline-crossing"
+    "6|Availability is a signed LIVE beat and not a published field|agent-availability-crossing"
+    "org|Admin card, disclosure before first invoke, assigned scope, custody|agent-org-crossing"
+  )
+
+  local failed=0 row claim what verb log
+  for row in "${claims[@]}"; do
+    claim="${row%%|*}"
+    what="${row#*|}"; what="${what%%|*}"
+    verb="${row##*|}"
+    log="$work/$verb.log"
+    echo "== $verb  (points $claim)" | tee -a "$out"
+    echo "   $what" | tee -a "$out"
+    if WEALD_AGENT_CROSSING_OUT="$work" "$0" "$verb" --out "$work" >"$log" 2>&1; then
+      echo "   PASS  $log" | tee -a "$out"
+    else
+      echo "   FAIL  $log" | tee -a "$out"
+      tail -20 "$log" >&2
+      failed=1
+    fi
+    echo | tee -a "$out"
+  done
+
+  # The call arm of point 6. It is a Rust integration test rather than a crossing
+  # in this file, because the offering side is the thing that has to read the
+  # decline and its latency, and that side is the gateway's own binary. Named here
+  # so the transcript covers all of point 6 rather than the half a crossing can
+  # reach.
+  echo "== call decline  (point 6)" | tee -a "$out"
+  echo "   A call offered into the agent's channel is declined within a second" | tee -a "$out"
+  if cargo nextest run -p weald-agent-gateway -E 'binary(call_decline)' \
+      >"$work/call_decline.log" 2>&1; then
+    echo "   PASS  $work/call_decline.log" | tee -a "$out"
+  else
+    echo "   FAIL  $work/call_decline.log" | tee -a "$out"
+    tail -20 "$work/call_decline.log" >&2
+    failed=1
+  fi
+  echo | tee -a "$out"
+
+  # And the assertion the whole org track is built around. Three checks rather
+  # than a commit-range diff, for the reason `phases-org.md` gives at length: the
+  # relay is under active development by other programmes, so a range diff cannot
+  # separate this track's changes from theirs and would be switched off within a
+  # week. `relay_blind.rs` asserts the property the diff was a proxy for.
+  echo "== relay unchanged  (org addendum)" | tee -a "$out"
+  echo "   backend/wealdrelay/src/ names no agent concept and links none of the crates" \
+    | tee -a "$out"
+  if cargo nextest run -p wealdrelay -E 'binary(relay_blind)' \
+      >"$work/relay_blind.log" 2>&1; then
+    echo "   PASS  $work/relay_blind.log" | tee -a "$out"
+  else
+    echo "   FAIL  $work/relay_blind.log" | tee -a "$out"
+    tail -20 "$work/relay_blind.log" >&2
+    failed=1
+  fi
+  echo | tee -a "$out"
+
+  {
+    echo "## The sentence"
+    echo
+    if [ "$failed" -eq 0 ]; then
+      echo "shipgate=pass"
+      echo "Every point above held on one relay in one run. From here the product"
+      echo "may be described as networked agents."
+    else
+      echo "shipgate=fail"
+      echo "At least one point did not hold. Until this run is green the product"
+      echo "describes bots as local assistants with relay-synced chat, and not as"
+      echo "networked agents."
+    fi
+  } | tee -a "$out"
+
+  [ "$failed" -eq 0 ] || exit 1
+}
+
 cmd_agent_ticket_crossing() {
   local out_dir="${WEALD_AGENT_CROSSING_OUT:-$ROOT/build-evidence/agents/step-16}"
   while [ $# -gt 0 ]; do
@@ -5483,6 +5898,8 @@ main() {
     agent-crossing) cmd_agent_crossing "$@" ;;
     agent-fold-crossing) cmd_agent_fold_crossing "$@" ;;
     agent-card-crossing) cmd_agent_card_crossing "$@" ;;
+    ci-card-crossing) cmd_ci_card_crossing "$@" ;;
+    ci-disclosure-crossing) cmd_ci_disclosure_crossing "$@" ;;
     agent-card-directory-crossing) cmd_agent_card_directory_crossing "$@" ;;
     agent-leaf-crossing) cmd_agent_leaf_crossing "$@" ;;
     agent-claim-race) cmd_agent_claim_race "$@" ;;
@@ -5494,6 +5911,7 @@ main() {
     agent-availability-gateway) cmd_agent_availability_gateway "$@" ;;
     agent-dm-crossing) cmd_agent_dm_crossing "$@" ;;
     agent-ticket-crossing) cmd_agent_ticket_crossing "$@" ;;
+    agent-ship-gate) cmd_agent_ship_gate "$@" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) echo "weald-stack: unknown command: $cmd" >&2; exit 64 ;;
   esac

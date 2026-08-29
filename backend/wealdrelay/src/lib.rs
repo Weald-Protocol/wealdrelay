@@ -93,12 +93,28 @@ impl RunningDigest {
     /// The environment key an image build bakes the published digest into.
     pub const IMAGE_KEY: &'static str = "WEALD_RELAY_IMAGE_DIGEST";
 
-    /// What this process is running, resolved once at startup.
+    /// What this process is running, resolved once per process and then reused.
+    ///
+    /// Memoised, and the memo is the whole point rather than an optimisation.
+    /// The unbaked form reads and BLAKE3-hashes this process' own executable,
+    /// and `Session::new` calls this for **every connection**: an 84 MB debug
+    /// binary re-hashed per socket saturated every core of the host, starved the
+    /// Postgres pool behind it into eight to twelve second acquires, and left the
+    /// relay accepting connections and then sending nothing for thirty seconds.
+    /// Read from the outside that looks exactly like a busy machine, which is how
+    /// it was misread as one; the load was this. The digest is a property of the
+    /// running process and cannot change while it runs, so resolving it more than
+    /// once was never anything but cost.
     pub fn resolve() -> Self {
-        Self::resolve_with(
-            std::env::var(Self::IMAGE_KEY).ok(),
-            std::env::current_exe().ok(),
-        )
+        static RESOLVED: std::sync::OnceLock<RunningDigest> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                Self::resolve_with(
+                    std::env::var(Self::IMAGE_KEY).ok(),
+                    std::env::current_exe().ok(),
+                )
+            })
+            .clone()
     }
 
     /// The resolution itself, over its two inputs, so every outcome including

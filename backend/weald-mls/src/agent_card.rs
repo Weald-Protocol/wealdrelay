@@ -94,6 +94,10 @@ pub enum Capability {
     ReadChannel,
     ReadTicket,
     CodePullRequest,
+    /// Weald CI: a client inside the customer's own pipeline reporting a run as
+    /// an agent. It writes no branch, so `ci-module.md` refuses a card that also
+    /// carries `CodePullRequest` rather than trusting a policy to hold later.
+    CiReport,
 }
 
 impl Capability {
@@ -103,6 +107,7 @@ impl Capability {
             Capability::ReadChannel => "read.channel",
             Capability::ReadTicket => "read.ticket",
             Capability::CodePullRequest => "code.pullrequest",
+            Capability::CiReport => "ci.report",
         }
     }
 
@@ -115,6 +120,7 @@ impl Capability {
             "read.channel" => Some(Capability::ReadChannel),
             "read.ticket" => Some(Capability::ReadTicket),
             "code.pullrequest" => Some(Capability::CodePullRequest),
+            "ci.report" => Some(Capability::CiReport),
             _ => None,
         }
     }
@@ -242,6 +248,10 @@ pub enum CardError {
     EmptyAlias,
     AliasNotLowercased(String),
     CodeBlockMismatch,
+    /// A card carrying both `ci.report` and `code.pullrequest`. A CI client is
+    /// admitted only because it is never a second Git writer, and this makes that
+    /// unrepresentable in bytes rather than enforced by a policy somewhere later.
+    CapabilityExclusive,
     CodeRepositoriesInvalid,
     RepositoryRefInvalid(String),
     BranchInvalid(String),
@@ -272,6 +282,7 @@ impl CardError {
             CardError::EmptyAlias => "codec.alias.empty",
             CardError::AliasNotLowercased(_) => "codec.alias.case",
             CardError::CodeBlockMismatch => "codec.code.mismatch",
+            CardError::CapabilityExclusive => "codec.capability.exclusive",
             CardError::CodeRepositoriesInvalid => "codec.code.repos",
             CardError::RepositoryRefInvalid(_) => "codec.repo.ref",
             CardError::BranchInvalid(_) => "codec.branch.ref",
@@ -324,6 +335,10 @@ impl std::fmt::Display for CardError {
             CardError::CodeBlockMismatch => write!(
                 f,
                 "code block must be present exactly with code.pullrequest"
+            ),
+            CardError::CapabilityExclusive => write!(
+                f,
+                "ci.report and code.pullrequest cannot appear on one card"
             ),
             CardError::CodeRepositoriesInvalid => write!(
                 f,
@@ -528,6 +543,11 @@ pub fn decode(data: &[u8]) -> Result<AgentCard> {
     let code = cbor::optional_slot(&slots, key::CODE)
         .map(decode_code)
         .transpose()?;
+    if capabilities.contains(&Capability::CiReport)
+        && capabilities.contains(&Capability::CodePullRequest)
+    {
+        return Err(CardError::CapabilityExclusive);
+    }
     let has_code_capability = capabilities.contains(&Capability::CodePullRequest);
     if has_code_capability != code.is_some() {
         return Err(CardError::CodeBlockMismatch);

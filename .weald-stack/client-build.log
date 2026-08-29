@@ -1,0 +1,5 @@
+Command line invocation:
+    "/Applications/Xcode 2.app/Contents/Developer/usr/bin/xcodebuild" -project /tmp/relayrel/Weald.xcodeproj -scheme Weald -configuration Debug build
+
+2026-08-29 18:07:21.214 xcodebuild[34914:46045935] Writing error result bundle to /var/folders/mz/clst0pxs4f70g0s8lkb32chw0000gn/T/ResultBundle_2026-29-08_18-07-0021.xcresult
+xcodebuild: error: '/tmp/relayrel/Weald.xcodeproj' does not exist.
