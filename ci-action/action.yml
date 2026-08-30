@@ -27,7 +27,7 @@ inputs:
   version:
     description: "The weald-ci release to run, pinned by tag."
     required: false
-    default: "weald-ci-v0.1.0"
+    default: "weald-ci-v0.1.1"
 runs:
   using: "composite"
   steps:
@@ -69,9 +69,23 @@ runs:
         WEALD_CI_TOKEN: ${{ inputs.token }}
         WEALD_CI_INVOCATION_ID: ${{ inputs.invocation-id }}
         WEALD_CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        WEALD_CI_BASE_OID: ${{ github.event.pull_request.base.sha }}
+        WEALD_CI_PR_BASE_OID: ${{ github.event.pull_request.base.sha }}
+        WEALD_CI_PUSH_BEFORE_OID: ${{ github.event.before }}
         WEALD_CI_HEAD_OID: ${{ github.sha }}
         WEALD_CI_COMMAND: ${{ inputs.run }}
       run: |
         set -euo pipefail
+        # A terminal report carries base and head OIDs or the control plane
+        # refuses it, `ci.evidence.missing`. `pull_request.base.sha` is empty on
+        # a push, and `github.event.before` is all zeroes on a branch's first
+        # push, so the fallback ends at the head commit's parent and then at the
+        # head itself, which is true for a root commit and never absent.
+        base="$WEALD_CI_PR_BASE_OID"
+        if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+          base="$WEALD_CI_PUSH_BEFORE_OID"
+        fi
+        if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+          base="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+        fi
+        export WEALD_CI_BASE_OID="$base"
         weald-ci --invocation-id "$WEALD_CI_INVOCATION_ID" -- bash -lc "$WEALD_CI_COMMAND"
