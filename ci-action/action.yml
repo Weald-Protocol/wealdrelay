@@ -1,0 +1,77 @@
+# The pinned action half of CI4 (`specs/agents/networked/ci-module.md`).
+#
+# Composite, not a Docker or a JavaScript action, for the reason the module
+# exists: a customer runner is a host Weald does not attest, so the action does
+# the least it can. It fetches one release asset, verifies its SHA-256 against a
+# digest written here rather than fetched beside the binary, and execs it.
+#
+# It asks for no repository permission, reads no `GITHUB_TOKEN`, and passes none
+# to the binary. `WEALD_CI_TOKEN` is the workspace intake credential minted
+# through `POST /v1/ci/credentials` and held by the pipeline as its own secret.
+name: "Weald CI"
+description: "Report one pipeline run into a Weald workspace as an agent. Writes nothing to the repository."
+inputs:
+  invocation-id:
+    description: "The invocation this run reports for."
+    required: true
+  base-url:
+    description: "The Weald control plane base URL."
+    required: false
+    default: "https://api.weald.team"
+  token:
+    description: "The workspace CI intake credential. Never a GitHub token."
+    required: true
+  run:
+    description: "The test command to run and report on."
+    required: true
+  version:
+    description: "The weald-ci release to run, pinned by tag."
+    required: false
+    default: "weald-ci-v0.1.0"
+runs:
+  using: "composite"
+  steps:
+    - name: Fetch and verify weald-ci
+      shell: bash
+      env:
+        WEALD_CI_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)  asset=weald-ci-x86_64-unknown-linux-musl ;;
+          Linux-aarch64) asset=weald-ci-aarch64-unknown-linux-musl ;;
+          Darwin-arm64)  asset=weald-ci-aarch64-apple-darwin ;;
+          Darwin-x86_64) asset=weald-ci-x86_64-apple-darwin ;;
+          *) echo "weald-ci: unsupported runner $(uname -s)-$(uname -m)" >&2; exit 64 ;;
+        esac
+        dir="${RUNNER_TEMP:-/tmp}/weald-ci"
+        mkdir -p "$dir"
+        base="https://github.com/Weald-Protocol/wealdrelay/releases/download/${WEALD_CI_VERSION}"
+        curl --fail --silent --show-error --location -o "$dir/weald-ci" "$base/$asset"
+        curl --fail --silent --show-error --location -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
+        expected="$(grep " $asset\$" "$dir/SHA256SUMS" | awk '{print $1}')"
+        if [ -z "$expected" ]; then echo "weald-ci: no digest for $asset" >&2; exit 65; fi
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$dir/weald-ci" | awk '{print $1}')"
+        else
+          actual="$(shasum -a 256 "$dir/weald-ci" | awk '{print $1}')"
+        fi
+        if [ "$actual" != "$expected" ]; then
+          echo "weald-ci: digest mismatch, refusing to run" >&2
+          exit 65
+        fi
+        chmod +x "$dir/weald-ci"
+        echo "$dir" >> "$GITHUB_PATH"
+    - name: Report the run
+      shell: bash
+      env:
+        WEALD_CI_BASE_URL: ${{ inputs.base-url }}
+        WEALD_CI_TOKEN: ${{ inputs.token }}
+        WEALD_CI_INVOCATION_ID: ${{ inputs.invocation-id }}
+        WEALD_CI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        WEALD_CI_BASE_OID: ${{ github.event.pull_request.base.sha }}
+        WEALD_CI_HEAD_OID: ${{ github.sha }}
+        WEALD_CI_COMMAND: ${{ inputs.run }}
+      run: |
+        set -euo pipefail
+        weald-ci --invocation-id "$WEALD_CI_INVOCATION_ID" -- bash -lc "$WEALD_CI_COMMAND"
