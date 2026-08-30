@@ -26,3 +26,6 @@ __pycache__/
 # Gate evidence written by test runs. Generated, never published.
 build-evidence/
 .weald/
+
+# Local dev stack scratch: logs, pids and a locally generated operator token.
+.weald-stack/

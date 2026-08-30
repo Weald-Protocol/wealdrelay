@@ -180,6 +180,8 @@ jobs:
   cross-host:
     name: cross-architecture reproduction, x86_64 host under emulation
     runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.repro.outputs.digest }}
     # 330: twice the measured 10776 seconds (179.6 minutes), which leaves room
     # for a slower runner without letting a hung build reach the six hour
     # ceiling.
@@ -190,12 +192,25 @@ jobs:
           fetch-depth: 0
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      # The digest leaves this job as a job output as well as an artifact.
+      # wealdrelay-v0.1.38 spent 2h48m on this build and then lost the verdict
+      # to an upload-artifact CreateArtifact timeout, which left the pin gate
+      # unproven for a defect that was not in the image. A job output is carried
+      # by the run itself and cannot time out.
       - name: Build and record the digest
+        id: repro
         env:
           WEALD_REPRO_LABEL: cross-host
           WEALD_REPRO_VERSION: ${{ github.ref_name }}
-        run: scripts/relay-reproduce.sh --out repro-cross-host --label cross-host
+        run: |
+          set -eux
+          scripts/relay-reproduce.sh --out repro-cross-host --label cross-host
+          digest="$(python3 -c 'import json;print(json.load(open("repro-cross-host/manifest.json"))["artifact_digest"])')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # Advisory: the build log is worth keeping, but the verdict no longer
+      # depends on it, so a CreateArtifact timeout must not red this job.
       - if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: crossarch-${{ github.ref_name }}
@@ -213,15 +228,12 @@ jobs:
     needs: [cross-host, compare]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: crossarch-${{ github.ref_name }}
-          path: repro-cross-host
       - name: It must equal the digest the two arm64 runners agreed on
         run: |
           set -eux
-          rebuilt="$(python3 -c 'import json;print(json.load(open("repro-cross-host/manifest.json"))["artifact_digest"])')"
+          rebuilt='${{ needs.cross-host.outputs.digest }}'
           agreed='${{ needs.compare.outputs.digest }}'
+          test -n "$rebuilt"
           {
             echo "### reproducibility, second architecture"
             echo

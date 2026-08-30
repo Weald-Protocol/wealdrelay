@@ -1,4 +1,0 @@
-stack_up_seconds=12.2
-budget_seconds=90
-measured=2026-08-29T22:07:22Z
-services=postgres minio redis mailpit
