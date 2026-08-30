@@ -27,7 +27,7 @@ inputs:
   version:
     description: "The weald-ci release to run, pinned by tag."
     required: false
-    default: "weald-ci-v0.1.1"
+    default: "weald-ci-v0.1.2"
 runs:
   using: "composite"
   steps:
