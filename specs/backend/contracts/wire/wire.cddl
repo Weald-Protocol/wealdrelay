@@ -122,6 +122,7 @@ event-kind =
   / k-dm-welcome          ; 0x0022
   / k-roster-removal     ; 0x0023
   / k-access-snapshot     ; 0x0024
+  / k-member-photo        ; 0x0025
   / k-media-ref           ; 0x0030
   / k-git-patch           ; 0x0040
   / k-git-status          ; 0x0041
@@ -165,6 +166,16 @@ k-roster-removal     = 35
 ; replayed one is dropped. Body is the `AccessSet` encoding, unchanged.
 ; See specs/backend/relay/access.md and WEALD-L354.
 k-access-snapshot    = 36
+; One person's face, as PNG bytes, signed by the device it describes and admitted
+; only when the record names its own author. In the roster family because it is
+; the third thing a device claims about itself, beside its name and its colour;
+; kept out of `k-roster-update` because that record is read on every fold and
+; image bytes do not belong in it. A cleared photo is this record with no bytes,
+; so a reader that learned a face can unlearn it. Refused above 512 KB. The body
+; is a JSON `MemberPhotoRecord` and is not schematised here, for the reason the
+; agent kinds below are not: the relay never reads a body.
+; See specs/member-photos.md.
+k-member-photo       = 37
 k-media-ref          = 48
 k-git-patch          = 64
 k-git-status         = 65

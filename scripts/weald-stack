@@ -23,6 +23,10 @@
 # Components that a later step builds are reported as such and exit 69
 # (EX_UNAVAILABLE), which is how the gate tells "not built yet" apart from
 # "broken". Nothing here pretends a component exists.
+
+# No macOS privacy panel may come out of a scripted run: a person is not
+# there to answer it. See PrivacyPromptGate and specs/system-permissions.md.
+export WEALD_NO_PROMPTS=1
 set -euo pipefail
 
 # WEALD-L421: enrol/redeem refuse bootstrap secrets in argv by default. This

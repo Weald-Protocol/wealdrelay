@@ -295,6 +295,47 @@ pub struct Client {
     pending_pongs: Vec<Vec<u8>>,
 }
 
+/// Loopback addresses this host will actually let a socket bind, `want` of them at
+/// most and `least` of them at minimum, 127.0.0.1 first and then aliases.
+///
+/// BR-032 is about sockets arriving from *distinct sources*, so which alias block
+/// a host happens to carry is not part of any claim. Hard coding `127.0.0.x` made
+/// relay proofs a property of one machine's `lo0` alias set, and a host aliased to
+/// a different block failed tests about the relay. Panics naming the fix when the
+/// host has none, because skipping would turn an adversarial proof green silently.
+pub fn distinct_loopback_sources(want: usize, least: usize) -> Vec<std::net::IpAddr> {
+    const CANDIDATES: [[u8; 4]; 9] = [
+        [127, 0, 0, 2],
+        [127, 0, 0, 3],
+        [127, 0, 0, 4],
+        [127, 0, 0, 5],
+        [127, 0, 2, 2],
+        [127, 0, 2, 3],
+        [127, 0, 2, 4],
+        [127, 0, 2, 5],
+        [127, 0, 1, 2],
+    ];
+    let mut found = vec![std::net::IpAddr::from([127, 0, 0, 1])];
+    for octets in CANDIDATES {
+        if found.len() >= want {
+            break;
+        }
+        let address = std::net::IpAddr::from(octets);
+        if std::net::TcpListener::bind(std::net::SocketAddr::new(address, 0)).is_ok() {
+            found.push(address);
+        }
+    }
+    assert!(
+        found.len() >= least,
+        "this host offers {} bindable loopback source(s) and the proof needs {least}. \
+         Alias one: sudo ifconfig lo0 alias 127.0.0.2 up (it does not survive a \
+         reboot; `scripts/weald-stack up` reports the set).",
+        found.len()
+    );
+    found.truncate(want);
+    found
+}
+
 impl Client {
     pub async fn connect(address: std::net::SocketAddr) -> Self {
         Self::upgrade(TcpStream::connect(address).await.expect("connect")).await

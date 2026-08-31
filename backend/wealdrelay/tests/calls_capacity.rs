@@ -222,7 +222,7 @@ async fn one_unauthenticated_source_cannot_reserve_the_connection_table() {
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
 
     let attacker: std::net::IpAddr = "127.0.0.1".parse().expect("attacker source");
-    let member: std::net::IpAddr = "127.0.0.2".parse().expect("member source");
+    let member = support::distinct_loopback_sources(2, 2)[1];
     let (_first, first_response) = upgrade_from(relay.address, attacker).await;
     assert!(
         first_response.starts_with("HTTP/1.1 101"),

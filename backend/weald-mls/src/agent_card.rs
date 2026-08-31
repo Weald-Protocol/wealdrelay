@@ -98,6 +98,9 @@ pub enum Capability {
     /// an agent. It writes no branch, so `ci-module.md` refuses a card that also
     /// carries `CodePullRequest` rather than trusting a policy to hold later.
     CiReport,
+    /// Run work on a remote cell. The control plane's `RemoteCellRoutes.start`
+    /// refuses any profile that does not carry it.
+    ComputeRemote,
 }
 
 impl Capability {
@@ -108,6 +111,7 @@ impl Capability {
             Capability::ReadTicket => "read.ticket",
             Capability::CodePullRequest => "code.pullrequest",
             Capability::CiReport => "ci.report",
+            Capability::ComputeRemote => "compute.remote",
         }
     }
 
@@ -121,6 +125,7 @@ impl Capability {
             "read.ticket" => Some(Capability::ReadTicket),
             "code.pullrequest" => Some(Capability::CodePullRequest),
             "ci.report" => Some(Capability::CiReport),
+            "compute.remote" => Some(Capability::ComputeRemote),
             _ => None,
         }
     }

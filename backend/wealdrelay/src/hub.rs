@@ -255,6 +255,51 @@ impl Hub {
         self.shed.load(Ordering::Relaxed)
     }
 
+    /// How many subscribers are still owed a downgrade notice they could not be sent.
+    ///
+    /// Above zero means that many clients believe they are live and are not. See
+    /// [`Hub::settle_downgrades`].
+    pub async fn downgrades_owed(&self) -> usize {
+        self.lock()
+            .await
+            .values()
+            .flat_map(|subscribers| subscribers.iter())
+            .filter(|subscriber| subscriber.downgrade_owed)
+            .count()
+    }
+
+    /// Pay every outstanding downgrade notice that can be paid now.
+    ///
+    /// A subscriber whose queue was full when it was downgraded is owed the frame
+    /// that tells it to reconcile, and until this existed that debt was discharged
+    /// **only** by the next frame fanned out to the same group. A burst that filled
+    /// a queue and was then followed by silence in that group therefore left the
+    /// subscriber downgraded, uninformed and indistinguishable from healthy: the
+    /// socket was up, nothing was refused, and nothing written afterwards was ever
+    /// delivered or reconciled (WEALD-L757). `operations.md` requires that a
+    /// downgraded subscriber is told, and "when somebody next writes to that group"
+    /// is not a schedule.
+    ///
+    /// Returns how many notices went out. Safe to call on a timer: a subscriber that
+    /// owes nothing is not touched, and a queue that is still full leaves the debt
+    /// where it was for the next pass.
+    pub async fn settle_downgrades(&self) -> usize {
+        let mut sent = 0;
+        let mut groups = self.lock().await;
+        for (group, subscribers) in groups.iter_mut() {
+            for subscriber in subscribers.iter_mut() {
+                if !subscriber.downgrade_owed {
+                    continue;
+                }
+                if try_queue(&subscriber.sender, downgrade_frame(group)) == Queued::Sent {
+                    subscriber.downgrade_owed = false;
+                    sent += 1;
+                }
+            }
+        }
+        sent
+    }
+
     /// Push one envelope to every subscriber except its writer.
     ///
     /// The writer is excluded because it already has the envelope and has been

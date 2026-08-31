@@ -378,6 +378,18 @@ pub async fn run(state: Arc<RelayState>) {
         let wait = interval_ms.saturating_add(jitter_ms(interval_ms));
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         passes = passes.wrapping_add(1);
+        // Before the collector pass and independent of it: a subscriber owed a
+        // downgrade notice it could not be sent is a client that believes it is live
+        // and is not, and until this ran the debt was discharged only by the next
+        // frame fanned into the same group. A burst that filled a queue and was then
+        // followed by quiet in that group left the subscriber silently non-live, with
+        // the socket up and nothing refused (WEALD-L757). Cheap: it touches only
+        // subscribers that owe something.
+        let downgrades_settled = state.hub.settle_downgrades().await;
+        let downgrades_owed = state.hub.downgrades_owed().await;
+        if downgrades_settled > 0 || downgrades_owed > 0 {
+            tracing::info!(downgrades_settled, downgrades_owed, "downgrade notices");
+        }
         let list_storage = passes.is_multiple_of(STORAGE_LISTING_EVERY);
         let summary = pass_with(&state, list_storage).await;
         let storage_listings = summary.storage_listings;

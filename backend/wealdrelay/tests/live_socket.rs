@@ -412,3 +412,134 @@ async fn the_ephemeral_path_can_be_turned_off_by_the_operator() {
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// lp.10 and lp.12 of `.claude/skills/multiplayer-scenarios/scenarios.json`: "a busy
+/// pointer never delays a real message", and "a busy pointer cannot be used to knock a
+/// workspace offline".
+///
+/// `an_oversized_beat_and_a_spent_budget_are_refused_on_the_frame_only` already proves
+/// the flooder's own `SEND` survives its spent `LIVE` budget. The half no client verb
+/// can reach, and the half a person actually means, is the *other* member: while one
+/// connection empties its live allowance and is refused, a third party's durable
+/// message must still arrive, in order, at a reader that is subscribed to the same
+/// group. That is a statement about the relay's fanout under a flood and it can only be
+/// asserted on a connection that composed none of the flood.
+///
+/// `presence.md:207-214`: the live budget is per connection and separate from the
+/// envelope allowance. `multiplayer-cursors.md:49-54`: a pointer is never allowed to
+/// cost a message its delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flooded_live_budget_never_delays_another_members_durable_message() {
+    let scratch = Scratch::new("live_flood_fanout").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let group = make_group(&relay.state, 0x36).await;
+
+    // The flooder, the member writing real messages, and the reader that asserts.
+    let mut flooder = Client::connect(relay.address).await;
+    flooder.handshake(vec![group.clone()], CLOCK).await;
+    let mut writer = Client::connect(relay.address).await;
+    writer
+        .handshake_as(&other_device(), vec![group.clone()], CLOCK)
+        .await;
+    let mut reader = Client::connect(relay.address).await;
+    // A second connection of the writer's device. Hub exclusion is by connection id
+    // and never by device identity (`a_durable_write_reaches_two_other_connections`),
+    // so this is a third independent recipient, and it composes none of the flood.
+    reader
+        .handshake_as(&other_device(), vec![group.clone()], CLOCK)
+        .await;
+    reader
+        .send_frame(&Frame::Sub {
+            group: group.clone(),
+            from_seq: 0,
+        })
+        .await;
+    assert!(matches!(reader.recv_frame().await, Frame::SubAck { .. }));
+
+    // Empty the flooder's whole live allowance and take the refusal past it, so the
+    // durable traffic below is written by a connection whose neighbour is being
+    // rate limited right now rather than one that merely was.
+    for _ in 0..LIVE_FRAMES_PER_MINUTE {
+        flooder.send_frame(&beat(&group, b"pointer".to_vec())).await;
+    }
+    flooder
+        .send_frame(&beat(&group, b"one too many".to_vec()))
+        .await;
+    match flooder.recv_frame().await {
+        Frame::Error(error) => assert_eq!(error.code, ErrorCode::RateLimited),
+        other => panic!("expected the live budget to refuse, got {other:?}"),
+    }
+
+    // The other member's messages, during the flood. Delivery is at least once
+    // (`migration.md`), so the reader is asserted to have seen every body rather
+    // than to have seen exactly three frames.
+    let bodies: [&[u8]; 3] = [b"standup at ten", b"the build is green", b"shipping it"];
+    for body in bodies {
+        let envelope = support::envelope_for(&group, body);
+        writer
+            .send_frame(&Frame::Send {
+                envelope: envelope.encode(),
+            })
+            .await;
+        assert!(matches!(writer.recv_frame().await, Frame::SendAck { .. }));
+    }
+
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut seqs: Vec<u64> = Vec::new();
+    // Bounded by the work: delivery is at least once, so a repeat is read past and a
+    // relay that sends neither runs out of attempts rather than hanging.
+    // The reader is also being fanned every beat of the flood, so the bound counts
+    // frames of every kind: the messages are behind up to a full live allowance of
+    // pointers, and that queueing is exactly what this test measures the far end of.
+    for _ in 0..(LIVE_FRAMES_PER_MINUTE as usize + bodies.len() * 8) {
+        if seen.len() == bodies.len() {
+            break;
+        }
+        match reader.recv_frame().await {
+            Frame::Push { envelope: bytes } => {
+                let pushed =
+                    wealdrelay::envelope::Envelope::decode(&bytes).expect("a pushed envelope");
+                if !seen.contains(&pushed.ct) {
+                    seen.push(pushed.ct.clone());
+                    seqs.push(pushed.seq);
+                }
+            }
+            // A `LIVE` frame from the flood is expected traffic on this socket and is
+            // not what this test asserts about.
+            Frame::Live { .. } => continue,
+            other => panic!("expected the durable message, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        bodies.len(),
+        "a message never arrived during the flood"
+    );
+    for (index, body) in bodies.iter().enumerate() {
+        assert_eq!(
+            seen[index],
+            body.to_vec(),
+            "message {index} was delayed or lost"
+        );
+    }
+    let mut ordered = seqs.clone();
+    ordered.sort_unstable();
+    assert_eq!(
+        seqs, ordered,
+        "the flood reordered another member's messages"
+    );
+
+    // And the flooder's own durable allowance is untouched, which is the separation
+    // the budget exists for: it is refused as a pointer and accepted as a message.
+    let envelope = support::envelope_for(&group, b"the flooder can still talk");
+    flooder
+        .send_frame(&Frame::Send {
+            envelope: envelope.encode(),
+        })
+        .await;
+    assert!(matches!(flooder.recv_frame().await, Frame::SendAck { .. }));
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

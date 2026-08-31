@@ -268,7 +268,12 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     // A ceiling small enough to fill, which is the attack at scale in miniature:
     // with no handshake deadline these four sockets are the whole relay, forever,
     // for the cost of four file descriptors.
-    config.max_connections = wealdrelay::config::Limit::Of(4);
+    // Sized to the sources this host can actually offer. BR-032 gives one source
+    // `(ceiling / 4).max(1)` pre-authentication slots, so a table with one slot per
+    // source fills at any of these sizes and the claim is unchanged; a fixed four
+    // made the proof depend on a host carrying four loopback aliases.
+    let sources = support::distinct_loopback_sources(4, 2);
+    config.max_connections = wealdrelay::config::Limit::Of(sources.len() as u64);
     let relay = Running::start(config, Clock::Fixed(CLOCK)).await;
     let group = make_group(&relay.state, 0x41).await;
 
@@ -281,9 +286,8 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     // attack that control refuses rather than the full table this test needs.
     // The claim here is about deadlines returning slots, not about the share.
     let mut opening = Vec::new();
-    for index in 0..4u8 {
+    for source in sources.clone() {
         let address = relay.address;
-        let source = std::net::IpAddr::from([127, 0, 0, index + 1]);
         opening.push(tokio::spawn(async move {
             Client::connect_from(address, source).await
         }));
@@ -292,7 +296,11 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
     for handle in opening {
         silent.push(handle.await.expect("a client connected"));
     }
-    assert_eq!(relay.state.open_connections(), 4, "the relay is full");
+    assert_eq!(
+        relay.state.open_connections(),
+        sources.len(),
+        "the relay is full"
+    );
 
     // A real device, arriving while the table is full, is refused before the
     // upgrade. That is the pre-existing cap behaving correctly and it is the
@@ -331,7 +339,10 @@ async fn every_slot_a_silent_attacker_took_is_returned_and_the_relay_serves_a_re
         0,
         "the relay never recovered its connection table"
     );
-    assert_eq!(relay.state.deadline_closes(Expiry::Handshake), 4);
+    assert_eq!(
+        relay.state.deadline_closes(Expiry::Handshake),
+        sources.len() as u64
+    );
 
     // And the device that was locked out gets in, over the same relay process.
     let mut ada = Client::connect(relay.address).await;

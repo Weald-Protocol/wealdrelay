@@ -646,3 +646,60 @@ async fn a_full_queue_ends_a_subscriber_rather_than_downgrading_it_for_a_handsha
     }
     assert_eq!(seen, SEND_QUEUE_BOUND);
 }
+
+#[tokio::test]
+async fn an_owed_downgrade_is_paid_without_a_second_fanout_into_the_group() {
+    // WEALD-L757. The debt used to be discharged only by the next frame fanned into
+    // the same group, so a burst that filled a queue and was then followed by quiet
+    // left the subscriber downgraded and never told. From the outside that is the
+    // worst of the three outcomes the wire allows: the socket is up, nothing was
+    // refused, and nothing written afterwards is delivered or reconciled.
+    let hub = Hub::new();
+    let (sender, mut receiver) = outbound_channel();
+    let id = hub.connect();
+    hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
+        .await;
+    for _ in 0..SEND_QUEUE_BOUND {
+        hub.fanout(&group(1), &envelope(1), u64::MAX).await;
+    }
+    assert_eq!(
+        hub.fanout(&group(1), &envelope(2), u64::MAX).await,
+        vec![(id, Delivery::Downgraded)]
+    );
+    assert_eq!(hub.downgrades_owed().await, 1);
+
+    // Still full: the notice cannot go out yet and the debt stands, which is the
+    // half that must not turn into a spin.
+    assert_eq!(hub.settle_downgrades().await, 0);
+    assert_eq!(hub.downgrades_owed().await, 1);
+
+    // The client drains and nobody writes to the group again. The sweep pays it.
+    while receiver.try_recv().is_ok() {}
+    assert_eq!(hub.settle_downgrades().await, 1);
+    downgrade(&mut receiver, &group(1));
+    assert_eq!(hub.downgrades_owed().await, 0);
+
+    // Paid once. A second sweep owes nothing and sends nothing, so a client is never
+    // told to reconcile on a timer.
+    assert_eq!(hub.settle_downgrades().await, 0);
+    assert!(receiver.try_recv().is_err());
+
+    // And it is live again.
+    hub.fanout(&group(1), &envelope(3), u64::MAX).await;
+    assert_eq!(pushed(&mut receiver), envelope(3));
+}
+
+#[tokio::test]
+async fn a_hub_with_nothing_owed_settles_nothing() {
+    let hub = Hub::new();
+    let (sender, mut receiver) = outbound_channel();
+    let id = hub.connect();
+    hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
+        .await;
+    hub.fanout(&group(1), &envelope(1), u64::MAX).await;
+    assert_eq!(hub.downgrades_owed().await, 0);
+    assert_eq!(hub.settle_downgrades().await, 0);
+    // The one frame that was fanned out, and no downgrade behind it.
+    assert_eq!(pushed(&mut receiver), envelope(1));
+    assert!(receiver.try_recv().is_err());
+}
