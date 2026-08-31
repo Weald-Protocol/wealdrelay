@@ -1,0 +1,22 @@
+# Dokploy blueprint metadata. github.com/Dokploy/templates.
+#
+# Dokploy generates the domain and the secrets; this file names which variables
+# get them. WEALD_RELAY_ACCESS_SET is not here on purpose: it is `enforce` in the
+# compose file and a template variable would make it look adjustable.
+
+[variables]
+main_domain = "${domain}"
+postgres_password = "${password:40}"
+minio_password = "${password:40}"
+
+[config]
+[[config.domains]]
+serviceName = "relay"
+port = 8443
+host = "${main_domain}"
+
+[[config.env]]
+WEALD_RELAY_HOSTNAME = "${main_domain}"
+POSTGRES_PASSWORD = "${postgres_password}"
+MINIO_ROOT_PASSWORD = "${minio_password}"
+MINIO_BUCKET = "weald-blobs"

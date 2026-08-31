@@ -1,0 +1,14 @@
+{
+  "id": "wealdrelay",
+  "name": "Weald Relay",
+  "version": "wealdrelay-v0.1.28",
+  "description": "End-to-end encrypted relay for a Weald workspace. Stores ciphertext envelopes and routing metadata, holds no key, and has no admin panel because there is nothing an operator could administer.",
+  "logo": "wealdrelay.svg",
+  "links": {
+    "github": "https://github.com/Weald-Protocol/wealdrelay",
+    "website": "https://getweald.com/deploy",
+    "docs": "https://getweald.com/docs/self-hosting"
+  },
+  "tags": ["chat", "collaboration", "encryption", "developer-tools"],
+  "notes": "After the first boot, open the relay's logs and copy the one-time enrollment URL. It expires in 24 hours or on first use, and the first device to open it becomes the workspace trust root."
+}

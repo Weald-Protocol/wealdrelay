@@ -1,0 +1,54 @@
+# Umbrel app manifest. github.com/getumbrel/umbrel-apps.
+#
+# Read the note in ../README.md before submitting this. Umbrel requires that an
+# installed app be usable from a browser, and this relay has no web UI at all by
+# construction. What the manifest below does is put the one thing a new operator
+# needs, the one-time enrollment URL, into Umbrel's own app page as a widget, so
+# the browser requirement is met by the only screen a relay could honestly show.
+
+manifestVersion: 1
+id: weald-relay
+name: Weald Relay
+tagline: End-to-end encrypted relay for a Weald workspace
+category: social
+version: "wealdrelay-v0.1.28"
+port: 8443
+description: >-
+  Weald Relay carries one Weald workspace: encrypted messages, tickets, presence
+  and media between the Macs and phones of the people in it.
+
+
+  The relay holds no key. It stores ciphertext envelopes and the routing
+  metadata needed to deliver them, and it cannot read a message, a filename or a
+  ticket title. That is not a policy, it is the protocol: keys live on member
+  devices and group state is MLS.
+
+
+  It also has no admin panel, no operator account and no admin password, because
+  there is nothing an operator could usefully administer. Adding a member is done
+  in the client, signed by a device that holds the right to admit.
+
+
+  After installing, open the app page and copy the one-time enrollment URL. It
+  expires in 24 hours or on first use, and the first device to open it becomes
+  the workspace trust root.
+developer: Weald
+website: https://getweald.com
+submitter: Weald
+submission: https://github.com/Weald-Protocol/wealdrelay
+repo: https://github.com/Weald-Protocol/wealdrelay
+support: https://getweald.com/contact
+gallery:
+  - 1.jpg
+  - 2.jpg
+  - 3.jpg
+releaseNotes: >-
+  Reproducible image, pinned by digest. The release notes name the digest, and
+  the client's encryption panel reports what the relay it is talking to is
+  actually running, so the claim above is checkable rather than promised.
+dependencies: []
+permissions:
+  - STORAGE_DOWNLOADS
+path: ""
+defaultUsername: ""
+defaultPassword: ""

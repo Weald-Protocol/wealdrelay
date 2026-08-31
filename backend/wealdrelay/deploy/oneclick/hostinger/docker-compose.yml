@@ -1,0 +1,118 @@
+# The Weald relay, one self-contained compose file, no sibling files.
+#
+# For Hostinger's Docker Manager, and for anything else that takes a compose
+# file by URL and has nowhere to put a Caddyfile. Same deployment as
+# ../../compose/docker-compose.yml; the only difference is that Caddy is
+# configured from its command line instead of a mounted Caddyfile, so this file
+# can be pasted or fetched on its own.
+#
+# Set WEALD_RELAY_HOSTNAME and the two passwords in the platform's environment
+# editor. An A or AAAA record for the hostname must already point at the machine,
+# and ports 80 and 443 must be reachable, or no certificate can be issued.
+#
+# The relay is blind (specs/backend/relay/groups.md). No password here protects
+# anything we could read.
+
+name: weald-relay
+
+services:
+  postgres:
+    image: postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wealdrelay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: wealdrelay
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wealdrelay -d wealdrelay"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One shot. The relay never creates buckets: a process that can create one is a
+  # process holding a credential that can delete one.
+  minio-init:
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/"$$BUCKET"
+        mc anonymous set none local/"$$BUCKET"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wealdrelay}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      BUCKET: ${MINIO_BUCKET:-weald-blobs}
+    restart: "no"
+
+  relay:
+    image: ${WEALD_RELAY_IMAGE:-ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.28}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      WEALD_RELAY_HOSTNAME: ${WEALD_RELAY_HOSTNAME:?set WEALD_RELAY_HOSTNAME}
+      WEALD_RELAY_DATABASE_URL: postgres://wealdrelay:${POSTGRES_PASSWORD}@postgres:5432/wealdrelay
+      WEALD_RELAY_STORAGE_URL: s3://${MINIO_BUCKET:-weald-blobs}
+      WEALD_RELAY_TLS: "off"
+      WEALD_RELAY_LISTEN: 0.0.0.0:8443
+      WEALD_RELAY_TRUSTED_PROXY_HOPS: "1"
+      WEALD_RELAY_OBSERVABILITY_LISTEN: 0.0.0.0:9090
+      WEALD_RELAY_ACCESS_SET: enforce
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-wealdrelay}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    # No ports. The only way in is Caddy, and 9090 is never reachable from off
+    # the machine (specs/backend/relay/server.md).
+
+  caddy:
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    restart: unless-stopped
+    depends_on: [relay]
+    # Port 80 is not decoration: the ACME HTTP challenge needs it, and a closed
+    # port 80 is the commonest reason a first boot has no certificate.
+    ports:
+      - "80:80"
+      - "443:443"
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${WEALD_RELAY_HOSTNAME:?set WEALD_RELAY_HOSTNAME}
+      - --to
+      - relay:8443
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  postgres:
+  minio:
+  caddy-data:
+  caddy-config:

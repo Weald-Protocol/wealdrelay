@@ -1,0 +1,101 @@
+# CapRover one-click app. github.com/caprover/one-click-apps.
+#
+# CapRover's own nginx terminates TLS and holds the certificate, so this app
+# publishes no port and carries no proxy of its own. Postgres and MinIO are
+# CapRover apps beside the relay, which is how CapRover expresses a stack.
+#
+# Install from a custom repository, or paste this file into
+# Apps -> One-Click Apps/Databases -> template.
+
+captainVersion: 4
+
+caproverOneClickApp:
+  variables:
+    - id: $$cap_relay_hostname
+      label: Relay hostname
+      description: The public hostname this relay answers on. Point DNS at this CapRover machine first, then enable HTTPS for the app once it is up.
+      validRegex: /^[a-z0-9.-]+$/
+    - id: $$cap_pg_password
+      label: Postgres password
+      defaultValue: $$cap_gen_random_hex(32)
+      description: Protects ciphertext at rest. The relay is blind, so this guards a database whose contents we could not read either.
+    - id: $$cap_minio_password
+      label: Object storage password
+      defaultValue: $$cap_gen_random_hex(32)
+    - id: $$cap_relay_image
+      label: Relay image
+      defaultValue: ghcr.io/weald-protocol/wealdrelay:wealdrelay-v0.1.28
+      description: A release tag or a digest. No moving tag is ever published, so `latest` will not resolve.
+
+  instructions:
+    start: |-
+      Weald Relay stores end-to-end encrypted envelopes for one Weald workspace.
+      It holds no key, runs no search index, and has no admin panel, because
+      workspace administration happens in the client and is signed by a device.
+    end: |-
+      Three things, in order.
+
+      1. Enable HTTPS for the app in CapRover, and set the container HTTP port to 8443.
+      2. Open the relay app's logs and copy the one-time enrollment URL. It expires in 24 hours or on first use, and the first device to open it becomes the workspace trust root.
+      3. Open that URL on the Mac running Weald.
+
+      Set up backups of the Postgres volume before you invite anyone.
+      https://getweald.com/docs/self-hosting/backups
+
+  displayName: Weald Relay
+  isOfficial: false
+  description: End-to-end encrypted relay for a Weald workspace. Apache 2.0, reproducible image, digest-pinned.
+  documentation: https://getweald.com/docs/self-hosting
+
+services:
+  $$cap_appname-postgres:
+    image: postgres:16-bookworm
+    volumes:
+      - $$cap_appname-pgdata:/var/lib/postgresql/data
+    restart: always
+    environment:
+      POSTGRES_USER: wealdrelay
+      POSTGRES_DB: wealdrelay
+      POSTGRES_PASSWORD: $$cap_pg_password
+    caproverExtra:
+      notExposeAsWebApp: 'true'
+
+  $$cap_appname-minio:
+    image: minio/minio:latest
+    volumes:
+      - $$cap_appname-minio:/data
+    restart: always
+    # The bucket is a directory on MinIO's filesystem backend, made before the
+    # server starts. CapRover has no one-shot service, and the relay does not
+    # create buckets on purpose: a process that can create one holds a
+    # credential that can delete one.
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /data/weald-blobs && exec minio server /data"]
+    environment:
+      MINIO_ROOT_USER: wealdrelay
+      MINIO_ROOT_PASSWORD: $$cap_minio_password
+    caproverExtra:
+      notExposeAsWebApp: 'true'
+
+  $$cap_appname:
+    image: $$cap_relay_image
+    restart: always
+    depends_on:
+      - $$cap_appname-postgres
+      - $$cap_appname-minio
+    environment:
+      WEALD_RELAY_HOSTNAME: $$cap_relay_hostname
+      WEALD_RELAY_DATABASE_URL: postgres://wealdrelay:$$cap_pg_password@srv-captain--$$cap_appname-postgres:5432/wealdrelay
+      WEALD_RELAY_STORAGE_URL: s3://weald-blobs
+      # CapRover's nginx is the terminator. The binary refuses `acme` and `file`
+      # outright, so `off` is the only legal value behind a proxy.
+      WEALD_RELAY_TLS: 'off'
+      WEALD_RELAY_LISTEN: 0.0.0.0:8443
+      WEALD_RELAY_TRUSTED_PROXY_HOPS: '1'
+      WEALD_RELAY_OBSERVABILITY_LISTEN: 127.0.0.1:9090
+      WEALD_RELAY_ACCESS_SET: enforce
+      AWS_ENDPOINT_URL_S3: http://srv-captain--$$cap_appname-minio:9000
+      AWS_ACCESS_KEY_ID: wealdrelay
+      AWS_SECRET_ACCESS_KEY: $$cap_minio_password
+      AWS_REGION: us-east-1
+    caproverExtra:
+      containerHttpPort: '8443'
