@@ -1719,10 +1719,18 @@ pub async fn perform(
             {
                 // A frame on a socket that stays up. The connection's reads are
                 // untouched: this is a statement about its writes.
-                return queue_all(
+                //
+                // WEALD-L811: awaiting, not `queue_all`. A burst is precisely the
+                // moment the outbound queue is full of this sender's own acks, and
+                // `queue_all` reads a full queue as a peer that has stopped
+                // reading and ends the connection. That turned the one refusal the
+                // budget exists to deliver into the sever it exists to avoid, with
+                // no code on the wire for the client to back off against.
+                return queue_all_awaiting(
                     sender,
                     vec![Frame::Error(refusal.to_frame_error(&state.send_budget))],
-                );
+                )
+                .await;
             }
             let decoded = match Envelope::decode(&envelope) {
                 Ok(decoded) => decoded,
@@ -1763,13 +1771,21 @@ pub async fn perform(
                     let seq = match outcome {
                         Accepted::Stored { seq } | Accepted::Duplicate { seq } => seq,
                     };
-                    queue_all(
+                    // WEALD-L811: awaiting, for the reason the refusal above
+                    // awaits. One ack is owed per accepted `SEND`, so a client
+                    // writing faster than it reads fills its own queue with them,
+                    // and closing on that made a fast honest sender lose the
+                    // session rather than be paced. Waiting stops this connection's
+                    // reader, which is the backpressure `operations.md` asks for:
+                    // it travels out through TCP, and the socket stays up.
+                    queue_all_awaiting(
                         sender,
                         vec![Frame::SendAck {
                             hash: decoded.hash,
                             seq,
                         }],
                     )
+                    .await
                 }
                 Err(error) => queue_all(sender, vec![Frame::Error(error.to_frame())]),
             }

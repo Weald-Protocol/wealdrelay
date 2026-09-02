@@ -372,3 +372,99 @@ fn body_for(index: usize, len: usize) -> Vec<u8> {
     body.resize(len, 0x5a);
     body
 }
+
+// MARK: The recovery. The window rolls and the device publishes again.
+
+/// A device refused by the frame budget publishes again once the window turns
+/// over, on the same socket, with no reconnection.
+///
+/// WEALD-L924. The tests above pin the refusal; none of them pinned what happens
+/// next, and what a live 0.1.42 cell was observed doing after a burst was
+/// `messageAfter=no`: both ends reported `connected=yes` and the workspace could
+/// not publish again. "Refused with `quota/rate_limited` on a socket that stays
+/// up" (`wire.md:929`) is two promises, and only the first of them had a proof.
+///
+/// The clock is manual rather than fixed, so the window turning over is an
+/// instruction rather than a sleep: a test that waited a real minute for a real
+/// window would be a test nobody runs.
+#[tokio::test]
+async fn a_refused_device_publishes_again_once_the_window_rolls() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let scratch = Scratch::new("send-budget-recovery").await;
+    let blobs = tempfile::tempdir().expect("a blob directory");
+    let clock = Arc::new(AtomicU64::new(CLOCK));
+    let relay = Running::start(
+        config_with(
+            &scratch,
+            blobs.path(),
+            [(keys::SEND_FRAMES_PER_MINUTE, FEW_FRAMES.to_string())],
+        ),
+        Clock::Manual(Arc::clone(&clock)),
+    )
+    .await;
+    let group = make_group(&relay.state, 0x53).await;
+
+    let mut ada = Client::connect(relay.address).await;
+    ada.handshake_as(&default_device(), vec![group.clone()], CLOCK)
+        .await;
+
+    for index in 0..FEW_FRAMES {
+        let envelope = envelope_for(&group, &[index as u8; 32]);
+        ada.send_frame(&Frame::Send {
+            envelope: envelope.encode(),
+        })
+        .await;
+        expect_ack(&mut ada, &envelope.hash).await;
+    }
+
+    // The refusal, and the code a client branches on. Pinned here as well as
+    // above, because this test is the one that says what the code is worth: a
+    // client told `quota/rate_limited` waits `retry_after` and tries again, and
+    // the assertion below is that doing so works.
+    let over = envelope_for(&group, b"one too many");
+    ada.send_frame(&Frame::Send {
+        envelope: over.encode(),
+    })
+    .await;
+    let error = match ada.recv_frame().await {
+        Frame::Error(error) => error,
+        other => panic!("expected the budget to refuse, got {other:?}"),
+    };
+    assert_eq!(error.code, ErrorCode::RateLimited);
+    assert_eq!(error.code.class(), ErrorClass::Quota);
+    let wait = error.retry_after.expect("the refusal names an interval");
+
+    // Exactly the interval the relay named, and not a millisecond more: a
+    // recovery that needed longer than the wait it advertised would be the same
+    // defect wearing a smaller number.
+    clock.fetch_add(u64::from(wait) * 1_000, Ordering::Relaxed);
+
+    let after = envelope_for(&group, b"after the window rolled");
+    ada.send_frame(&Frame::Send {
+        envelope: after.encode(),
+    })
+    .await;
+    let seq = expect_ack(&mut ada, &after.hash).await;
+    assert!(seq > 0, "the recovered write is in the log");
+
+    // And it is durable, rather than merely acknowledged.
+    let pool = relay
+        .state
+        .database
+        .as_ref()
+        .expect("a database")
+        .pool()
+        .clone();
+    let stored: i64 =
+        sqlx::query_scalar("select count(*) from relay_envelope where group_id = $1 and hash = $2")
+            .bind(&group)
+            .bind(&after.hash)
+            .fetch_one(&pool)
+            .await
+            .expect("count the recovered envelope");
+    assert_eq!(stored, 1, "the write after the window is not in the log");
+
+    relay.shutdown().await;
+}
