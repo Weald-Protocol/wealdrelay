@@ -1313,8 +1313,11 @@ async fn set_media_quota(
             .into_response();
     }
     let pool = database.pool();
+    // WEALD-L972. `set_quota_limit`, not `ensure_quota_row`: the shared upsert now
+    // keeps an existing ceiling, because it also runs on every `PUT`, and this is
+    // the one route whose job is to change one.
     if let Err(error) =
-        crate::media::store::ensure_quota_row(pool, &body.workspace, body.limit_bytes).await
+        crate::media::store::set_quota_limit(pool, &body.workspace, body.limit_bytes).await
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

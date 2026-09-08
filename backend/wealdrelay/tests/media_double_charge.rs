@@ -83,9 +83,12 @@ async fn re_uploading_an_object_whose_row_survived_charges_it_once() {
         .await
         .expect("the first reservation");
     let first_id = reservation_id(&first);
-    assert!(store::claim(pool, WORKSPACE, &group, &hash)
-        .await
-        .expect("the claim"));
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash)
+            .await
+            .expect("the claim"),
+        store::ClaimOutcome::Claimed
+    );
     let usage = store::usage(pool, WORKSPACE).await.unwrap();
     assert_eq!(usage.stored_bytes, 400);
     assert_eq!(usage.reserved_bytes, 0);
@@ -115,10 +118,16 @@ async fn re_uploading_an_object_whose_row_survived_charges_it_once() {
     assert_eq!(usage.reserved_bytes, 400);
     assert_eq!(rows_for(pool, &group, &hash).await, 1);
 
-    // And the second claim lands the object at its true size, once.
-    assert!(store::claim(pool, WORKSPACE, &group, &hash)
-        .await
-        .expect("the second claim"));
+    // And the second claim lands the object at its true size, once. The stale row
+    // was retired and replaced by a fresh, unfinalized reservation above, so this
+    // claim finalizes that new row for the first time: `Claimed`, not
+    // `AlreadyClaimed`.
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash)
+            .await
+            .expect("the second claim"),
+        store::ClaimOutcome::Claimed
+    );
     let usage = store::usage(pool, WORKSPACE).await.unwrap();
     assert_eq!(
         usage.stored_bytes, 400,
@@ -174,9 +183,12 @@ async fn an_already_double_charged_object_is_reconciled_by_its_next_upload() {
         .await
         .expect("the re-upload reservation");
     reservation_id(&again);
-    assert!(store::claim(pool, WORKSPACE, &group, &hash)
-        .await
-        .expect("the claim"));
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash)
+            .await
+            .expect("the claim"),
+        store::ClaimOutcome::Claimed
+    );
 
     let usage = store::usage(pool, WORKSPACE).await.unwrap();
     assert_eq!(
@@ -219,9 +231,12 @@ async fn a_retry_and_an_existing_object_are_unaffected() {
     );
     assert_eq!(rows_for(pool, &group, &hash).await, 1);
 
-    assert!(store::claim(pool, WORKSPACE, &group, &hash)
-        .await
-        .expect("the claim"));
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash)
+            .await
+            .expect("the claim"),
+        store::ClaimOutcome::Claimed
+    );
     // Finalized *and* the object is present, which is the ordinary steady state: the
     // short circuit answers first and the finalized row is never touched.
     let free = store::reserve(pool, WORKSPACE, &group, &hash, 400, true, TTL)

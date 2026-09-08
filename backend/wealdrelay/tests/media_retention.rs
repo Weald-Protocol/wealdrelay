@@ -670,6 +670,9 @@ async fn a_manifest_that_fails_verification_is_evidence_and_never_the_latest() {
     store::ensure_quota_row(pool, "ws-badman", None)
         .await
         .unwrap();
+    store::reserve(pool, "ws-badman", &group, &blob_hash(0xa1), 100, false, 900)
+        .await
+        .unwrap();
     let real = signed_manifest(&group, 0, 1, None, vec![blob_hash(0xa1)], &epoch0);
     let digest = match retention::apply_manifest(pool, "ws-badman", &real)
         .await
@@ -1288,6 +1291,46 @@ async fn a_manifest_whose_claims_cannot_be_written_is_refused() {
     scratch.drop_database().await;
 }
 
+/// A manifest naming a hash with no reservation row at all is refused whole,
+/// leaving no manifest and no partial claim behind (WEALD-353).
+///
+/// `store::claim_in` returns `NoReservation` distinctly from `AlreadyClaimed`
+/// (the ordinary case of a manifest re-naming a hash an earlier manifest
+/// already finalized), so only the genuine defect -- a hash the group calls
+/// live that the relay never reserved bytes for -- refuses the manifest.
+#[tokio::test]
+async fn a_manifest_naming_an_unreserved_hash_is_refused_whole() {
+    let (scratch, _blobs, state) = prepared("retention_no_reservation").await;
+    let pool = pool_of(&state);
+    let group = workspace_with(&state, "ws-noreservation", 0x6c, &[device_from(0x71)]).await;
+    let epoch0 = verifier_key(0x22);
+    retention::apply_control(pool, &signed_control(&group, 0, &epoch0, None, &epoch0))
+        .await
+        .unwrap();
+    store::ensure_quota_row(pool, "ws-noreservation", None)
+        .await
+        .unwrap();
+
+    // No `store::reserve` call: this hash never had a reservation row.
+    let manifest = signed_manifest(&group, 0, 1, None, vec![blob_hash(0xb2)], &epoch0);
+    let outcome = retention::apply_manifest(pool, "ws-noreservation", &manifest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, retention::ManifestOutcome::Invalid(_)),
+        "a manifest naming an unreserved hash must not be accepted: {outcome:?}"
+    );
+    assert!(
+        retention::latest_manifest(pool, &group)
+            .await
+            .unwrap()
+            .is_none(),
+        "the refused manifest must leave no partial state behind"
+    );
+
+    scratch.drop_database().await;
+}
+
 // MARK: The chain position a joiner resyncs against (WEALD-L355)
 
 /// The relay is the authority on where a group's manifest chain is, and it can
@@ -1323,6 +1366,23 @@ async fn the_position_reports_the_group_chain_so_a_joiner_can_resync() {
     assert_eq!(founded.control_epoch, 0);
     assert_eq!(founded.control_digest, Some(genesis.digest()));
     assert_eq!(founded.next_sequence, retention::FIRST_MANIFEST_SEQUENCE);
+
+    store::ensure_quota_row(pool, "ws-position", None)
+        .await
+        .unwrap();
+    for seed in [1u8, 2] {
+        store::reserve(
+            pool,
+            "ws-position",
+            &group,
+            &blob_hash(seed),
+            100,
+            false,
+            900,
+        )
+        .await
+        .unwrap();
+    }
 
     let first = signed_manifest(
         &group,
@@ -1362,6 +1422,9 @@ async fn the_position_reports_the_group_chain_so_a_joiner_can_resync() {
 
     // The same device, rebuilt from the reported position and carrying the claim
     // set forward, is accepted.
+    store::reserve(pool, "ws-position", &group, &blob_hash(3), 100, false, 900)
+        .await
+        .unwrap();
     let resynced = signed_manifest(
         &group,
         after.control_epoch,

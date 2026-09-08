@@ -714,9 +714,12 @@ async fn a_claim_that_does_not_commit_is_never_reported_as_a_claim() {
     // Nothing was claimed and nothing was charged, and the claim still works once
     // the database will take it.
     assert_eq!(store::usage(pool, WORKSPACE).await.unwrap().stored_bytes, 0);
-    assert!(store::claim(pool, WORKSPACE, &group(), &hash())
-        .await
-        .unwrap());
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group(), &hash())
+            .await
+            .unwrap(),
+        store::ClaimOutcome::Claimed
+    );
 
     scratch.drop_database().await;
 }

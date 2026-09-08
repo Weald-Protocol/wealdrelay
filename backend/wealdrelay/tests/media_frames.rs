@@ -378,6 +378,82 @@ async fn a_put_the_relay_cannot_serve_is_refused_by_the_reason_it_cannot() {
     harness.finish().await;
 }
 
+/// WEALD-L972. The operator ceiling has to survive the next upload.
+///
+/// `POST /media/quota` puts `quota/storage_exhausted` one object away instead of
+/// 25 GB of real uploading away, and every `PUT` and every quota read called the
+/// same upsert with the tier constant, so the first put after the ceiling was set
+/// replaced it with 25 GB. Nineteen 5 MB puts then carried a live workspace 94 MB
+/// past its ceiling with no refusal, and `media-quota` reported 25 GB because the
+/// row said 25 GB. Two functions now: one that makes sure a row exists, one that
+/// sets a ceiling.
+#[tokio::test]
+async fn an_operator_ceiling_survives_the_next_put_and_the_next_quota_read() {
+    let harness = Harness::with(
+        "frames_quota_operator",
+        [(keys::MAX_STORAGE_GB, "1".to_string())],
+        |_| {},
+    )
+    .await;
+    let group = harness.group(0x45, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let pool = harness.pool();
+
+    // The row exists with the tier's ceiling, the way a first upload leaves it.
+    store::ensure_quota_row(pool, WS, Some(1_000_000_000))
+        .await
+        .expect("a quota row");
+    // The operator lowers it to one object away.
+    store::set_quota_limit(pool, WS, Some(10_000_000))
+        .await
+        .expect("the ceiling is set");
+    assert_eq!(
+        store::usage(pool, WS).await.unwrap().limit_bytes,
+        Some(10_000_000)
+    );
+
+    // A quota read is one of the two paths that used to overwrite it.
+    let _ = harness
+        .ask(
+            &session,
+            &Request::Quota {
+                group: group.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        store::usage(pool, WS).await.unwrap().limit_bytes,
+        Some(10_000_000),
+        "a quota read must not restore the tier default over an operator ceiling"
+    );
+
+    // And so was the put itself, which is why the refusal was unreachable.
+    let refused = harness
+        .ask(&session, &put(&group, &blob_hash(9), 20_000_000))
+        .await;
+    assert_eq!(error_code(&refused), ErrorCode::StorageExhausted);
+    assert_eq!(
+        store::usage(pool, WS).await.unwrap().limit_bytes,
+        Some(10_000_000)
+    );
+
+    // The ceiling is still the operator's lever in both directions.
+    store::set_quota_limit(pool, WS, None)
+        .await
+        .expect("unlimited");
+    assert_eq!(store::usage(pool, WS).await.unwrap().limit_bytes, None);
+    store::ensure_quota_row(pool, WS, Some(1_000_000_000))
+        .await
+        .expect("a quota row");
+    assert_eq!(
+        store::usage(pool, WS).await.unwrap().limit_bytes,
+        Some(1_000_000_000),
+        "a row with no ceiling still takes the tier's"
+    );
+
+    harness.finish().await;
+}
+
 #[tokio::test]
 async fn a_workspace_out_of_storage_is_told_so_and_text_still_flows() {
     // One gigabyte, which is what `WEALD_RELAY_MAX_STORAGE_GB` means here.
@@ -497,9 +573,12 @@ async fn the_quota_read_reports_the_workspace_s_real_stored_limit_and_remaining(
     // And the same bytes once they are claimed rather than reserved: the total the
     // ceiling is measured against has not moved, which is what a person reading
     // "600 MB left" is entitled to.
-    assert!(store::claim(harness.pool(), WS, &group, &hash)
-        .await
-        .unwrap());
+    assert_eq!(
+        store::claim(harness.pool(), WS, &group, &hash)
+            .await
+            .unwrap(),
+        store::ClaimOutcome::Claimed
+    );
     let claimed = harness
         .ask(
             &session,

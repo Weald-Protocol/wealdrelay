@@ -75,9 +75,24 @@ async fn a_quota_row_is_created_once_and_then_follows_the_configured_limit() {
         Some(1_000)
     );
 
-    // A relay restarted with a changed `WEALD_RELAY_MAX_STORAGE_GB` enforces the
-    // new limit on its next reservation, not the one it booted with.
+    // WEALD-L972. `ensure_quota_row` runs on every `PUT`, so it must never
+    // overwrite a ceiling that already exists: doing so undid an operator's
+    // limit at the next upload. A second call with a different value is a
+    // no-op against an existing row.
     store::ensure_quota_row(pool, WORKSPACE, Some(4_000))
+        .await
+        .expect("leave the existing row alone");
+    assert_eq!(
+        store::usage(pool, WORKSPACE)
+            .await
+            .expect("read")
+            .limit_bytes,
+        Some(1_000)
+    );
+
+    // `set_quota_limit` is the only path that may change a ceiling: the operator
+    // route.
+    store::set_quota_limit(pool, WORKSPACE, Some(4_000))
         .await
         .expect("update the row");
     assert_eq!(
@@ -87,7 +102,7 @@ async fn a_quota_row_is_created_once_and_then_follows_the_configured_limit() {
             .limit_bytes,
         Some(4_000)
     );
-    store::ensure_quota_row(pool, WORKSPACE, None)
+    store::set_quota_limit(pool, WORKSPACE, None)
         .await
         .expect("an unlimited relay");
     assert_eq!(
@@ -283,7 +298,10 @@ async fn bytes_move_from_reserved_to_stored_exactly_once_and_leave_exactly_once(
         .unwrap()
         .is_empty());
 
-    assert!(store::claim(pool, WORKSPACE, &group, &hash).await.unwrap());
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash).await.unwrap(),
+        store::ClaimOutcome::Claimed
+    );
     let usage = store::usage(pool, WORKSPACE).await.unwrap();
     assert_eq!(usage.reserved_bytes, 0);
     assert_eq!(usage.stored_bytes, 700);
@@ -291,7 +309,10 @@ async fn bytes_move_from_reserved_to_stored_exactly_once_and_leave_exactly_once(
     // A later manifest naming the same hash again is a no-op: `finalized_at` is
     // only ever set once, which is what stops a chatty group inflating its own
     // stored total.
-    assert!(!store::claim(pool, WORKSPACE, &group, &hash).await.unwrap());
+    assert_eq!(
+        store::claim(pool, WORKSPACE, &group, &hash).await.unwrap(),
+        store::ClaimOutcome::AlreadyClaimed
+    );
     assert_eq!(
         store::usage(pool, WORKSPACE).await.unwrap().stored_bytes,
         700

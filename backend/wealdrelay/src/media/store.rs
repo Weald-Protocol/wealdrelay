@@ -69,6 +69,40 @@ pub async fn ensure_quota_row(
     workspace: &str,
     limit_bytes: Option<i64>,
 ) -> Result<(), StoreError> {
+    // WEALD-L972. `coalesce`, never `excluded.limit_bytes`. This runs on every
+    // `PUT` and on every quota read, so overwriting the row's ceiling with the
+    // tier constant undid an operator ceiling at the very next upload: a limit set
+    // one 5 MB object above `stored_bytes` was replaced by 25 GB by the first put
+    // that tested it, nineteen puts carried a live workspace 94 MB past its
+    // ceiling with no refusal, and `media-quota` then reported 25 GB because that
+    // is what the row really said. An existing ceiling is somebody's decision;
+    // this call's job is only to make sure a row exists, and to fill in a ceiling
+    // where the row has none. `set_quota_limit` is what changes one.
+    sqlx::query(
+        "insert into relay_quota (workspace_id, limit_bytes) values ($1, $2) \
+         on conflict (workspace_id) do update \
+           set limit_bytes = coalesce(relay_quota.limit_bytes, excluded.limit_bytes)",
+    )
+    .bind(workspace)
+    .bind(limit_bytes)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Set one workspace's storage ceiling, creating the row if it does not exist.
+///
+/// WEALD-L972. The operator route's half of what `ensure_quota_row` used to do
+/// for everybody: this one writes the number it is given, including `None` for
+/// unlimited, and it is the only path that may lower or raise a ceiling. Keeping
+/// the two apart is what stops a `PUT` from quietly restoring the tier default
+/// over an operator's decision.
+pub async fn set_quota_limit(
+    pool: &PgPool,
+    workspace: &str,
+    limit_bytes: Option<i64>,
+) -> Result<(), StoreError> {
     sqlx::query(
         "insert into relay_quota (workspace_id, limit_bytes) values ($1, $2) \
          on conflict (workspace_id) do update set limit_bytes = excluded.limit_bytes",
@@ -355,16 +389,34 @@ pub async fn find_active_reservation(
 /// and its bytes move from reserved to stored. A second claim (a later manifest
 /// naming the same hash again) is a no-op: `finalized_at` is only ever set once,
 /// which is what the `finalized_at is null` guard enforces.
+/// The three states a claim attempt can land in. `finalized_at is null` in the
+/// update's `where` clause makes a single boolean ambiguous between two very
+/// different cases: a hash the group names that this relay never reserved at
+/// all (the bug `apply_manifest` must refuse), and a hash an earlier manifest
+/// already claimed, which `claim` is deliberately idempotent about (`media.md`,
+/// `retention.rs`'s sequence rules: a manifest that re-names a previously
+/// claimed blob is the ordinary case, not an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// A fresh, unfinalized reservation existed and is now finalized.
+    Claimed,
+    /// A reservation for this hash exists but was already finalized by an
+    /// earlier claim. Not an error.
+    AlreadyClaimed,
+    /// No reservation row exists for this `(workspace, group, hash)` at all.
+    NoReservation,
+}
+
 pub async fn claim(
     pool: &PgPool,
     workspace: &str,
     group: &[u8],
     hash: &[u8],
-) -> Result<bool, StoreError> {
+) -> Result<ClaimOutcome, StoreError> {
     let mut tx = pool.begin().await.map_err(db)?;
-    let claimed = claim_in(&mut tx, workspace, group, hash).await?;
+    let outcome = claim_in(&mut tx, workspace, group, hash).await?;
     tx.commit().await.map_err(db)?;
-    Ok(claimed)
+    Ok(outcome)
 }
 
 /// `claim`, inside a transaction the caller owns.
@@ -379,7 +431,7 @@ pub(crate) async fn claim_in(
     workspace: &str,
     group: &[u8],
     hash: &[u8],
-) -> Result<bool, StoreError> {
+) -> Result<ClaimOutcome, StoreError> {
     let row = sqlx::query(
         "update relay_blob_reservation set finalized_at = now() \
          where workspace_id = $1 and group_id = $2 and blob_hash = $3 and finalized_at is null \
@@ -392,7 +444,22 @@ pub(crate) async fn claim_in(
     .await
     .map_err(db)?;
     let Some(row) = row else {
-        return Ok(false);
+        let exists = sqlx::query(
+            "select 1 as present from relay_blob_reservation \
+             where workspace_id = $1 and group_id = $2 and blob_hash = $3 limit 1",
+        )
+        .bind(workspace)
+        .bind(group)
+        .bind(hash)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?
+        .is_some();
+        return Ok(if exists {
+            ClaimOutcome::AlreadyClaimed
+        } else {
+            ClaimOutcome::NoReservation
+        });
     };
     let bytes: i64 = row.try_get("bytes").map_err(db)?;
     sqlx::query(
@@ -404,7 +471,7 @@ pub(crate) async fn claim_in(
     .execute(&mut **tx)
     .await
     .map_err(db)?;
-    Ok(true)
+    Ok(ClaimOutcome::Claimed)
 }
 
 /// Release one reservation's bytes back to the workspace without finalizing it,

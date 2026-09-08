@@ -532,9 +532,15 @@ pub async fn apply_manifest(
     .map_err(db)?;
 
     for hash in &record.blobs {
-        super::store::claim_in(&mut tx, workspace, &record.group, hash)
+        let outcome = super::store::claim_in(&mut tx, workspace, &record.group, hash)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))?;
+        if matches!(outcome, super::store::ClaimOutcome::NoReservation) {
+            drop(tx);
+            let reason = reject("manifest names a hash with no reservation");
+            reject_manifest(pool, record, &reason).await?;
+            return Ok(ManifestOutcome::Invalid(reason));
+        }
     }
     tx.commit().await.map_err(db)?;
 
