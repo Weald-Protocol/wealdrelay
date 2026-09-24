@@ -75,7 +75,11 @@ principal set, and a receipt for every group and relay-side access-set update.
 Each step is idempotent; after a crash or reconnect the client resumes the same
 operation, never starts a second removal against a newer roster by accident. If
 the authorization head changed before the first MLS commit, the operation pauses
-and shows the admin the intervening change for explicit reapproval. The receipt
+and shows the admin the intervening change for explicit reapproval. Re-running
+the removal while it is still at `enumerated` is that reapproval: the operation
+keeps its id and targets and takes the current head (`RemovalRunner.reapprove`,
+WEALD-L982). The operation is saved at every step it reaches, so a process stopped
+mid-removal resumes where it stopped rather than re-enumerating. The receipt
 is emitted only after every scoped group has rotated and the access-set
 compare-and-swap has succeeded.
 

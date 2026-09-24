@@ -325,6 +325,20 @@ pub fn distinct_loopback_sources(want: usize, least: usize) -> Vec<std::net::IpA
             found.push(address);
         }
     }
+    // Any other alias the host already carries on its loopback interface. The
+    // fixed list above is only a preference order; an alias in another block
+    // (for example 127.2.47.243) is just as distinct a source.
+    for address in loopback_interface_addresses() {
+        if found.len() >= want {
+            break;
+        }
+        if found.contains(&address) {
+            continue;
+        }
+        if std::net::TcpListener::bind(std::net::SocketAddr::new(address, 0)).is_ok() {
+            found.push(address);
+        }
+    }
     assert!(
         found.len() >= least,
         "this host offers {} bindable loopback source(s) and the proof needs {least}. \
@@ -334,6 +348,35 @@ pub fn distinct_loopback_sources(want: usize, least: usize) -> Vec<std::net::IpA
     );
     found.truncate(want);
     found
+}
+
+/// IPv4 loopback addresses configured on this host's interfaces, in the order
+/// `getifaddrs` reports them.
+fn loopback_interface_addresses() -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list we walk read-only and free
+    // exactly once with `freeifaddrs`.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cursor = head;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            if !entry.ifa_addr.is_null() && i32::from((*entry.ifa_addr).sa_family) == libc::AF_INET
+            {
+                let v4 = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                let ip = std::net::Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
+                if ip.is_loopback() {
+                    out.push(std::net::IpAddr::V4(ip));
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
 }
 
 impl Client {
