@@ -61,7 +61,7 @@ services:
       notExposeAsWebApp: 'true'
 
   $$cap_appname-minio:
-    image: minio/minio:latest
+    image: docker.io/pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
     volumes:
       - $$cap_appname-minio:/data
     restart: always
