@@ -135,27 +135,34 @@ impl Ringer {
             return Outcome::Refused;
         };
 
-        let sent = tokio::time::timeout(
-            Duration::from_millis(super::WAKE_DEADLINE_MS),
-            self.client.request(request),
-        )
-        .await;
-        let response = match sent {
-            Ok(Ok(response)) => response,
-            // A ringer that hangs and a ringer that is not there are the same fact
-            // from the relay's side: no answer. Both are `unreachable`, and neither
-            // is allowed to hold anything up, which is what the deadline is for.
-            Ok(Err(_)) | Err(_) => return Outcome::Unreachable,
+        // One deadline over the whole exchange, head and body. `request` resolves
+        // as soon as the response head arrives, so a deadline around it alone let
+        // a ringer that sent a head and stalled the body park the only push
+        // worker forever (WEALD-L1087). On expiry the future is dropped, which
+        // drops the connection with it.
+        let exchange = async {
+            let response = self.client.request(request).await.ok()?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(hyper::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            // Drained rather than dropped, so the pooled connection is reusable
+            // for the next wake instead of being torn down with a body on it.
+            let _ = response.into_body().collect().await;
+            Some((status, retry_after))
         };
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(hyper::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok());
-        // Drained rather than dropped, so the pooled connection is reusable for the
-        // next wake instead of being torn down with a body still on it.
-        let _ = response.into_body().collect().await;
+        let (status, retry_after) =
+            match tokio::time::timeout(Duration::from_millis(super::WAKE_DEADLINE_MS), exchange)
+                .await
+            {
+                Ok(Some(answer)) => answer,
+                // A ringer that hangs and a ringer that is not there are the same fact
+                // from the relay's side: no answer. Both are `unreachable`, and neither
+                // is allowed to hold anything up, which is what the deadline is for.
+                Ok(None) | Err(_) => return Outcome::Unreachable,
+            };
 
         if status.is_success() {
             return Outcome::Accepted;

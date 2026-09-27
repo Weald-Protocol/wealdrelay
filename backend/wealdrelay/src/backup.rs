@@ -396,15 +396,7 @@ pub async fn collect(
         migrations,
     };
 
-    let mut entries = Vec::new();
-    let tables = db
-        .tables()
-        .await
-        .map_err(|error| BackupError::Database(error.to_string()))?;
-    for table in &tables {
-        let dump = dump_table(db, table).await?;
-        entries.push(Entry::new(format!("database/{table}.copy"), dump));
-    }
+    let mut entries = dump_tables(db, |_| async {}).await?;
 
     let Some(storage) = storage else {
         return Ok((entries, provenance));
@@ -452,8 +444,51 @@ async fn blob_groups(db: &crate::db::Database) -> Result<Vec<(String, String)>, 
         .collect())
 }
 
+/// Every table, read inside one `repeatable read, read only` transaction so the
+/// capture reflects one instant (`specs/backend/cloud/backup-dr.md`, consistent
+/// recovery point). At read committed each `COPY` took its own snapshot, so a
+/// reservation or a `SEND` committed between two tables left a counter that
+/// disagreed with the rows it counts after restore (WEALD-L1114).
+///
+/// `between` runs after each table is dumped, inside the snapshot. The capture
+/// passes a no-op; it is public so a test can commit from a second connection
+/// mid-capture and prove the capture does not see it.
+pub async fn dump_tables<F, Fut>(
+    db: &crate::db::Database,
+    mut between: F,
+) -> Result<Vec<Entry>, BackupError>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let database = |error: sqlx::Error| BackupError::Database(error.to_string());
+    let mut tx = db.pool().begin().await.map_err(database)?;
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await
+        .map_err(database)?;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "select table_name::text from information_schema.tables \
+         where table_schema = 'public' order by table_name",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database)?;
+    let mut entries = Vec::new();
+    for table in &tables {
+        let dump = dump_table(&mut tx, table).await?;
+        entries.push(Entry::new(format!("database/{table}.copy"), dump));
+        between(table).await;
+    }
+    tx.commit().await.map_err(database)?;
+    Ok(entries)
+}
+
 /// One table as a `psql`-loadable `COPY` block.
-async fn dump_table(db: &crate::db::Database, table: &str) -> Result<Vec<u8>, BackupError> {
+async fn dump_table(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+) -> Result<Vec<u8>, BackupError> {
     // Identifier quoting rather than interpolation hygiene by hope: the name came
     // from `information_schema`, so it cannot contain a quote, but the query is
     // built by format and this is the line that makes that safe to read.
@@ -463,12 +498,10 @@ async fn dump_table(db: &crate::db::Database, table: &str) -> Result<Vec<u8>, Ba
         )));
     }
     let mut out = format!("copy public.\"{table}\" from stdin;\n").into_bytes();
-    let mut stream = sqlx::postgres::PgPoolCopyExt::copy_out_raw(
-        db.pool(),
-        &format!("copy public.\"{table}\" to stdout"),
-    )
-    .await
-    .map_err(|error| BackupError::Database(error.to_string()))?;
+    let mut stream = connection
+        .copy_out_raw(&format!("copy public.\"{table}\" to stdout"))
+        .await
+        .map_err(|error| BackupError::Database(error.to_string()))?;
     while let Some(chunk) = stream
         .try_next()
         .await

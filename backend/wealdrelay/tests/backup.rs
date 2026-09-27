@@ -509,3 +509,70 @@ async fn a_refused_upload_fails_and_leaves_no_temporary_file() {
 
     scratch.drop_database().await;
 }
+
+/// The data rows of one `COPY` block, as tab-separated fields.
+fn copy_rows(block: &[u8]) -> Vec<Vec<String>> {
+    String::from_utf8_lossy(block)
+        .lines()
+        .skip(1)
+        .take_while(|line| *line != "\\.")
+        .map(|line| line.split('\t').map(str::to_string).collect())
+        .collect()
+}
+
+/// WEALD-L1114: a reservation committed from a second connection between two
+/// table dumps is either wholly in the capture or wholly absent. At read
+/// committed `relay_blob_reservation` was read before the reservation and
+/// `relay_quota` after it, so the capture held `reserved_bytes` with no row.
+#[tokio::test]
+async fn a_write_between_two_table_dumps_does_not_split_the_capture() {
+    let scratch = support::Scratch::new("backup_one_snapshot").await;
+    let db = Database::connect(&scratch.url).await.expect("connect");
+    db.migrate().await.expect("migrate");
+    let writer = Database::connect(&scratch.url)
+        .await
+        .expect("a second connection");
+    let workspace = "ws-snapshot";
+    sqlx::query("insert into relay_quota (workspace_id) values ($1)")
+        .bind(workspace)
+        .execute(db.pool())
+        .await
+        .expect("seed a quota row");
+
+    let entries = backup::dump_tables(&db, |table| {
+        let fire = table == "relay_blob_reservation";
+        let pool = writer.pool().clone();
+        async move {
+            if fire {
+                wealdrelay::media::store::reserve(
+                    &pool, workspace, &[3u8; 32], &[4u8; 32], 100, false, 3600,
+                )
+                .await
+                .expect("a reservation commits mid-capture");
+            }
+        }
+    })
+    .await
+    .expect("the capture");
+
+    let block = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.name == format!("database/{name}.copy"))
+            .map(|entry| entry.bytes.clone())
+            .expect("the table is in the capture")
+    };
+    let reservations: i64 = copy_rows(&block("relay_blob_reservation"))
+        .iter()
+        .filter(|row| row[1] == workspace)
+        .map(|row| row[4].parse::<i64>().expect("bytes"))
+        .sum();
+    let quota = copy_rows(&block("relay_quota"));
+    let row = quota
+        .iter()
+        .find(|row| row[0] == workspace)
+        .expect("the quota row is captured");
+    let reserved: i64 = row[2].parse().expect("reserved_bytes");
+    assert_eq!(reserved, reservations, "reserved_bytes matches its rows");
+    assert_eq!(reserved, 0, "the capture predates the mid-capture write");
+}

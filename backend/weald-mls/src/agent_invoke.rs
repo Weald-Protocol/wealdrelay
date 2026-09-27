@@ -76,9 +76,14 @@ pub mod key {
     pub const DEADLINE: u64 = 12;
     pub const SIG: u64 = 13;
     pub const REPO_REF: u64 = 14;
+    /// The four handoff slots (WEALD-L992). Present together or not at all.
+    pub const PARENT_INVOCATION_ID: u64 = 15;
+    pub const HOP: u64 = 16;
+    pub const DELEGATOR: u64 = 17;
+    pub const DELEGATOR_SIG: u64 = 18;
 
     /// The decoder's allow-list. Every key, and nothing else.
-    pub const SCHEMA: [u64; 14] = [
+    pub const SCHEMA: [u64; 18] = [
         V,
         INVOCATION_ID,
         IDEMPOTENCY_KEY,
@@ -93,7 +98,24 @@ pub mod key {
         DEADLINE,
         SIG,
         REPO_REF,
+        PARENT_INVOCATION_ID,
+        HOP,
+        DELEGATOR,
+        DELEGATOR_SIG,
     ];
+}
+
+/// An agent handing work to another agent: the parent invoke it delegates from,
+/// the hop count, and the accepting host's attestation of the agent's key.
+/// `specs/agents/networked/protocol.md`, "Agent handoff". Structure only here: the
+/// Mac host verifies it (`AgentHandoff.swift`); a gateway that does not honour
+/// handoffs refuses the invoke at membership, because the requester is an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    pub parent_invocation_id: Vec<u8>,
+    pub hop: u64,
+    pub delegator: Vec<u8>,
+    pub delegator_sig: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +134,7 @@ pub struct AgentInvoke {
     pub capability: Capability,
     pub deadline: u64,
     pub sig: Vec<u8>,
+    pub handoff: Option<Handoff>,
 }
 
 /// Why an invoke's bytes were refused. Two cases beyond the CBOR layer's, which
@@ -206,6 +229,15 @@ fn body_pairs(invoke: &AgentInvoke) -> Vec<(u64, Vec<u8>)> {
     pairs.push((key::REQUESTER, cbor::bytes(&invoke.requester)));
     pairs.push((key::CAPABILITY, cbor::text(invoke.capability.as_str())));
     pairs.push((key::DEADLINE, cbor::uint(invoke.deadline)));
+    if let Some(handoff) = &invoke.handoff {
+        pairs.push((
+            key::PARENT_INVOCATION_ID,
+            cbor::bytes(&handoff.parent_invocation_id),
+        ));
+        pairs.push((key::HOP, cbor::uint(handoff.hop)));
+        pairs.push((key::DELEGATOR, cbor::bytes(&handoff.delegator)));
+        pairs.push((key::DELEGATOR_SIG, cbor::bytes(&handoff.delegator_sig)));
+    }
     pairs
 }
 
@@ -235,6 +267,34 @@ pub fn decode(data: &[u8]) -> Result<AgentInvoke> {
         Some(_) => Some(cbor::in_slot(&slots, key::REPO_REF, |r| r.text())?),
         None => None,
     };
+    // All four handoff slots or none, the same rule and the same refusal as Swift.
+    let handoff_keys = [
+        key::PARENT_INVOCATION_ID,
+        key::HOP,
+        key::DELEGATOR,
+        key::DELEGATOR_SIG,
+    ];
+    let handoff = if handoff_keys
+        .iter()
+        .any(|k| cbor::optional_slot(&slots, *k).is_some())
+    {
+        if let Some(missing) = handoff_keys
+            .iter()
+            .find(|k| cbor::optional_slot(&slots, **k).is_none())
+        {
+            return Err(CborError::MissingKey(*missing).into());
+        }
+        Some(Handoff {
+            parent_invocation_id: cbor::in_slot(&slots, key::PARENT_INVOCATION_ID, |r| {
+                r.bytes_exact(INVOCATION_ID_WIDTH)
+            })?,
+            hop: cbor::in_slot(&slots, key::HOP, |r| r.uint())?,
+            delegator: cbor::in_slot(&slots, key::DELEGATOR, |r| r.bytes())?,
+            delegator_sig: cbor::in_slot(&slots, key::DELEGATOR_SIG, |r| r.bytes())?,
+        })
+    } else {
+        None
+    };
 
     Ok(AgentInvoke {
         v: cbor::in_slot(&slots, key::V, |r| r.uint())?,
@@ -261,6 +321,7 @@ pub fn decode(data: &[u8]) -> Result<AgentInvoke> {
         capability,
         deadline: cbor::in_slot(&slots, key::DEADLINE, |r| r.uint())?,
         sig: cbor::in_slot(&slots, key::SIG, |r| r.bytes())?,
+        handoff,
     })
 }
 
@@ -374,6 +435,7 @@ mod tests {
             thread_ref: None,
             ticket_ref: None,
             repo_ref: None,
+            handoff: None,
             requester: requester_key().verifying_key().to_bytes().to_vec(),
             capability: Capability::ChatReply,
             deadline: 1_760_000_300,
@@ -389,6 +451,17 @@ mod tests {
 
     fn invoke() -> AgentInvoke {
         signed(unsigned(), &requester_key())
+    }
+
+    fn invoke_with_handoff() -> AgentInvoke {
+        let mut original = unsigned();
+        original.handoff = Some(Handoff {
+            parent_invocation_id: vec![0x2b; INVOCATION_ID_WIDTH],
+            hop: 1,
+            delegator: vec![0xd1; 32],
+            delegator_sig: vec![0xd5; 64],
+        });
+        signed(original, &requester_key())
     }
 
     fn slots_of(data: &[u8]) -> Vec<(u64, Vec<u8>)> {
@@ -482,7 +555,8 @@ mod tests {
     #[test]
     fn agent_invoke_refuses_an_unknown_key() {
         let mut slots = slots_of(&encode(&invoke()));
-        slots.push((15, cbor::text("a system prompt")));
+        // One past the last schema key: 15..=18 are the handoff slots now.
+        slots.push((19, cbor::text("a system prompt")));
         assert_eq!(
             decode(&relay(slots)).unwrap_err().reason(),
             "codec.key.unknown"
@@ -534,7 +608,18 @@ mod tests {
     /// row, and the new field would then be the one read loosely.
     #[test]
     fn agent_invoke_refuses_a_wrong_major_type_in_every_slot() {
-        let numeric = [key::V, key::EXPECTED_PROFILE_VERSION, key::DEADLINE];
+        let numeric = [
+            key::V,
+            key::EXPECTED_PROFILE_VERSION,
+            key::DEADLINE,
+            key::HOP,
+        ];
+        let handoff_keys = [
+            key::PARENT_INVOCATION_ID,
+            key::HOP,
+            key::DELEGATOR,
+            key::DELEGATOR_SIG,
+        ];
         for target in key::SCHEMA {
             // Whichever type the slot does not hold: a byte string where a number
             // belongs, and a number everywhere else.
@@ -543,7 +628,15 @@ mod tests {
             } else {
                 cbor::uint(1)
             };
-            let mut slots = slots_of(&encode(&invoke()));
+            // The handoff slots are all-or-none, so a handoff slot is mistyped
+            // inside an otherwise whole handoff rather than on its own, which
+            // would be refused as a missing key before its type was read.
+            let base = if handoff_keys.contains(&target) {
+                invoke_with_handoff()
+            } else {
+                invoke()
+            };
+            let mut slots = slots_of(&encode(&base));
             match slots.iter_mut().find(|(k, _)| *k == target) {
                 Some(slot) => slot.1 = wrong,
                 // The two optional slots are absent from a minimal invoke, so they

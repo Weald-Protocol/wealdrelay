@@ -611,12 +611,14 @@ async fn a_full_queue_ends_a_subscriber_rather_than_downgrading_it_for_a_handsha
     // zero, which is the one recovery that exists. See WEALD-476.
     let hub = Hub::new();
     let (sender, mut receiver) = outbound_channel();
+    let watch = sender.clone();
     let id = hub.connect();
     hub.subscribe(&group(1), id, sender, wealdrelay::frame::PROTOCOL_VERSION)
         .await;
     for _ in 0..SEND_QUEUE_BOUND {
         hub.fanout(&group(1), &envelope(1), u64::MAX).await;
     }
+    assert!(!watch.is_evicted());
 
     let commit = Frame::Handshake {
         group: group(1),
@@ -637,6 +639,10 @@ async fn a_full_queue_ends_a_subscriber_rather_than_downgrading_it_for_a_handsha
     // downgrade is precisely what did not happen.
     assert_eq!(hub.subscribers(&group(1)).await, 0);
     assert_eq!(hub.downgrades(), 0);
+    // And ended on the socket, not only in the hub: the reader loop selects on
+    // this signal, and without it the connection stayed up, deaf and invisible
+    // to revocation (WEALD-L1111).
+    assert!(watch.is_evicted());
 
     // And everything the queue did accept is still on it. Ending the connection is
     // not a licence to discard what was already owed.
@@ -702,4 +708,79 @@ async fn a_hub_with_nothing_owed_settles_nothing() {
     // The one frame that was fanned out, and no downgrade behind it.
     assert_eq!(pushed(&mut receiver), envelope(1));
     assert!(receiver.try_recv().is_err());
+}
+
+fn handshake(seq: u64) -> Frame {
+    Frame::Handshake {
+        group: group(9),
+        seq,
+        message: vec![seq as u8; 4],
+    }
+}
+
+fn handshake_seqs(receiver: &mut wealdrelay::ws::OutboundReceiver) -> Vec<u64> {
+    let mut seqs = Vec::new();
+    while let Ok(Outbound::Frame(Frame::Handshake { seq, .. })) = receiver.try_recv() {
+        seqs.push(seq);
+    }
+    seqs
+}
+
+/// WEALD-L1112: a commit fanned out while a `SUB` replay is mid-drain reaches the
+/// replaying member only after the replay, once, and in seq order.
+#[tokio::test]
+async fn a_live_handshake_during_a_replay_waits_for_the_replay_and_is_not_repeated() {
+    let hub = Hub::new();
+    let (sender, mut receiver) = outbound_channel();
+    let replaying = hub.connect();
+    let publisher = hub.connect();
+    hub.subscribe_holding_handshakes(
+        &group(9),
+        replaying,
+        sender.clone(),
+        wealdrelay::frame::PROTOCOL_VERSION,
+    )
+    .await;
+
+    // Page one of the replay: seqs 0..=2.
+    for seq in 0..3 {
+        assert_eq!(
+            wealdrelay::ws::try_queue(&sender, handshake(seq)),
+            wealdrelay::ws::Queued::Sent
+        );
+    }
+    // A commit lands while page two is being read, and is fanned out live.
+    hub.fanout_frame(
+        &group(9),
+        &handshake(5),
+        publisher,
+        wealdrelay::hub::MIN_FANOUT_VERSION,
+    )
+    .await;
+    // Page two includes the new commit.
+    for seq in 3..6 {
+        assert_eq!(
+            wealdrelay::ws::try_queue(&sender, handshake(seq)),
+            wealdrelay::ws::Queued::Sent
+        );
+    }
+    // One more commit lands after the last page read, before the release.
+    hub.fanout_frame(
+        &group(9),
+        &handshake(6),
+        publisher,
+        wealdrelay::hub::MIN_FANOUT_VERSION,
+    )
+    .await;
+    hub.release_handshakes(&group(9), replaying, 6).await;
+    // And the hold is over: the next commit goes straight out.
+    hub.fanout_frame(
+        &group(9),
+        &handshake(7),
+        publisher,
+        wealdrelay::hub::MIN_FANOUT_VERSION,
+    )
+    .await;
+
+    assert_eq!(handshake_seqs(&mut receiver), vec![0, 1, 2, 3, 4, 5, 6, 7]);
 }

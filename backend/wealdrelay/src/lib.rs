@@ -25,6 +25,7 @@ pub mod db;
 pub mod deadline;
 pub mod envelope;
 pub mod frame;
+pub mod group_ingress;
 pub mod handshake;
 pub mod health;
 pub mod hub;

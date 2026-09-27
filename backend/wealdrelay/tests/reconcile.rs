@@ -812,9 +812,22 @@ async fn a_group_of_large_envelopes_converges_across_the_byte_budget() {
     // Thirty-two envelopes of 512 KiB is 16 MiB against a 7 MiB allowance, so the
     // response cannot be one round and the ranges holding the remainder have to come
     // back open.
+    //
+    // 16 MiB into one group from one device in one frozen minute is twice the
+    // per-group ingress budget (`wealdrelay::group_ingress`, WEALD-L1090), so the
+    // budget is widened here: this test is about the reconcile byte allowance, and
+    // `tests/group_ingress_socket.rs` is where the ingress budget is proven.
     let scratch = Scratch::new("recon-over-bytes").await;
     let blobs = tempfile::tempdir().unwrap();
-    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let relay = Running::start_with(
+        config_for(&scratch, blobs.path()),
+        Clock::Fixed(CLOCK),
+        |state| {
+            state.group_ingress =
+                wealdrelay::group_ingress::GroupIngressBudget::new(u64::MAX, u64::MAX);
+        },
+    )
+    .await;
     let group = make_group(&relay.state, 0x5c).await;
 
     let mut writer = Client::connect(relay.address).await;

@@ -217,3 +217,67 @@ async fn evicting_a_peer_that_stopped_reading_still_evicts_everybody_behind_it()
     assert_eq!(hub.connections_for(&entry).await, 0);
     drop(wedged_receiver);
 }
+
+/// WEALD-L1089. Eviction reaches a connection whose outbound queue is full.
+///
+/// `close` queues nothing on a full queue, and the connection holds its own
+/// sender, so before the signal existed the socket stayed up after `evict` and
+/// the device, once it resumed reading, could keep sending. Now the reader's
+/// wait resolves, and a `SEND` or `SUB` that reaches `perform` afterwards is
+/// refused `writer_not_in_access_set` before anything is read or stored, and
+/// the connection is told to end.
+#[tokio::test]
+async fn eviction_reaches_a_connection_whose_queue_is_full_and_refuses_its_writes() {
+    let hub = Hub::new();
+    let entry = vec![0x5c; 32];
+    let id = hub.connect();
+    let (sender, mut receiver) = outbound_channel();
+    for index in 0..SEND_QUEUE_BOUND {
+        assert_eq!(
+            try_queue(
+                &sender,
+                Frame::SubAck {
+                    group: [0x12; 32].to_vec(),
+                    head_seq: index as u64,
+                }
+            ),
+            Queued::Sent
+        );
+    }
+    // The hub holds a clone, as `identify` does in the socket path; the
+    // connection keeps `sender` itself.
+    hub.identify(&entry, id, sender.clone()).await;
+    assert!(!sender.is_evicted());
+    assert_eq!(hub.evict(&entry).await, 1);
+
+    // The close could not be queued, and the signal got through anyway.
+    assert!(sender.is_evicted());
+    tokio::time::timeout(std::time::Duration::from_secs(1), sender.evicted())
+        .await
+        .expect("the reader's wait resolves on eviction");
+
+    // The device drains its queue and sends: refused, and the connection ends.
+    while receiver.try_recv().is_ok() {}
+    let state = blind();
+    let mut session = Session::new(&state.config);
+    for work in [
+        Work::Accept {
+            envelope: vec![0u8; 8],
+        },
+        Work::Subscribe {
+            group: [0x12; 32].to_vec(),
+            from_seq: 0,
+        },
+    ] {
+        let alive = wealdrelay::ws::perform(&sender, &state, &mut session, id, work, 1).await;
+        assert!(!alive, "an evicted connection is ended");
+        match queued(&mut receiver) {
+            Frame::Error(error) => assert_eq!(error.code, ErrorCode::WriterNotInAccessSet),
+            other => panic!("expected writer_not_in_access_set, got {other:?}"),
+        }
+    }
+
+    // A connection that was never evicted is untouched by any of this.
+    let (other, _other_receiver) = outbound_channel();
+    assert!(!other.is_evicted());
+}

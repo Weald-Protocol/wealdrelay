@@ -609,7 +609,9 @@ access-set principal could otherwise inject invalid ciphertext into any known
 group id. `SEND` therefore also has an admission-blind abuse budget: 8 MiB per
 authenticated principal per target group per minute, 64 MiB per workspace per
 minute, and 32 MiB of not-yet-delivered envelope backlog per principal/group.
-These are independent of the normal per-principal write limit and are charged
+The two byte-rate limits are enforced (`backend/wealdrelay/src/group_ingress.rs`,
+WEALD-L1090); the backlog bound is not enforced in v1, because the relay keeps
+no per-recipient delivery record to measure it against. These are independent of the normal per-principal write limit and are charged
 before persistence; media uses `BLOB`, not this path. Exceeding one returns a
 stable retryable `group_ingress_limited` rejection and emits an operator metric
 with no content-derived labels. The limits are deliberately low enough that a

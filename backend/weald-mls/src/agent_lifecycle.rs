@@ -47,7 +47,7 @@ pub const DETAIL_BYTE_LIMIT: usize = 512;
 /// to *interpret* a reason, only to refuse one that is not in the set, and a
 /// twenty-six case enum whose only operation is set membership would be twenty-six
 /// places for the set to drift from the Swift copy.
-pub const LIFECYCLE_REASONS: [&str; 39] = [
+pub const LIFECYCLE_REASONS: [&str; 41] = [
     "version.unsupported",
     "profile.stale",
     "scope.notmember",
@@ -87,6 +87,8 @@ pub const LIFECYCLE_REASONS: [&str; 39] = [
     "github.ratelimited",
     "github.transport",
     "runner.unavailable",
+    "handoff.orphan",
+    "handoff.depth",
 ];
 
 pub mod key {
@@ -1038,7 +1040,7 @@ mod tests {
     /// which is the divergence the whole corpus exists to prevent.
     #[test]
     fn agent_lifecycle_reason_vocabulary_is_closed_and_complete() {
-        assert_eq!(LIFECYCLE_REASONS.len(), 39);
+        assert_eq!(LIFECYCLE_REASONS.len(), 41);
         assert!(LIFECYCLE_REASONS.contains(&"deadline.passed"));
         assert!(LIFECYCLE_REASONS.contains(&"provider.malformed"));
         assert!(LIFECYCLE_REASONS.contains(&"runner.unavailable"));

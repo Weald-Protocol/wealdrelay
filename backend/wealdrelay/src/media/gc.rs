@@ -177,12 +177,37 @@ pub async fn sweep_unclaimed_after(
         // deletion, and releasing the reservation while the object may still be
         // in the bucket would let a later, legitimate manifest claim collide
         // with a reservation that no longer exists.
+        //
+        // The row is re-checked and held across the delete: a manifest claim or
+        // a re-PUT that landed after the list was read must never lose its
+        // object (WEALD-L1088). A failed commit after the delete leaves the row
+        // unfinalized and stale, so the next pass finds the object absent and
+        // releases it then.
+        let Ok(mut tx) = pool.begin().await else {
+            continue;
+        };
+        match store::lock_unclaimed(&mut tx, workspace, reservation_id, grace_seconds).await {
+            Ok(true) => {}
+            _ => {
+                let _ = tx.rollback().await;
+                continue;
+            }
+        }
         if clear_object(storage, &key).await == Cleared::Kept {
+            let _ = tx.rollback().await;
             continue;
         }
-        if let Ok(Some(bytes)) = store::release(pool, workspace, reservation_id).await {
-            report.deleted += 1;
-            report.deleted_bytes += bytes;
+        let released = store::release_in(&mut tx, workspace, reservation_id).await;
+        match released {
+            Ok(Some(bytes)) => {
+                if tx.commit().await.is_ok() {
+                    report.deleted += 1;
+                    report.deleted_bytes += bytes;
+                }
+            }
+            _ => {
+                let _ = tx.rollback().await;
+            }
         }
     }
     let finished = now_ms;

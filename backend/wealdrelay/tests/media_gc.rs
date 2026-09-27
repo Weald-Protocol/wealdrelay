@@ -1487,3 +1487,81 @@ async fn a_listing_carries_the_age_a_name_cannot() {
 
     harness.finish().await;
 }
+
+/// WEALD-L1088. A manifest claim that lands after the stale list was read must
+/// not lose its object. The claim is held open in its own transaction while
+/// the sweep runs, which is the interleaving the per-row loop used to lose: the
+/// row read stale, the object was deleted, and the claim then committed a
+/// finalized row for an object that no longer existed.
+#[tokio::test]
+async fn an_unclaimed_sweep_never_deletes_an_object_a_concurrent_claim_holds() {
+    let harness = Harness::new("gc_unclaimed_claim_race").await;
+    let pool = harness.pool();
+    let workspace = "ws-gc-race";
+    let group = make_group_in(
+        &harness.state,
+        workspace,
+        0x4c,
+        &[device_from(0x71)],
+        &[device_from(0x71)],
+    )
+    .await;
+    store::ensure_quota_row(pool, workspace, None)
+        .await
+        .unwrap();
+    let hash = blob_hash(0xc1);
+    let reservation = live_blob(&harness, workspace, &group, &hash, b"claimed late").await;
+    sqlx::query(
+        "update relay_blob_reservation set created_at = now() - interval '25 hours' \
+         where reservation_id = $1",
+    )
+    .bind(reservation)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store::stale_unclaimed(pool, 24 * 3600).await.unwrap().len(),
+        1
+    );
+
+    // The claim, in flight: it holds the row and has not committed.
+    let mut claim = pool.begin().await.unwrap();
+    sqlx::query("update relay_blob_reservation set finalized_at = now() where reservation_id = $1")
+        .bind(reservation)
+        .execute(&mut *claim)
+        .await
+        .unwrap();
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        gc::sweep_unclaimed(pool, harness.storage(), workspace, NOW),
+    )
+    .await
+    .expect("the sweep skips a held row rather than waiting on it");
+    assert_eq!(report.deleted, 0);
+    claim.commit().await.unwrap();
+
+    assert!(
+        harness
+            .storage()
+            .head(&key(workspace, &group, &hash))
+            .await
+            .unwrap()
+            .is_some(),
+        "the claimed object is still in the bucket"
+    );
+    let reserved_before = store::usage(pool, workspace).await.unwrap().reserved_bytes;
+    assert_eq!(reserved_before, 12, "the sweep released nothing");
+
+    // A later pass leaves the finalized row alone as well.
+    let report = gc::sweep_unclaimed(pool, harness.storage(), workspace, NOW).await;
+    assert_eq!(report.examined, 0);
+    assert!(harness
+        .storage()
+        .head(&key(workspace, &group, &hash))
+        .await
+        .unwrap()
+        .is_some());
+
+    harness.finish().await;
+}

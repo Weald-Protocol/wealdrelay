@@ -665,3 +665,88 @@ async fn the_access_state_query_grows_no_field_that_could_hold_a_handle() {
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// WEALD-L1087. A ringer that sends a `202` head with `Content-Length: 10` and
+/// then never sends the body. The deadline covers the whole exchange, so
+/// `deliver` returns inside it with `Unreachable` recorded, and the next wake to
+/// a healthy ringer is delivered. Before the fix the body drain never returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ringer_that_stalls_its_body_is_unreachable_inside_the_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a stalling ringer");
+    let address = listener.local_addr().expect("an address");
+    let stall = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 10\r\n\r\n")
+                .await;
+            let _ = stream.flush().await;
+            // Held open: a FIN would end the body and prove nothing.
+            held.push(stream);
+        }
+    });
+    let stalled_url = format!("http://127.0.0.1:{}/v1/wake", address.port());
+
+    let scratch = Scratch::new("push_adversarial_stalled_body").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let healthy = RecordingRinger::accepting().await;
+    let relay = Running::start(
+        config_for_push(&scratch, blobs.path(), &healthy.url(), 0),
+        Clock::Fixed(CLOCK),
+    )
+    .await;
+    let ringer = ringer::Ringer::new();
+
+    let failed_before = relay.state.push.failed();
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_millis(wealdrelay::push::WAKE_DEADLINE_MS + 3000),
+        worker::deliver(
+            &relay.state,
+            &ringer,
+            &stalled_url,
+            None,
+            &wake_handle(0xF1),
+            Category::Message,
+        ),
+    )
+    .await
+    .expect("deliver returns inside the wake deadline");
+    assert!(
+        started.elapsed() < Duration::from_millis(wealdrelay::push::WAKE_DEADLINE_MS + 1000),
+        "the stall cost {:?}",
+        started.elapsed()
+    );
+    assert_eq!(relay.state.push.failed(), failed_before + 1);
+    assert_eq!(
+        relay.state.push.health(),
+        wealdrelay::push::Health::Unreachable,
+        "a stalled ringer reads unreachable"
+    );
+
+    // The worker is free, so the next wake reaches a healthy ringer.
+    let sent_before = relay.state.push.sent();
+    worker::deliver(
+        &relay.state,
+        &ringer,
+        &healthy.url(),
+        None,
+        &wake_handle(0xF2),
+        Category::Message,
+    )
+    .await;
+    assert_eq!(healthy.wait_for(1).await.len(), 1);
+    assert_eq!(relay.state.push.sent(), sent_before + 1);
+
+    stall.abort();
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

@@ -115,6 +115,16 @@ pub const SEND_QUEUE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 pub struct OutboundSender {
     inner: mpsc::Sender<Outbound>,
     budget: Arc<tokio::sync::Semaphore>,
+    /// Shared by every clone, so revocation reaches the connection's own reader
+    /// whatever the state of its queue. See [`OutboundSender::evict`].
+    eviction: Arc<Eviction>,
+}
+
+/// The revocation signal one connection's reader waits on.
+#[derive(Debug, Default)]
+struct Eviction {
+    evicted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 /// The receiving half, which returns a frame's bytes to the budget as it takes it.
@@ -170,6 +180,36 @@ impl OutboundSender {
     /// socket. False means "not queued", and no caller treats that as failure.
     pub fn close(&self) -> bool {
         self.inner.try_send(Outbound::Close).is_ok()
+    }
+
+    /// Mark this connection's principal as revoked and wake its reader.
+    ///
+    /// `close` cannot be relied on for revocation: on a queue holding 256
+    /// frames it queues nothing, and the connection's own sender keeps the
+    /// channel open, so an evicted device that resumed reading could keep
+    /// sending (WEALD-L1089). The reader loop selects on this signal and ends,
+    /// and `perform` refuses any `SEND` or `SUB` that reaches it afterwards.
+    pub fn evict(&self) {
+        self.eviction
+            .evicted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `notify_one` stores a permit when the reader is not waiting yet, so a
+        // signal fired mid-message is still seen at the next wait.
+        self.eviction.notify.notify_one();
+    }
+
+    /// True once [`OutboundSender::evict`] has run on any clone.
+    pub fn is_evicted(&self) -> bool {
+        self.eviction
+            .evicted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once this connection has been evicted.
+    pub async fn evicted(&self) {
+        while !self.is_evicted() {
+            self.eviction.notify.notified().await;
+        }
     }
 
     /// Queue a liveness ping, without waiting.
@@ -266,6 +306,7 @@ pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
         OutboundSender {
             inner: inner_sender,
             budget: Arc::clone(&budget),
+            eviction: Arc::new(Eviction::default()),
         },
         OutboundReceiver {
             inner: inner_receiver,
@@ -421,7 +462,13 @@ async fn serve_connection_inner(
             crate::deadline::Next::Wait(remaining) => remaining,
         };
 
-        let message = match tokio::time::timeout(wait, stream.next()).await {
+        // Revocation ends the connection whatever its queue holds (WEALD-L1089).
+        let next = tokio::select! {
+            biased;
+            () = sender.evicted() => break,
+            next = tokio::time::timeout(wait, stream.next()) => next,
+        };
+        let message = match next {
             // The wait ran out. Nothing is decided here: the loop goes back to
             // `next`, which is the one place a deadline is evaluated, so a probe
             // and an expiry cannot come to disagree about the same instant.
@@ -442,6 +489,9 @@ async fn serve_connection_inner(
         // opened the socket. In particular, a long-lived client must not make a
         // newly accepted envelope look as old as its connection.
         let now_ms = state.now_ms();
+        if sender.is_evicted() {
+            break;
+        }
         if !handle_message(&sender, &state, &mut session, connection, message, now_ms).await {
             break;
         }
@@ -1634,6 +1684,18 @@ pub async fn perform(
     work: Work,
     now_ms: u64,
 ) -> bool {
+    // A principal evicted while this message was in flight writes nothing and
+    // subscribes to nothing: refused before persistence, and the connection ends
+    // (WEALD-L1089, `wire.md` SEND failure on a revoked device).
+    if sender.is_evicted() && matches!(work, Work::Accept { .. } | Work::Subscribe { .. }) {
+        let _ = queue_all(
+            sender,
+            vec![Frame::Error(FrameError::new(
+                ErrorCode::WriterNotInAccessSet,
+            ))],
+        );
+        return false;
+    }
     match work {
         Work::Authenticate {
             device_key,
@@ -1742,6 +1804,28 @@ pub async fn perform(
                 Ok(pool) => pool,
                 Err(code) => return queue_all(sender, vec![Frame::Error(FrameError::new(code))]),
             };
+            // The admission-blind abuse budget `wire.md` requires, after the group is
+            // known to be this workspace's and before anything is stored: a principal
+            // that knows a group id but is not a member cannot make it expensive
+            // (WEALD-L1090). Awaiting for the reason the device budget above awaits.
+            let workspace = session.authorized_workspace().unwrap_or("").to_string();
+            if let Err(refusal) = state
+                .group_ingress
+                .charge(
+                    &device,
+                    &decoded.group,
+                    &workspace,
+                    envelope.len() as u64,
+                    now_ms,
+                )
+                .await
+            {
+                return queue_all_awaiting(
+                    sender,
+                    vec![Frame::Error(refusal.to_frame_error(&state.group_ingress))],
+                )
+                .await;
+            }
             match accept::accept(pool, &state.config, &decoded, now_ms).await {
                 Ok(outcome) => {
                     // The live path. Only a fresh store is fanned out: a duplicate

@@ -284,6 +284,100 @@ pub async fn reconcile(
     queue_all(sender, frames)
 }
 
+/// The `SUB` handshake replay, from seq 0, a page at a time. `Ok` carries the
+/// seq one past the last message queued; `Err` carries that cursor and what
+/// `subscribe` returns.
+async fn replay_handshakes(
+    sender: &crate::ws::OutboundSender,
+    database: &crate::db::Database,
+    group: &[u8],
+) -> Result<u64, (u64, bool)> {
+    // Handshake messages first, in their own order, and all of them from zero.
+    //
+    // Not "since the client's cursor", because that cursor is the envelope log's
+    // and the two sequences are unrelated. And not partially, because MLS state is
+    // built by applying every message in order from the group's creation: a member
+    // that joined at epoch 9 still has to process the commits that produced epochs
+    // 1 through 9 to hold a tree it can decrypt against. A client that already has
+    // them discards the ones it recognises, which costs a comparison; a client that
+    // is missing one cannot decrypt anything published after it, which costs the
+    // group.
+    //
+    // Before the envelopes on purpose. An envelope encrypted under epoch N is
+    // unreadable until the commit that produced epoch N has been applied, so a
+    // backfill in the other order hands a client ciphertext it must buffer and then
+    // reprocess.
+    // `queue_all_awaiting` rather than `queue_all`, and the difference is a group's
+    // joinability. This run's length is the group's epoch count, not anything the
+    // client chose, so a group that has committed more times than `SEND_QUEUE_BOUND`
+    // would refuse every subscription from every member, permanently, and reconnecting
+    // would meet the same wall. Truncating instead is not available: there is no
+    // reconciliation for MLS state and a member missing one commit cannot decrypt
+    // anything published after it. So the replay waits for the writer to make room and
+    // the queue bound still holds across it.
+    //
+    // Read a page at a time, not the whole log. Every message still goes out, in the
+    // same order, so this changes nothing a client sees; what it changes is peak
+    // memory, because a page drains to the socket before the next one is read.
+    // Reading it whole put the group's entire commit history in the heap twice, once
+    // as rows and once as frames, at up to `MAX_FRAME_BYTES` each, for as long as
+    // the slowest member's socket took to drain it.
+    let mut cursor = 0u64;
+    loop {
+        let messages = match crate::handshake::store::page(
+            database.pool(),
+            group,
+            cursor,
+            Some(HANDSHAKE_REPLAY_PAGE),
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(_) => {
+                return Err((
+                    cursor,
+                    queue_all(
+                        sender,
+                        vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
+                    ),
+                ))
+            }
+        };
+        if messages.is_empty() {
+            break;
+        }
+        let short = messages.len() < HANDSHAKE_REPLAY_PAGE as usize;
+        // Past the last row of this page, so the next read cannot repeat it. Taken
+        // before the frames are consumed because the sequence is the cursor.
+        cursor = messages
+            .last()
+            .map(|stored| stored.seq.saturating_add(1))
+            .unwrap_or(cursor);
+        if !crate::ws::queue_all_awaiting(
+            sender,
+            messages
+                .into_iter()
+                .map(|stored| Frame::Handshake {
+                    group: group.to_vec(),
+                    seq: stored.seq,
+                    message: stored.message,
+                })
+                .collect(),
+        )
+        .await
+        {
+            return Err((cursor, false));
+        }
+        // A short page is the end of the log. Stopping here rather than on the next
+        // empty read saves one query per subscription, which is the common case: most
+        // groups have fewer commits than one page holds.
+        if short {
+            break;
+        }
+    }
+    Ok(cursor)
+}
+
 /// Register a subscription, acknowledge it, and backfill from the cursor.
 pub async fn subscribe(
     sender: &crate::ws::OutboundSender,
@@ -326,97 +420,36 @@ pub async fn subscribe(
     // both fanned out and returned by the query, and a client deduplicates it
     // without coordination because the hash is a content address
     // (`specs/backend/relay/migration.md`, dual transport).
+    //
+    // Handshakes are the exception to that dedup argument: they are ordered, not
+    // content-addressed, so a live commit fanned out mid-replay would reach the
+    // member ahead of the seqs the replay has yet to send. The hub holds this
+    // connection's live handshakes until the replay ends and then releases only
+    // the seqs the replay did not cover (WEALD-L1112).
     state
         .hub
-        .subscribe(&group, connection, sender.clone(), protocol_version)
+        .subscribe_holding_handshakes(&group, connection, sender.clone(), protocol_version)
         .await;
 
     let Some(database) = &state.database else {
         // No database is not a reason to refuse the subscription: the client is
         // registered, the acknowledgement went out, and the honest backfill from a
         // relay that cannot read its log is none. `/readyz` reports the outage.
+        state.hub.release_handshakes(&group, connection, 0).await;
         return true;
     };
 
-    // Handshake messages first, in their own order, and all of them from zero.
-    //
-    // Not "since the client's cursor", because that cursor is the envelope log's
-    // and the two sequences are unrelated. And not partially, because MLS state is
-    // built by applying every message in order from the group's creation: a member
-    // that joined at epoch 9 still has to process the commits that produced epochs
-    // 1 through 9 to hold a tree it can decrypt against. A client that already has
-    // them discards the ones it recognises, which costs a comparison; a client that
-    // is missing one cannot decrypt anything published after it, which costs the
-    // group.
-    //
-    // Before the envelopes on purpose. An envelope encrypted under epoch N is
-    // unreadable until the commit that produced epoch N has been applied, so a
-    // backfill in the other order hands a client ciphertext it must buffer and then
-    // reprocess.
-    // `queue_all_awaiting` rather than `queue_all`, and the difference is a group's
-    // joinability. This run's length is the group's epoch count, not anything the
-    // client chose, so a group that has committed more times than `SEND_QUEUE_BOUND`
-    // would refuse every subscription from every member, permanently, and reconnecting
-    // would meet the same wall. Truncating instead is not available: there is no
-    // reconciliation for MLS state and a member missing one commit cannot decrypt
-    // anything published after it. So the replay waits for the writer to make room and
-    // the queue bound still holds across it.
-    //
-    // Read a page at a time, not the whole log. Every message still goes out, in the
-    // same order, so this changes nothing a client sees; what it changes is peak
-    // memory, because a page drains to the socket before the next one is read.
-    // Reading it whole put the group's entire commit history in the heap twice, once
-    // as rows and once as frames, at up to `MAX_FRAME_BYTES` each, for as long as
-    // the slowest member's socket took to drain it.
-    let mut cursor = 0u64;
-    loop {
-        let messages = match crate::handshake::store::page(
-            database.pool(),
-            &group,
-            cursor,
-            Some(HANDSHAKE_REPLAY_PAGE),
-        )
-        .await
-        {
-            Ok(messages) => messages,
-            Err(_) => {
-                return queue_all(
-                    sender,
-                    vec![Frame::Error(FrameError::new(ErrorCode::Backpressure))],
-                )
-            }
-        };
-        if messages.is_empty() {
-            break;
-        }
-        let short = messages.len() < HANDSHAKE_REPLAY_PAGE as usize;
-        // Past the last row of this page, so the next read cannot repeat it. Taken
-        // before the frames are consumed because the sequence is the cursor.
-        cursor = messages
-            .last()
-            .map(|stored| stored.seq.saturating_add(1))
-            .unwrap_or(cursor);
-        if !crate::ws::queue_all_awaiting(
-            sender,
-            messages
-                .into_iter()
-                .map(|stored| Frame::Handshake {
-                    group: group.clone(),
-                    seq: stored.seq,
-                    message: stored.message,
-                })
-                .collect(),
-        )
-        .await
-        {
-            return false;
-        }
-        // A short page is the end of the log. Stopping here rather than on the next
-        // empty read saves one query per subscription, which is the common case: most
-        // groups have fewer commits than one page holds.
-        if short {
-            break;
-        }
+    let replay = replay_handshakes(sender, database, &group).await;
+    let replayed_to = match &replay {
+        Ok(cursor) => *cursor,
+        Err((cursor, _)) => *cursor,
+    };
+    state
+        .hub
+        .release_handshakes(&group, connection, replayed_to)
+        .await;
+    if let Err((_, outcome)) = replay {
+        return outcome;
     }
 
     // Bounded by the frame count and then by the byte allowance, for the reason

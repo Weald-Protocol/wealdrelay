@@ -158,6 +158,52 @@ async fn a_capture_restored_returns_what_it_held_and_not_what_came_after() {
 }
 
 #[tokio::test]
+async fn a_restore_moves_every_owned_sequence_past_the_ids_it_reloaded() {
+    // WEALD-L1113. `truncate ... restart identity` put each sequence back to 1 and
+    // `COPY` reloaded the original ids, so the next DROP run collided with row 1.
+    let scratch = support::Scratch::new("restore_sequences").await;
+    let blobs = tempfile::tempdir().expect("a blob root");
+    let out = tempfile::tempdir().expect("an output directory");
+    let config = support::config_for(&scratch, blobs.path());
+    let db = Database::connect(&scratch.url).await.expect("connect");
+    db.migrate().await.expect("migrate");
+
+    let insert = "insert into relay_drop_run \
+        (group_id, manifest_hash, barrier_seq, deleted_count, deleted_bytes, kept_count) \
+        values ($1, $2, 1, 0, 0, 0) returning id";
+    for _ in 0..3 {
+        sqlx::query(insert)
+            .bind([7u8; 32].as_slice())
+            .bind([8u8; 32].as_slice())
+            .execute(db.pool())
+            .await
+            .expect("seed a drop run");
+    }
+
+    let capture = out.path().join("capture.tar");
+    backup::run(
+        &config,
+        &backup::Request {
+            out: Destination::Local(capture.clone()),
+            database_only: true,
+        },
+    )
+    .await
+    .expect("the capture runs");
+    restore::run(&config, &from(&capture))
+        .await
+        .expect("the restore runs");
+
+    let (id,): (i64,) = sqlx::query_as(insert)
+        .bind([7u8; 32].as_slice())
+        .bind([8u8; 32].as_slice())
+        .fetch_one(db.pool())
+        .await
+        .expect("an insert after a restore does not collide with a restored id");
+    assert_eq!(id, 4);
+}
+
+#[tokio::test]
 async fn a_receipt_is_written_only_after_the_load_succeeds() {
     let scratch = support::Scratch::new("restore_receipt").await;
     let blobs = tempfile::tempdir().expect("a blob root");

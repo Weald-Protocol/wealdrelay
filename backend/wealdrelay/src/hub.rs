@@ -125,7 +125,20 @@ struct Subscriber {
     /// envelope this subscriber can accept, so the client learns before it is given
     /// anything it might otherwise mistake for a complete live stream.
     downgrade_owed: bool,
+    /// Live handshake frames held back while this subscriber's `SUB` replay is
+    /// still running, in the order they were appended. `None` once released.
+    ///
+    /// A commit fanned out mid-replay would otherwise reach the member ahead of
+    /// the lower seqs the replay has not delivered yet, and again inside a later
+    /// page (WEALD-L1112). `wire.md` promises every handshake in order, once.
+    held_handshakes: Option<Vec<Frame>>,
 }
+
+/// How many live handshake frames one replaying subscriber may have held back.
+/// A group committing faster than this while one member replays is ended for
+/// that member, the same answer a full queue gets: the client reconnects and
+/// replays from zero.
+pub const MAX_HELD_HANDSHAKES: usize = 256;
 
 impl Hub {
     pub fn new() -> Self {
@@ -157,7 +170,72 @@ impl Hub {
             sender,
             protocol_version,
             downgrade_owed: false,
+            held_handshakes: None,
         });
+    }
+
+    /// `subscribe`, with live handshake frames for this connection held back
+    /// until [`Hub::release_handshakes`] runs. Used by the `SUB` path, whose
+    /// handshake replay must reach the member before any live commit does.
+    pub async fn subscribe_holding_handshakes(
+        &self,
+        group: &[u8],
+        id: ConnectionId,
+        sender: OutboundSender,
+        protocol_version: u16,
+    ) {
+        let mut groups = self.lock().await;
+        let subscribers = groups.entry(group.to_vec()).or_default();
+        if subscribers.iter().any(|subscriber| subscriber.id == id) {
+            return;
+        }
+        subscribers.push(Subscriber {
+            id,
+            sender,
+            protocol_version,
+            downgrade_owed: false,
+            held_handshakes: Some(Vec::new()),
+        });
+    }
+
+    /// End the hold on one subscriber's live handshakes and queue what was held,
+    /// skipping every seq below `replayed_to`, which the replay already sent.
+    ///
+    /// Under the same lock `fanout_frame` takes, so no live frame can slip between
+    /// the release and the end of the hold. A held frame that finds no room ends
+    /// the connection, as a live handshake would.
+    pub async fn release_handshakes(&self, group: &[u8], id: ConnectionId, replayed_to: u64) {
+        let mut evicted = false;
+        {
+            let mut groups = self.lock().await;
+            let Some(subscriber) = groups
+                .get_mut(group)
+                .and_then(|subscribers| subscribers.iter_mut().find(|s| s.id == id))
+            else {
+                return;
+            };
+            let Some(held) = subscriber.held_handshakes.take() else {
+                return;
+            };
+            let mut next = replayed_to;
+            for frame in held {
+                let Frame::Handshake { seq, .. } = &frame else {
+                    continue;
+                };
+                if *seq < next {
+                    continue;
+                }
+                next = seq.saturating_add(1);
+                if !matches!(try_queue(&subscriber.sender, frame), Queued::Sent) {
+                    subscriber.sender.evict();
+                    evicted = true;
+                    break;
+                }
+            }
+        }
+        if evicted {
+            self.disconnect(id).await;
+        }
     }
 
     /// Whether one connection already holds a live entry for a group.
@@ -203,6 +281,10 @@ impl Hub {
             // Best effort, deliberately. A sender whose receiver has gone is a
             // connection that is already closed, and treating that as a failure
             // would make revocation look unreliable when it had already succeeded.
+            // The signal first: `close` queues nothing on a full queue, and the
+            // connection holds its own sender, so without it the socket stayed up
+            // and kept writing (WEALD-L1089).
+            sender.evict();
             let _ = sender.close();
             self.disconnect(id).await;
         }
@@ -376,6 +458,19 @@ impl Hub {
                     outcomes.push((subscriber.id, Delivery::NotSpoken));
                     continue;
                 }
+                if undowngradable {
+                    if let Some(held) = subscriber.held_handshakes.as_mut() {
+                        if held.len() < MAX_HELD_HANDSHAKES {
+                            held.push(frame.clone());
+                            outcomes.push((subscriber.id, Delivery::Sent));
+                        } else {
+                            subscriber.sender.evict();
+                            gone.push(subscriber.id);
+                            outcomes.push((subscriber.id, Delivery::Gone));
+                        }
+                        continue;
+                    }
+                }
                 // A downgrade owed from an earlier round goes out before anything
                 // else this subscriber might read as a complete live stream, and that
                 // includes an ephemeral frame. It used to be attempted only ahead of
@@ -395,7 +490,12 @@ impl Hub {
                             // Owed a downgrade it cannot be sent, and now a handshake
                             // it cannot be sent either. Waiting would leave it live and
                             // missing a commit, which is the state `undowngradable`
-                            // exists to refuse, so end it here too.
+                            // exists to refuse, so end it here too. Evicted, not only
+                            // removed: `disconnect` touches the hub and not the socket,
+                            // so without the signal the reader stayed up, deaf to every
+                            // group and absent from `principals`, where revocation
+                            // could no longer find it (WEALD-L1111).
+                            subscriber.sender.evict();
                             gone.push(subscriber.id);
                             outcomes.push((subscriber.id, Delivery::Gone));
                             continue;
@@ -433,6 +533,9 @@ impl Hub {
                     Queued::Sent => Delivery::Sent,
                     Queued::Full if undowngradable => {
                         // See `undowngradable` above: ended, not told to reconcile.
+                        // Ended means the socket too, so the reader loop breaks and
+                        // the client reconnects for the replay (WEALD-L1111).
+                        subscriber.sender.evict();
                         gone.push(subscriber.id);
                         Delivery::Gone
                     }

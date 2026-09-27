@@ -551,6 +551,34 @@ async fn load_tables(db: &crate::db::Database, plan: &LoadPlan) -> Result<(), Re
         sink.send(payload).await.map_err(fail)?;
         sink.finish().await.map_err(fail)?;
     }
+    // `restart identity` set every owned sequence back to 1, and `COPY` loaded the
+    // original ids verbatim, so the next insert into any `bigserial` table (a DROP
+    // run, a key package, a retention conflict) collided with a restored row and
+    // rolled its whole transaction back (WEALD-L1113). Each owned sequence is moved
+    // past the largest id it now has to not collide with, in this transaction.
+    for (table, _) in &plan.tables {
+        let qualified = format!("public.\"{table}\"");
+        let owned: Vec<(String, String)> = sqlx::query_as(
+            "select a.attname::text, pg_get_serial_sequence($1, a.attname::text) \
+             from pg_attribute a \
+             where a.attrelid = $1::regclass and a.attnum > 0 and not a.attisdropped \
+             and pg_get_serial_sequence($1, a.attname::text) is not null",
+        )
+        .bind(&qualified)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(fail)?;
+        for (column, sequence) in owned {
+            let column = column.replace('"', "\"\"");
+            sqlx::query(&format!(
+                "select setval($1, coalesce((select max(\"{column}\") from {qualified}), 0) + 1, false)"
+            ))
+            .bind(&sequence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(fail)?;
+        }
+    }
     transaction.commit().await.map_err(fail)?;
     Ok(())
 }

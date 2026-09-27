@@ -3075,3 +3075,116 @@ async fn a_joiners_manifest_claim_is_accepted_on_the_founders_terms() {
     );
     harness.finish().await;
 }
+
+/// WEALD-L1086. A session whose opening window has passed while it is still
+/// issuing parts is not stale: issuing a part URL moves its expiry forward, so
+/// the janitor keeps the parts already uploaded and `COMPLETE` still succeeds.
+#[tokio::test]
+async fn a_multipart_session_still_issuing_parts_survives_a_janitor_pass() {
+    let harness = Harness::new("frames_multipart_refresh").await;
+    let group = harness.group(0x5b, &[device_from(0x71)]).await;
+    let session = harness.session();
+    let hash = blob_hash(0xd7);
+    let total = media::SINGLE_PART_MAX_BYTES + 16;
+    let session_id = match response(&harness.ask(&session, &put(&group, &hash, total)).await) {
+        Response::Multipart { session_id, .. } => session_id,
+        other => panic!("expected a multipart session, got {other:?}"),
+    };
+    let uuid = uuid::Uuid::from_slice(&session_id).unwrap();
+    let part_key = |number: u32| {
+        BlobKey::new(
+            "_multipart",
+            uuid.simple().to_string(),
+            format!("part-{number}"),
+        )
+        .unwrap()
+    };
+    let issue = |number: u32, len: u64| Request::MultipartPart {
+        session_id: session_id.clone(),
+        part_number: number,
+        expected_len: len,
+    };
+
+    // Part one issued and uploaded inside the opening window.
+    assert!(matches!(
+        response(
+            &harness
+                .ask(&session, &issue(1, media::MULTIPART_PART_SIZE))
+                .await
+        ),
+        Response::MultipartPartUpload { .. }
+    ));
+    harness
+        .storage()
+        .put(
+            &part_key(1),
+            &vec![0u8; media::MULTIPART_PART_SIZE as usize],
+        )
+        .await
+        .unwrap();
+
+    // Twenty minutes pass: the opening window is gone.
+    inject(
+        harness.pool(),
+        "update relay_blob_multipart set expires_at = now() - interval '5 minutes'",
+    )
+    .await;
+    assert_eq!(
+        store::stale_multipart_sessions(harness.pool())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The client is still uploading, so it asks for part two. That refreshes.
+    assert!(matches!(
+        response(&harness.ask(&session, &issue(2, 16)).await),
+        Response::MultipartPartUpload { .. }
+    ));
+    assert!(
+        store::stale_multipart_sessions(harness.pool())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a session that just issued a part is not stale"
+    );
+
+    let summary = wealdrelay::janitor::pass(&harness.state).await;
+    assert_eq!(summary.multipart_aborted, 0);
+    assert!(
+        harness.storage().get(&part_key(1)).await.is_ok(),
+        "the part uploaded before the sweep is still in the bucket"
+    );
+
+    harness
+        .storage()
+        .put(&part_key(2), &[1u8; 16])
+        .await
+        .unwrap();
+    let complete = Request::MultipartComplete {
+        session_id: session_id.clone(),
+        parts: vec![(1, b"etag-one".to_vec()), (2, b"etag-two".to_vec())],
+    };
+    assert_eq!(
+        response(&harness.ask(&session, &complete).await),
+        Response::MultipartCompleted
+    );
+
+    // A session that stops issuing parts is still swept once its window passes.
+    let idle_hash = blob_hash(0xd8);
+    match response(&harness.ask(&session, &put(&group, &idle_hash, total)).await) {
+        Response::Multipart { .. } => {}
+        other => panic!("expected a multipart session, got {other:?}"),
+    }
+    inject(
+        harness.pool(),
+        "update relay_blob_multipart set expires_at = now() - interval '5 minutes' \
+         where completed_at is null",
+    )
+    .await;
+    let summary = wealdrelay::janitor::pass(&harness.state).await;
+    assert_eq!(summary.multipart_aborted, 1);
+
+    harness.finish().await;
+}

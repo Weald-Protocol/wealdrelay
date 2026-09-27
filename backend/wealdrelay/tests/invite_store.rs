@@ -1652,3 +1652,79 @@ async fn a_correct_code_gives_its_guess_slot_back() {
     assert_eq!(volume.tuples, 0);
     scratch.drop_database().await;
 }
+
+/// WEALD-L1115: the janitor releases an expiring reservation between the commit
+/// judgement and `consume`. The seat went back and was also spent, and the grant
+/// was promoted; now the release wins and nothing is spent or promoted.
+#[tokio::test]
+async fn a_reservation_released_before_consume_spends_nothing() {
+    let (scratch, _blobs, state) = prepared("consume_after_release").await;
+    let pool = pool_of(&state);
+    let code = Code::from_bits(21);
+    let record = ordinary(0x31, code);
+    store::create(pool, WORKSPACE, &record, NOW).await.unwrap();
+    let before = store::fetch(pool, &record.token)
+        .await
+        .unwrap()
+        .unwrap()
+        .remaining;
+    let device = vec![0xe1; 32];
+    reserve::reserve(
+        pool,
+        &record.token,
+        &code.grouped(),
+        &nonce(1),
+        &device,
+        &[0xe2; 32],
+        NOW,
+    )
+    .await
+    .unwrap();
+    let grant_ms = |pool: PgPool, device: Vec<u8>| async move {
+        sqlx::query_scalar::<_, i64>(
+            "select (extract(epoch from expires_at) * 1000)::bigint \
+             from relay_provisional_grant where workspace_id = $1 and device_hash = $2",
+        )
+        .bind(WORKSPACE)
+        .bind(device)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+    };
+    let provisional = grant_ms(pool.clone(), device.clone()).await;
+
+    let later = NOW + (reserve::RESERVATION_SECONDS + 1) * 1000;
+    assert_eq!(reserve::release_expired(pool, later).await.unwrap(), 1);
+    let spent = reserve::consume(
+        pool,
+        &record.token,
+        &nonce(1),
+        &device,
+        WORKSPACE.to_string(),
+        NOW + 86_400_000,
+    )
+    .await
+    .unwrap();
+
+    assert!(!spent, "a released reservation was spent");
+    assert_eq!(
+        store::fetch(pool, &record.token)
+            .await
+            .unwrap()
+            .unwrap()
+            .remaining,
+        before
+    );
+    let consumed: bool = sqlx::query_scalar(
+        "select consumed_at is not null from relay_invite_reservation \
+         where token = $1 and join_nonce = $2",
+    )
+    .bind(&record.token)
+    .bind(nonce(1))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!consumed);
+    assert_eq!(grant_ms(pool.clone(), device.clone()).await, provisional);
+    scratch.drop_database().await;
+}

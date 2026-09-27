@@ -703,6 +703,15 @@ async fn handle_multipart_part(
         tracing::warn!(error = %error, "media: could not record a multipart part");
         return Frame::Error(FrameError::new(ErrorCode::Backpressure));
     }
+    // Issuing a URL keeps the session alive for that URL's whole lifetime, so
+    // the janitor never sweeps parts out from under an upload still in progress
+    // (WEALD-L1086).
+    if let Err(error) =
+        store::refresh_multipart(pool, session_uuid, i64::from(PRESIGN_TTL_SECONDS)).await
+    {
+        tracing::warn!(error = %error, "media: could not refresh a multipart session");
+        return Frame::Error(FrameError::new(ErrorCode::Backpressure));
+    }
 
     // The part is bound to the length recorded for it, which is the same number
     // the completion path adds up. A part URL that took any body would let one

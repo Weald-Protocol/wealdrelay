@@ -483,6 +483,17 @@ pub async fn release(
     reservation_id: Uuid,
 ) -> Result<Option<i64>, StoreError> {
     let mut tx = pool.begin().await.map_err(db)?;
+    let released = release_in(&mut tx, workspace, reservation_id).await?;
+    tx.commit().await.map_err(db)?;
+    Ok(released)
+}
+
+/// `release`, inside a transaction the caller owns.
+pub(crate) async fn release_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: &str,
+    reservation_id: Uuid,
+) -> Result<Option<i64>, StoreError> {
     let row = sqlx::query(
         "delete from relay_blob_reservation \
          where workspace_id = $1 and reservation_id = $2 and finalized_at is null \
@@ -490,11 +501,10 @@ pub async fn release(
     )
     .bind(workspace)
     .bind(reservation_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(db)?;
     let Some(row) = row else {
-        tx.commit().await.map_err(db)?;
         return Ok(None);
     };
     let bytes: i64 = row.try_get("bytes").map_err(db)?;
@@ -504,11 +514,46 @@ pub async fn release(
     )
     .bind(workspace)
     .bind(bytes)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(db)?;
-    tx.commit().await.map_err(db)?;
     Ok(Some(bytes))
+}
+
+/// Hold one unclaimed-collector candidate for the length of the caller's
+/// transaction, re-checking it is still unfinalized and still stale.
+///
+/// The candidate list is read once, and a manifest claim or a re-PUT can land
+/// on a row between that read and its object delete. Deleting against the
+/// stale list alone lost a claimed attachment (WEALD-L1088). Under this lock a
+/// claim or a refresh waits for the collector's transaction; one that already
+/// holds the row is skipped rather than waited on, and a row it finalized or
+/// refreshed no longer matches. Locks the quota row first, in the order
+/// `reserve` takes them, so the two cannot deadlock.
+pub(crate) async fn lock_unclaimed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: &str,
+    reservation_id: Uuid,
+    older_than_seconds: i64,
+) -> Result<bool, StoreError> {
+    sqlx::query("select 1 from relay_quota where workspace_id = $1 for update")
+        .bind(workspace)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db)?;
+    let row = sqlx::query(
+        "select 1 as present from relay_blob_reservation \
+         where workspace_id = $1 and reservation_id = $2 and finalized_at is null \
+           and created_at < now() - make_interval(secs => $3) \
+         for update skip locked",
+    )
+    .bind(workspace)
+    .bind(reservation_id)
+    .bind(older_than_seconds as f64)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(row.is_some())
 }
 
 /// Record that a claimed blob's object has been physically deleted: its bytes
@@ -804,6 +849,31 @@ pub async fn record_part(
     .bind(session_id)
     .bind(part_number)
     .bind(expected_len)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Move an open session's expiry to `ttl_seconds` from now.
+///
+/// Called every time a part URL is issued. The session used to keep the
+/// expiry it opened with, so a slow upload still running 15 minutes in was
+/// swept by the janitor with its uploaded parts deleted (WEALD-L1086). With
+/// the refresh, a session is stale only once no part URL was issued for a
+/// whole window, which is also when every URL it issued has expired.
+pub async fn refresh_multipart(
+    pool: &PgPool,
+    session_id: Uuid,
+    ttl_seconds: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "update relay_blob_multipart \
+         set expires_at = greatest(expires_at, now() + make_interval(secs => $2)) \
+         where session_id = $1 and completed_at is null and aborted_at is null",
+    )
+    .bind(session_id)
+    .bind(ttl_seconds as f64)
     .execute(pool)
     .await
     .map_err(db)?;

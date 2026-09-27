@@ -155,6 +155,24 @@ moved, and `ChatChannelIndex.normalize` sorts moved channels ahead of unmoved
 ones so a new channel cannot land above a pinned one on the strength of its name.
 `main` stays first and is neither renameable in the sidebar nor moveable.
 
+Amended 2026-09-26 (WEALD-L994, WEALD-L995): the client founds a workspace with
+`InviteWorkspaceJoin.convergedScopes`, and that list now carries every group this
+section and the client's own channel index need: the root, `general`, the ticket
+board, `activity`, then `live-work`, `standup` and `main`. Until this amendment the
+founding list was root, `general` and the board, so `activity` was never created,
+and the three channels `ChatChannelIndex.normalize` seeds into `channels.json` had
+no group to seal under on a relay workspace. `live-work`, `standup` and `main` are
+founded as ordinary `parent`, `open` channels, not as defaults in the policy sense
+above: the three-per-workspace default limit is unchanged and they stay archivable.
+Invites bundle the same list, so a joiner converges all of them with no extra
+step. `activity` reads as muted on arrival (`ChatNotifyLevel.standard(slug:)`,
+per machine like every notify level). The headless client posts a line there for
+every ticket lane move (`relay-client ticket --state`) and every completed
+`agent-execute`; the agent's answer itself stays in the group the invoke was
+written to, because the terminal record names it and `agent-answer` folds both out
+of one group. A workspace founded before this amendment has no `activity` group;
+its posters report `activity=absent` and write nowhere.
+
 `chan:ws/activity` exists so that agent chatter, which is the highest-volume
 writer at this posture (`specs/backend/relay/agents.md`), has a home that is not
 the channel humans read. Routing it into `general` by default is how a team turns

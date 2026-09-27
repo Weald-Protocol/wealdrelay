@@ -262,6 +262,9 @@ pub struct RelayState {
     /// rather than inside it, because they bound different paths with different
     /// windows and merging them would have made one limiter answer two questions.
     pub send_budget: crate::send_budget::SendBudget,
+    /// The admission-blind per-group and per-workspace `SEND` byte budget
+    /// (`crate::group_ingress`, WEALD-L1090).
+    pub group_ingress: crate::group_ingress::GroupIngressBudget,
     /// The calls this process is carrying, and the only place call state lives.
     ///
     /// Beside the hub rather than inside it, because the hub's map is group to
@@ -350,6 +353,7 @@ impl RelayState {
             media_presign_secret: random_secret(),
             media_rate: crate::media::default_rate_limiter(),
             send_budget,
+            group_ingress: crate::group_ingress::GroupIngressBudget::default(),
             calls: crate::calls::CallRegistry::new(max_concurrent_calls),
             connections: std::sync::atomic::AtomicUsize::new(0),
             unauthenticated_connections_by_source: tokio::sync::Mutex::new(HashMap::new()),

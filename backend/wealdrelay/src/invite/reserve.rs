@@ -383,8 +383,13 @@ pub async fn scope_commit(
     .map_err(db)?
     .get("done");
     let scopes: i64 = row.get("scopes");
-    if !consumed && committed >= scopes {
-        consume(
+    // `consume` re-judges the reservation under its row lock. The read above is
+    // unlocked, and the janitor can release an expiring reservation between it and
+    // here; a release that won is the same refusal an expired reservation gets
+    // (WEALD-L1115).
+    if !consumed
+        && committed >= scopes
+        && !consume(
             pool,
             token,
             nonce,
@@ -392,12 +397,18 @@ pub async fn scope_commit(
             row.get("workspace_id"),
             row.get::<f64, _>("invite_expires_ms") as i64,
         )
-        .await?;
+        .await?
+    {
+        return Ok(None);
     }
     Ok(Some(receipt))
 }
 
 /// The final scope commit: spend the seat, promote the grant.
+///
+/// `false` when the reservation was released before this ran, in which case
+/// nothing is spent and nothing is promoted. Public so the race with
+/// `release_expired` can be driven from a test without a clock hook.
 ///
 /// One transaction, so a second device cannot race a seat that has already been
 /// spent. Promotion rather than a second grant: the just-enrolled device stays
@@ -407,24 +418,48 @@ pub async fn scope_commit(
 /// caller already holds both from the row it judged the commit against, and a second
 /// read would have had a "the row went away between two statements" arm that only a
 /// race could reach, which is an arm no test can take honestly.
-async fn consume(
+pub async fn consume(
     pool: &PgPool,
     token: &[u8],
     nonce: &[u8],
     device_hash: &[u8],
     workspace_id: String,
     invite_expires_ms: i64,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let mut tx = pool.begin().await.map_err(db)?;
-    sqlx::query(
+    // Spent only while still unreleased, in the statement that takes the row lock.
+    // `release_expired` updates the same row under `consumed_at is null`, so the two
+    // serialize on it: whichever commits first, the other matches nothing. Without
+    // `released_at is null` here a seat the janitor had already returned was also
+    // spent, and a `uses = 1` invite admitted two devices (WEALD-L1115).
+    let spent = sqlx::query(
         "update relay_invite_reservation set consumed_at = now() \
-         where token = $1 and join_nonce = $2 and consumed_at is null",
+         where token = $1 and join_nonce = $2 and consumed_at is null \
+           and released_at is null",
     )
     .bind(token)
     .bind(nonce)
     .execute(&mut *tx)
     .await
-    .map_err(db)?;
+    .map_err(db)?
+    .rows_affected();
+    if spent == 0 {
+        // Either released under us, which is a refusal, or consumed by a concurrent
+        // retry of this same join, which already did everything below.
+        let consumed: bool = sqlx::query(
+            "select exists (select 1 from relay_invite_reservation \
+             where token = $1 and join_nonce = $2 and consumed_at is not null \
+               and released_at is null) as consumed",
+        )
+        .bind(token)
+        .bind(nonce)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?
+        .get("consumed");
+        tx.rollback().await.map_err(db)?;
+        return Ok(consumed);
+    }
     // A void survives this. If revocation reached the grant while the join was in
     // flight, the seat is still spent (the reservation was real and the group work
     // was done) but the credential stays dead: the last frame of a join must not be
@@ -465,7 +500,7 @@ async fn consume(
     }
 
     tx.commit().await.map_err(db)?;
-    Ok(())
+    Ok(true)
 }
 
 /// A receipt is a hash of what it is a receipt for, so it is stable across retries
