@@ -117,6 +117,20 @@ pub const WAKE_FRAMES_PER_MINUTE: u32 = 30;
 /// below a pipelined flood.
 pub const JOIN_FRAMES_PER_MINUTE: u32 = 20;
 
+/// `JOIN` frames one connection may send per minute once it holds a reservation.
+///
+/// A redemption is one reservation, one record read, then a bundle request and a
+/// commit for every scope the invite carries: `2 + 2 * scopes` frames on one
+/// socket inside a minute. Held to the pre-reservation allowance, an invite of
+/// more than nine scopes refused its tenth commit with the seat already taken,
+/// and the client read the generic refusal (WEALD-L1147). Raised only after a
+/// reservation succeeded, which is the one proof this path has: the token was
+/// real and the Argon2id code check passed, so a peer that has proved nothing is
+/// still held to `JOIN_FRAMES_PER_MINUTE`. Derived from the scope ceiling, so a
+/// larger invite can never outgrow it again.
+pub const JOIN_FRAMES_PER_MINUTE_RESERVED: u32 =
+    JOIN_FRAMES_PER_MINUTE + 2 * crate::invite::MAX_SCOPES as u32 + 2;
+
 /// `HANDSHAKE` frames one connection may send per minute.
 ///
 /// The most expensive durable write in the protocol per frame: each one takes
@@ -565,6 +579,9 @@ pub struct Session {
     /// `JOIN` frames per minute. The only budget charged before authentication,
     /// and the only one an unauthenticated peer can spend.
     join_budget: FrameBudget,
+    /// Whether a `JOIN` reservation succeeded on this connection, which moves the
+    /// `JOIN` allowance to [`JOIN_FRAMES_PER_MINUTE_RESERVED`] (WEALD-L1147).
+    join_reserved: bool,
     /// Whether the call path is on at all, from `WEALD_RELAY_CALLS`.
     calls: CallMode,
     /// `CALL` signalling frames per minute, budgeted separately from `LIVE`,
@@ -578,6 +595,24 @@ pub struct Session {
 }
 
 impl Session {
+    /// Record that a `JOIN` reservation succeeded on this connection.
+    ///
+    /// Called by the redemption path after `reserve::reserve` answered
+    /// `Reserved`, and never before: the raised allowance is what a proven code
+    /// buys, so nothing a peer sends ahead of that proof may reach it.
+    pub fn note_join_reserved(&mut self) {
+        self.join_reserved = true;
+    }
+
+    /// The `JOIN` frames this connection may send in the current window.
+    pub fn join_allowance(&self) -> u32 {
+        if self.join_reserved {
+            JOIN_FRAMES_PER_MINUTE_RESERVED
+        } else {
+            JOIN_FRAMES_PER_MINUTE
+        }
+    }
+
     pub fn new(config: &Config) -> Self {
         Self {
             state: State::Fresh,
@@ -612,6 +647,7 @@ impl Session {
             blob_budget: FrameBudget::default(),
             drop_budget: FrameBudget::default(),
             join_budget: FrameBudget::default(),
+            join_reserved: false,
             calls: config.calls,
             call_budget: FrameBudget::default(),
             media_budget: crate::calls::MediaBudget::default(),
@@ -925,11 +961,12 @@ impl Session {
                 // has authenticated nothing, and refusing the frame rather than the
                 // connection keeps a person mistyping a code on the socket they are
                 // already on.
-                if !self.join_budget.charge(now_ms, JOIN_FRAMES_PER_MINUTE) {
+                let allowance = self.join_allowance();
+                if !self.join_budget.charge(now_ms, allowance) {
                     return Reaction::Reply(vec![Frame::Error(
                         FrameError::new(ErrorCode::RateLimited)
                             .retry_after(60)
-                            .detail(u64::from(JOIN_FRAMES_PER_MINUTE).to_be_bytes()),
+                            .detail(u64::from(allowance).to_be_bytes()),
                     )]);
                 }
                 Reaction::Defer(Work::Redeem { body })

@@ -1059,7 +1059,7 @@ async fn administer_invite(
 async fn redeem(
     sender: &OutboundSender,
     state: &Arc<RelayState>,
-    session: &Session,
+    session: &mut Session,
     body: Vec<u8>,
 ) -> bool {
     use crate::invite::redeem::{Request, Response};
@@ -1143,12 +1143,17 @@ async fn redeem(
             )
             .await
             {
-                Ok(Verdict::Reserved { expires_at_ms }) => queue_all(
-                    sender,
-                    vec![Frame::Join {
-                        body: Response::Reserved { expires_at_ms }.encode(),
-                    }],
-                ),
+                Ok(Verdict::Reserved { expires_at_ms }) => {
+                    // The rest of this redemption is `2 * scopes` more frames on
+                    // this socket (WEALD-L1147).
+                    session.note_join_reserved();
+                    queue_all(
+                        sender,
+                        vec![Frame::Join {
+                            body: Response::Reserved { expires_at_ms }.encode(),
+                        }],
+                    )
+                }
                 Ok(Verdict::Unavailable) => refuse(sender),
                 // One arm, and the mapping lives on the error: a relay that could not
                 // look answers `retry`, and everything else is the one generic

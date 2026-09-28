@@ -1279,3 +1279,219 @@ async fn an_expired_invite_serves_nothing_and_the_janitor_deletes_what_it_held()
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// Redeem a `scopes`-scope, one-seat invite over one socket the way
+/// `InviteRedemption.redeemed` drives it: reserve, read the record, then a bundle
+/// request and a commit for each scope in record order, all inside one minute of
+/// the relay's clock. Asserts every commit answers a receipt, a retry of the last
+/// commit answers the same receipt, and the seat is spent exactly once.
+async fn redeem_every_scope(label: &str, scopes: usize, token_seed: u8) {
+    let scratch = Scratch::new(label).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let code = Code::from_bits(0x0e0e0e);
+    let issuer = SigningKey::from_bytes(&[1; 32]);
+    let token = vec![token_seed; 16];
+    // Sorted, because the record format requires it and the client walks them in
+    // record order.
+    let mut groups: Vec<Vec<u8>> = std::iter::once(root())
+        .chain((1..scopes).map(|n| {
+            let mut group = vec![0x20; 32];
+            group[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            group
+        }))
+        .collect();
+    groups.sort();
+    let mut record = Invite {
+        token: token.clone(),
+        workspace: root(),
+        issuer: issuer.verifying_key().to_bytes().to_vec(),
+        issued_at: CLOCK,
+        expires: CLOCK + invite::DEFAULT_EXPIRY_MS,
+        uses: 1,
+        code_hash: invite::code::hash(code, &token).unwrap().to_vec(),
+        scopes: groups.clone(),
+        caps: vec![b"chat.read".to_vec()],
+        update_pub: vec![0x33; 32],
+        bundles: groups
+            .iter()
+            .map(|group| EncBundle {
+                group: group.clone(),
+                epoch: 1,
+                ct: b"a GroupInfo sealed to the invite's update key".to_vec(),
+            })
+            .collect(),
+        sig: vec![0u8; 64],
+    };
+    record.sig = issuer.sign(&record.digest_input()).to_bytes().to_vec();
+    seed(&relay.state, &record).await;
+    let pool = relay.state.database.as_ref().unwrap().pool();
+
+    let mut joiner = connected(&relay).await;
+    let device = vec![0x77; 32];
+    let nonce = vec![0x0d; 16];
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Reserve {
+                token: token.clone(),
+                code: code.grouped(),
+                nonce: nonce.clone(),
+                device: device.clone(),
+            }
+            .encode(),
+        })
+        .await;
+    assert!(matches!(joiner.recv_frame().await, Frame::Join { .. }));
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Record {
+                token: token.clone(),
+            }
+            .encode(),
+        })
+        .await;
+    assert!(
+        matches!(joiner.recv_frame().await, Frame::Join { .. }),
+        "the record read after the reservation was refused"
+    );
+
+    let mut last_receipt = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        joiner
+            .send_frame(&Frame::Join {
+                body: Request::Bundles {
+                    token: token.clone(),
+                    group: group.clone(),
+                }
+                .encode(),
+            })
+            .await;
+        match joiner.recv_frame().await {
+            Frame::Join { body } => match Response::decode(&body).expect("a response") {
+                Response::Bundles(bundles) => {
+                    assert_eq!(bundles.len(), 1, "scope {index} served no bundle")
+                }
+                other => panic!("scope {index}: expected bundles, got {other:?}"),
+            },
+            other => panic!("scope {index}: bundle request answered {other:?}"),
+        }
+        joiner
+            .send_frame(&Frame::Join {
+                body: Request::Commit {
+                    token: token.clone(),
+                    nonce: nonce.clone(),
+                    device: device.clone(),
+                    group: group.clone(),
+                }
+                .encode(),
+            })
+            .await;
+        match joiner.recv_frame().await {
+            Frame::Join { body } => match Response::decode(&body).expect("a response") {
+                Response::Committed { receipt } => last_receipt = receipt,
+                other => panic!("scope {index}: expected a receipt, got {other:?}"),
+            },
+            other => panic!("scope {index}: commit answered {other:?}"),
+        }
+    }
+
+    // The retry a client that lost the last answer sends.
+    joiner
+        .send_frame(&Frame::Join {
+            body: Request::Commit {
+                token: token.clone(),
+                nonce: nonce.clone(),
+                device: device.clone(),
+                group: groups.last().unwrap().clone(),
+            }
+            .encode(),
+        })
+        .await;
+    match joiner.recv_frame().await {
+        Frame::Join { body } => match Response::decode(&body).expect("a response") {
+            Response::Committed { receipt } => assert_eq!(receipt, last_receipt),
+            other => panic!("retry: expected the same receipt, got {other:?}"),
+        },
+        other => panic!("retry: commit answered {other:?}"),
+    }
+
+    let consumed: i64 = sqlx::query_scalar(
+        "select count(*) from relay_invite_reservation \
+         where token = $1 and consumed_at is not null and released_at is null",
+    )
+    .bind(&token)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(consumed, 1, "the seat was not spent exactly once");
+    let committed: i64 =
+        sqlx::query_scalar("select count(*) from relay_invite_scope_commit where token = $1")
+            .bind(&token)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(committed, scopes as i64);
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
+
+/// WEALD-L1147: the invite rp8kytgdkny81 refused. Fourteen scopes is thirty `JOIN`
+/// frames, and the tenth commit met the pre-reservation allowance of twenty with
+/// the seat already taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fourteen_scope_invite_commits_every_scope_and_spends_its_one_seat_once() {
+    redeem_every_scope("invite_socket_multiscope", 14, 0xd4).await;
+}
+
+/// The ceiling, so no invite the record format admits can outgrow the allowance.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_at_the_scope_ceiling_redeems_on_one_socket_inside_one_minute() {
+    redeem_every_scope("invite_socket_maxscope", invite::MAX_SCOPES, 0xd5).await;
+}
+
+/// The raised allowance is bought by a reservation and by nothing else: a wrong
+/// code on a real token leaves the connection at the pre-reservation allowance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_reservation_does_not_raise_the_join_allowance() {
+    let scratch = Scratch::new("invite_socket_join_allowance").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let relay = Running::start(config_for(&scratch, blobs.path()), Clock::Fixed(CLOCK)).await;
+    let code = Code::from_bits(0x0b0b0b);
+    let record = issue(0xd6, code, 1);
+    seed(&relay.state, &record).await;
+
+    let mut peer = connected(&relay).await;
+    peer.send_frame(&Frame::Join {
+        body: Request::Reserve {
+            token: record.token.clone(),
+            code: Code::from_bits(0x0b0b0c).grouped(),
+            nonce: vec![0x0e; 16],
+            device: vec![0x78; 32],
+        }
+        .encode(),
+    })
+    .await;
+    assert!(matches!(peer.recv_frame().await, Frame::Error(_)));
+    let allowance = wealdrelay::session::JOIN_FRAMES_PER_MINUTE - 1;
+    let mut refused_at = None;
+    for sent in 0..allowance + 1 {
+        peer.send_frame(&Frame::Join {
+            body: Request::Bundles {
+                token: record.token.clone(),
+                group: root(),
+            }
+            .encode(),
+        })
+        .await;
+        if let Frame::Error(error) = peer.recv_frame().await {
+            assert_eq!(error.code, wealdrelay::frame::ErrorCode::RateLimited);
+            refused_at = Some(sent);
+            break;
+        }
+    }
+    assert_eq!(refused_at, Some(allowance));
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}
