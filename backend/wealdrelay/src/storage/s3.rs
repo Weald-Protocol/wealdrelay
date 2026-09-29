@@ -19,6 +19,12 @@ use aws_sdk_s3::Client;
 
 use super::{BlobInfo, BlobKey, BlobStore, StorageError};
 
+/// The longest one `HeadObject` may take before the relay answers `backpressure`.
+///
+/// Well inside the client's 30 s `BLOB` exchange window (`RelayConnectionMediaExchange`),
+/// so a stalled bucket reaches the member as a refusal rather than as silence.
+pub const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// The bucket, and the prefix inside it if the URL named one.
 #[derive(Debug, Clone)]
 pub struct S3Store {
@@ -225,14 +231,28 @@ impl BlobStore for S3Store {
     }
 
     async fn head(&self, key: &BlobKey) -> Result<Option<BlobInfo>, StorageError> {
-        match self
+        // Bounded, because `BLOB get` and `BLOB put` answer only after this returns
+        // and the SDK client carries no operation timeout. A HEAD that stalled at the
+        // bucket left the frame unanswered past the client's 30 s exchange window, so
+        // the member read "the relay did not answer" with no refusal to act on
+        // (WEALD-L1149). Past the bound it is `Unreachable`, which the handlers
+        // already answer as `backpressure`.
+        let sent = self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(self.object_key(key))
-            .send()
-            .await
-        {
+            .send();
+        let Ok(outcome) = tokio::time::timeout(HEAD_TIMEOUT, sent).await else {
+            return Err(StorageError::Unreachable {
+                reason: format!(
+                    "head {}: no answer from the bucket within {}s",
+                    key.path(),
+                    HEAD_TIMEOUT.as_secs()
+                ),
+            });
+        };
+        match outcome {
             Ok(output) => Ok(Some(BlobInfo {
                 len: output.content_length().unwrap_or_default().max(0) as u64,
             })),
