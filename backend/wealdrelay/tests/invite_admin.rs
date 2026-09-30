@@ -1209,7 +1209,9 @@ async fn voiding_grants_refuses_a_removed_joiner_s_next_connection_and_is_scoped
     assert!(access_store::grant(pool, WORKSPACE, &hash, far)
         .await
         .expect("granted"));
-    access_store::salt(pool, "ws-somebody-else").await.expect("salt");
+    access_store::salt(pool, "ws-somebody-else")
+        .await
+        .expect("salt");
     assert!(access_store::grant(pool, "ws-somebody-else", &hash, far)
         .await
         .expect("granted"));
