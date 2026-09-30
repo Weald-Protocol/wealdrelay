@@ -101,7 +101,7 @@ never leaves this page. This relay does not host client downloads itself, and if
 this workspace uses a different client, ask the person who invited you.</p>\
 <script>\
 var open = document.getElementById('open');\
-open.href = 'weald://join/' + location.pathname.split('/').pop() + location.hash;\
+open.href = 'weald://join/' + location.pathname.split('/').pop() + '?relay=' + encodeURIComponent(location.host) + location.hash;\
 if (location.hash === '') {\
 document.getElementById('missing-secret').hidden = false;\
 open.removeAttribute('href');\

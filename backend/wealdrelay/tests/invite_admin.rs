@@ -1189,3 +1189,104 @@ async fn refreshing_a_bundle_is_scoped_and_reaches_the_store() {
     relay.shutdown().await;
     scratch.drop_database().await;
 }
+
+/// WEALD-L1158, mp.67: a joiner removed before any accepted set named it, after
+/// its single-use invite was consumed, held a provisional grant neither implicit
+/// rule could reach and kept publishing into `#general`. `VoidGrants` ends it:
+/// the next `AUTH` is refused (`admit` maps `Refused` to
+/// `denied/writer_not_in_access_set`), and another workspace's grant is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn voiding_grants_refuses_a_removed_joiner_s_next_connection_and_is_scoped() {
+    let (scratch, _blobs, relay) = prepared("invite_admin_void_grants").await;
+    let pool = pool_of(&relay.state);
+    let root_key = key(0x41);
+    found(pool, &root_key, &[]).await;
+
+    let joiner = key(0x42);
+    let salt = access_store::salt(pool, WORKSPACE).await.expect("salt");
+    let hash = entry_hash(&pk(&joiner), &salt);
+    let far = (CLOCK as i64) * 2;
+    assert!(access_store::grant(pool, WORKSPACE, &hash, far)
+        .await
+        .expect("granted"));
+    access_store::salt(pool, "ws-somebody-else").await.expect("salt");
+    assert!(access_store::grant(pool, "ws-somebody-else", &hash, far)
+        .await
+        .expect("granted"));
+    assert_eq!(
+        access_store::admits(pool, WORKSPACE, &pk(&joiner))
+            .await
+            .expect("read"),
+        access_store::Admission::Provisional,
+        "the fixture must start from the live grant the ticket observed"
+    );
+
+    // A member who is not an authorizer cannot void anything.
+    assert!(matches!(
+        admin::handle(
+            pool,
+            WORKSPACE,
+            &pk(&joiner),
+            Request::VoidGrants {
+                hashes: vec![hash.clone()]
+            },
+            CLOCK as i64,
+        )
+        .await,
+        Err(AdminError::NotAnAdmin)
+    ));
+
+    let answered = admin::handle(
+        pool,
+        WORKSPACE,
+        &pk(&root_key),
+        Request::VoidGrants {
+            hashes: vec![hash.clone(), vec![0xee; 32]],
+        },
+        CLOCK as i64,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered,
+        Response::GrantsVoided {
+            voided: 1,
+            hashes: vec![hash.clone()]
+        }
+    );
+    // The wire carries the count only.
+    assert_eq!(
+        Response::decode(&answered.encode()).expect("decodes"),
+        Response::GrantsVoided {
+            voided: 1,
+            hashes: vec![]
+        }
+    );
+    let request = Request::VoidGrants {
+        hashes: vec![hash.clone()],
+    };
+    assert_eq!(
+        Request::decode(&request.encode()).expect("decodes"),
+        request
+    );
+
+    assert_eq!(
+        access_store::admits(pool, WORKSPACE, &pk(&joiner))
+            .await
+            .expect("read"),
+        access_store::Admission::Refused,
+        "a removed joiner's fresh connection was still admitted"
+    );
+    // Terminal: redeeming again cannot re-arm it.
+    assert!(!access_store::grant(pool, WORKSPACE, &hash, far)
+        .await
+        .expect("runs"));
+    assert!(
+        !access_store::grant_is_voided(pool, "ws-somebody-else", &hash)
+            .await
+            .expect("runs")
+    );
+
+    relay.shutdown().await;
+    scratch.drop_database().await;
+}

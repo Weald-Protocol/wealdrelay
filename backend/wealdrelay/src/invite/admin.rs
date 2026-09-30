@@ -61,6 +61,14 @@ pub enum Request {
         epoch: u64,
         ct: Vec<u8>,
     },
+    /// Void the provisional grants of these salted device hashes, explicitly.
+    ///
+    /// Removal's third mechanism (`lifecycle.md` step 5, WEALD-L1158). The implicit
+    /// rule voids a grant only when an earlier accepted set carried its hash, and
+    /// `Revoke` reaches only a live invite, so a joiner removed before any set named
+    /// it and after its single-use invite was consumed kept a working credential
+    /// until the invite's original expiry and could still publish.
+    VoidGrants { hashes: Vec<Vec<u8>> },
 }
 
 /// What the relay answers with.
@@ -80,6 +88,12 @@ pub enum Response {
     /// not own, a scope the record does not name, an invite that is no longer live,
     /// or ciphertext outside the bundle bound: one flat answer, because an admin has
     /// nothing to do differently about any of them and the alternative is a probe.
+    /// How many live grants the request voided. Hashes with no live grant in this
+    /// workspace count zero, so the answer is no probe of other workspaces.
+    GrantsVoided {
+        voided: u64,
+        hashes: Vec<Vec<u8>>,
+    },
     Refreshed {
         accepted: bool,
     },
@@ -159,6 +173,10 @@ impl Request {
                 cbor::uint(*epoch),
                 cbor::bytes(ct),
             ]),
+            Self::VoidGrants { hashes } => {
+                let encoded: Vec<Vec<u8>> = hashes.iter().map(|h| cbor::bytes(h)).collect();
+                cbor::array(&[cbor::uint(5), cbor::array(&encoded)])
+            }
         }
     }
 
@@ -181,6 +199,14 @@ impl Request {
                 epoch: reader.uint()?,
                 ct: reader.bytes()?,
             },
+            (5, 2) => {
+                let count = reader.array_header()?;
+                let mut hashes = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    hashes.push(reader.bytes()?);
+                }
+                Self::VoidGrants { hashes }
+            }
             _ => return Err(AdminError::UnknownRequest(kind)),
         };
         reader.finish()?;
@@ -203,6 +229,7 @@ impl Response {
             Self::Refreshed { accepted } => {
                 cbor::array(&[cbor::uint(4), cbor::uint(u64::from(*accepted))])
             }
+            Self::GrantsVoided { voided, .. } => cbor::array(&[cbor::uint(5), cbor::uint(*voided)]),
         }
     }
 
@@ -231,6 +258,10 @@ impl Response {
             },
             (4, 2) => Self::Refreshed {
                 accepted: reader.uint()? != 0,
+            },
+            (5, 2) => Self::GrantsVoided {
+                voided: reader.uint()?,
+                hashes: Vec::new(),
             },
             _ => return Err(AdminError::UnknownRequest(kind)),
         };
@@ -387,6 +418,25 @@ pub async fn handle(
             let bundle = super::EncBundle { group, epoch, ct };
             let accepted = store::refresh_bundle(pool, &token, &bundle).await?;
             Ok(Response::Refreshed { accepted })
+        }
+        Request::VoidGrants { hashes } => {
+            let mut dead = Vec::new();
+            for hash in hashes {
+                if crate::access::store::revoke_grant(pool, workspace_id, &hash)
+                    .await
+                    .map_err(|error| StoreError::Database(error.to_string()))?
+                {
+                    dead.push(hash);
+                }
+            }
+            // `hashes` rides back to the hub, never onto the wire: the socket path
+            // evicts every open connection they name, the half `AUTH` cannot do.
+            // Only hashes whose grant this workspace held, so an admin cannot close
+            // another workspace's sockets by naming its hashes.
+            Ok(Response::GrantsVoided {
+                voided: dead.len() as u64,
+                hashes: dead,
+            })
         }
     }
 }

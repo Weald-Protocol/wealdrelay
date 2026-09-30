@@ -1045,6 +1045,14 @@ async fn administer_invite(
                     }
                 }
             }
+            // Removal's explicit void (WEALD-L1158): the grant is dead at the next
+            // `AUTH`, and any socket already open under it closes now. Scoped: the
+            // hub is indexed by salted hash, and the salt is this workspace's.
+            if let admin::Response::GrantsVoided { hashes, .. } = &response {
+                for hash in hashes {
+                    state.hub.evict(hash).await;
+                }
+            }
             queue_all(
                 sender,
                 vec![Frame::Invite {
