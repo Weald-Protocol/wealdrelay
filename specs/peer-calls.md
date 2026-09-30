@@ -522,6 +522,22 @@ agent calls and would be wrong twice over for peer calls. Integration proof is
 two real app instances against a real relay, which is the shape
 `specs/agents/networked/ledger.json` already uses.
 
+**Step 37 status, 2026-09-29: code landed, integration proof open.** The pure types
+are in `Sources/Voice/Peers/` (`CallKeys`, `CallBody`, `MediaSeal`, `PeerCall`,
+`JitterBuffer`, `VoiceCodec`, `AacEldEncoder`, `AacEldDecoder`). They are copied
+byte for byte from `Companion/iOS/Voice/`. The Companion still compiles its own
+copies, and `Companion/project.yml` has not been switched to this path.
+`PeerCallAudio.swift` runs on `CallAudioGraph.shared`, so no second engine exists.
+`PeerCallCenter` holds sudden termination off while a call runs.
+`PeerCallWiring.shared` is activated from `VoiceModule.activate`, and
+`ChatHub.onRelayTransport` feeds it each relay transport. `AppState.peerCalls`
+(`Sources/Core/AppStatePeerCalls.swift`) exposes it to the root store.
+`NSMicrophoneUsageDescription` in `project.yml` now names calls. The epoch secret is
+`RelayTransport.callEpochSecret(group:epoch:)`, which reads `EnvelopeSeal.secrets(for:)`.
+Proof so far: `Tests/PeerCallInteropTests.swift` and `Tests/PeerCallLoopbackTests.swift`.
+Both were run as scratch `swiftc` binaries, and AAC-ELD encode and decode ran there too.
+The two-instance live relay proof and a live Android-to-Mac call are not recorded.
+
 **Step 38. Ring, answer, and the encryption panel.** `IncomingCallPresenter`'s
 `NSPanel` for the ring, `CallTrayView` for in-call, a call event written to the
 chat log as a durable `chat.message` so a missed call survives (the call itself
@@ -530,6 +546,18 @@ panel must state what the relay sees for a call: that a call happened, which
 group, who was connected, for how long, and how many bytes. Metadata is not
 hidden and `specs/backend/relay/overview.md` says to say so plainly, so say it
 here too.
+
+**Step 38 status, 2026-09-29: ring, in-call card, call record and encryption line
+landed.** `Sources/Voice/Peers/PeerCallPresenter.swift` shows the ring in a
+non-activating `NSPanel`, configured like `IncomingCallPresenter`.
+`Sources/UI/PeerCalls/PeerCallCard.swift` draws the ring, the dial, the in-call bar
+and the ended state. Its lock button states what the relay sees.
+`PeerCallWiring.record(_:)` writes one durable `chat.message` per call. The callee
+writes "Missed call from X.", and the caller writes the call length. A place-call
+button sits in the channel and DM header (`Sources/UI/PeerCalls/PeerCallButton.swift`).
+`CallTrayView` and `IncomingCallPresenter` are still agent-only and were not reused.
+
+**Step 39 status, 2026-09-29: not started.** Media is relayed on tag 24 only.
 
 **Step 39. P2P upgrade.** STUN listener on the relay, ICE-lite candidate
 exchange as `CALL` kinds, `NWConnection` UDP with the same GCM frame format so

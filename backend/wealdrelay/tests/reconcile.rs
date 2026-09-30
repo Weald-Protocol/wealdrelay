@@ -386,9 +386,21 @@ async fn a_subscription_larger_than_the_send_queue_can_finish_by_reconciliation(
         other => panic!("expected a subscription acknowledgement, got {other:?}"),
     };
     assert_eq!(head, 257);
+    // The backfill is sized by the queue's free slots when the `SUB` is answered
+    // (`sync::push_frame_allowance`): at most `SEND_QUEUE_BOUND - 1` pushes, fewer
+    // when the writer has not yet drained an earlier frame. Waiting for exactly
+    // that many hung CI run 36656065989 for four hours. Drain until the relay goes
+    // quiet; reconciliation carries whatever the cursor did not.
     let mut local = Local::default();
-    for _ in 0..wealdrelay::session::SEND_QUEUE_BOUND - 1 {
-        let frame = reader.recv_frame().await;
+    let mut backfilled = 0usize;
+    while let Ok(frame) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv_frame()).await
+    {
+        backfilled += 1;
+        assert!(
+            backfilled < wealdrelay::session::SEND_QUEUE_BOUND,
+            "the backfill exceeded the queue bound"
+        );
         let Frame::Push { envelope } = frame else {
             // Named, because a bare "expected a push" told a CI failure nothing:
             // the run that failed had already delivered part of the backfill, and
@@ -397,6 +409,7 @@ async fn a_subscription_larger_than_the_send_queue_can_finish_by_reconciliation(
         };
         local.apply(Envelope::decode(&envelope).unwrap()).unwrap();
     }
+    assert!(backfilled >= 1, "the cursor backfill sent nothing");
 
     let rounds = reconcile_to_convergence(&mut reader, &mut local, &group, &[], 12).await;
     assert_eq!(local.ids(), all.iter().map(id_of).collect());
